@@ -1,0 +1,15 @@
+# 書籍データ（著作物のため公開リポジトリに含めない）
+temp_sample/
+output/
+*.pdf
+*.epub
+*.kepub.epub
+
+# 変換結果
+*.txt
+!requirements.txt
+
+# 環境
+.venv/
+__pycache__/
+*.pyc
