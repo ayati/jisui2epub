@@ -388,6 +388,18 @@ def is_junk_line(text):
 
 # ── 柱・ノンブル判定 ─────────────────────────────────
 
+_CHAPTER_HEAD_RE = re.compile(
+    r'^(第[0-9０-９一二三四五六七八九十百]+[章話部]|序章|終章|プロローグ|エピローグ)')
+_CHAPTER_MARK_RE = re.compile(
+    r'(第[0-9０-９一二三四五六七八九十百]*[章話部]|序章|終章)')
+
+
+def _single_chapter_heading(text):
+    """章番号で始まり、章マーカーを1つだけ含む（目次ページの複数章題連結を弾く）。"""
+    return (bool(_CHAPTER_HEAD_RE.match(text))
+            and len(_CHAPTER_MARK_RE.findall(text)) == 1)
+
+
 def norm_hashira(text):
     """柱の頻度カウント用正規化（数字・空白除去）。
     章番号とタイトルが別スパンに分かれてOCRされることがあるため、
@@ -484,6 +496,78 @@ def classify_marginals(pages, body_size):
                     if c >= 2 and len(k) >= 3 and not NOMBRE_RE.match(k)
                     and re.search(r'[ぁ-ゖァ-ヺー㐀-鿿]', k)}
     return drop, headings, body_top, body_bottom, hashira_keys
+
+
+# ── 画像ページ（挿絵・口絵・画像主体の章頭）の検出と抽出 ──────────────
+
+def _page_ink_ratio(doc_page):
+    """縮小グレースケールレンダリングの暗画素率（画像ページ判定用）。"""
+    pix = doc_page.get_pixmap(matrix=fitz.Matrix(0.3, 0.3),
+                              colorspace=fitz.csGRAY)
+    s = pix.samples
+    return sum(1 for b in s if b < 200) / max(len(s), 1)
+
+
+def classify_image_pages(doc, pages, drop):
+    """
+    挿絵・口絵・画像主体の章頭ページを検出して page_num の集合を返す。
+
+    判定は2軸:
+      1. 本文行がほぼ無い（柱・ノンブル・挿絵ノイズ除去後 2 行以下）
+      2. インク率が本文ページの中央値の1.6倍超（白ページ・「上巻完」の
+         ような余白ページを除外。紙色の影響は本ごとの較正で吸収する）
+    """
+    def n_body_lines(pg):
+        return sum(1 for v in pg.vlines
+                   if v.text.strip() and (pg.num, id(v)) not in drop
+                   and not is_junk_line(v.text.strip()))
+
+    candidates = [pg for pg in pages if n_body_lines(pg) <= 4]
+    if not candidates:
+        return set()
+    # 本文ページのインク率ベースライン（サンプル30ページで較正）。
+    # 本文行が4行以下しかないページのインクはその1割程度のはずなので、
+    # ベースラインの0.7倍を超えるインクがあれば画像とみなせる
+    body_pages = [pg for pg in pages if n_body_lines(pg) > 10]
+    step = max(1, len(body_pages) // 30)
+    base_inks = [_page_ink_ratio(doc[pg.num]) for pg in body_pages[::step][:30]]
+    base = statistics.median(base_inks) if base_inks else 0.03
+    threshold = max(base * 0.7, 0.018)
+
+    result = set()
+    for pg in candidates:
+        if _page_ink_ratio(doc[pg.num]) > threshold:
+            result.add(pg.num)
+    return result
+
+
+def render_image_page(doc, page_num):
+    """
+    PDFページを画像ページ用JPEGにレンダリングして bytes を返す。
+    外周の白余白はインクのバウンディングボックスで自動トリミングする。
+    """
+    page = doc[page_num]
+    # 縮小グレースケールでインク領域のbboxを求める
+    small = page.get_pixmap(matrix=fitz.Matrix(0.3, 0.3),
+                            colorspace=fitz.csGRAY)
+    w, h, s = small.width, small.height, small.samples
+    xs, ys = [], []
+    for y in range(h):
+        row = s[y * w:(y + 1) * w]
+        for x, b in enumerate(row):
+            if b < 200:
+                xs.append(x)
+                ys.append(y)
+    if xs:
+        pad = max(2, int(min(w, h) * 0.02))
+        clip = fitz.Rect(max(0, min(xs) - pad) / 0.3,
+                         max(0, min(ys) - pad) / 0.3,
+                         min(w, max(xs) + pad) / 0.3,
+                         min(h, max(ys) + pad) / 0.3)
+    else:
+        clip = page.rect
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+    return pix.tobytes("jpeg", jpg_quality=85)
 
 
 # ── ルビ挿入 ────────────────────────────────────────
@@ -612,9 +696,13 @@ def render_vline(vl, ruby_map):
 # ── テキスト組み立て ──────────────────────────────────
 
 def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
-                  hashira_keys=None, indent=True, verbose=False):
-    """全ページから青空文庫形式の本文を組み立てる。"""
+                  hashira_keys=None, indent=True, verbose=False,
+                  image_pages=None):
+    """全ページから青空文庫形式の本文を組み立てる。
+    image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
+    """
     hashira_keys = hashira_keys or {}
+    image_pages = image_pages or {}
     out = []             # 段落のリスト（文字列）
     cur = ""             # 組み立て中の段落
     prev_line_short = True   # 直前の行が途中で終わった（段落末尾）か
@@ -761,6 +849,33 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         long_items = [t for t in page_headings if len(t) > HEADING_MAX_LEN]
         page_headings = [t for t in page_headings if len(t) <= HEADING_MAX_LEN]
 
+        # ── 画像ページ（挿絵・口絵・章頭）: 図タグを改ページに挟んで挿入 ──
+        # 章頭ページの見出しテキストは目次のため先に発行する
+        # （改ページ → 見出し → 画像 → 本文 の順）。
+        # ただし口絵・目次ページの飾り文字が大活字見出しに誤検出されやすいため、
+        # 画像ページ上の見出しは柱一致（＝実際の章題）か単独の章番号パターンに
+        # 限定する。どちらも無ければページ内の縦行から柱一致テキストを探す
+        # （章扉の飾り書体はOCRが崩れやすく、見出し判定から漏れることがある）
+        if pg.num in image_pages:
+            emit_pagebreak()
+            kept = [t for t in page_headings
+                    if matches_hashira(t) or _single_chapter_heading(t)]
+            if not kept:
+                for v in vlines:
+                    t = v.text.strip()
+                    if (t and not is_junk_line(t)
+                            and len(t) <= HEADING_MAX_LEN
+                            and matches_hashira(t)):
+                        kept = [t]
+                        break
+            if kept:
+                emit_heading("　".join(kept))
+            flush()
+            out.append(f"［＃「挿絵」の図（{image_pages[pg.num]}）入る］")
+            prev_line_short = True
+            prev_page_short = True   # 画像ページの後は必ず改ページ
+            continue
+
         # 直前の本文ページが途中で終わっていたら意図的な改ページを反映する。
         # ただし最終行がページ下端まで達していた場合（prev_line_short=False）は
         # 段落が継続中＝挿絵などでページ左側が空いただけなので改ページしない。
@@ -807,9 +922,94 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                            >= line_pitch * 2.5)
 
     flush()
+    _demote_image_only_headings(out)
     if junk_count[0]:
         print(f"挿絵ノイズ除去: {junk_count[0]} 行")
     return "\n".join(out)
+
+
+_MIDASHI_LINE_RE = re.compile(r"^［＃「(.*)」は中見出し(終わり)?］$")
+
+
+def _demote_image_only_headings(out):
+    """
+    本文が無く画像だけのセクションの見出しを、後方に類似見出しがある場合に
+    取り消す（目次・口絵ページの飾り文字が章見出しに誤検出され、実際の
+    章頭見出しと二重になるのを防ぐ。章扉→本文の正しい見出しは残る）。
+    out をインプレースで書き換える。
+    """
+    # 見出しブロック開始位置と見出しテキストを収集
+    heads = []   # (開始index, テキスト)
+    for i, ln in enumerate(out):
+        m = _MIDASHI_LINE_RE.match(ln)
+        if m and not m.group(2):
+            heads.append((i, m.group(1)))
+
+    drop_idx = []
+    for n, (i, title) in enumerate(heads):
+        end = heads[n + 1][0] if n + 1 < len(heads) else len(out)
+        # セクション内の本文量を数える（見出しタイトル表示行は本文でない）。
+        # 目次・口絵ページのOCR断片が数文字混じることがあるため、
+        # 合計8字以下なら本文なしとみなす
+        body_chars = 0
+        for ln in out[i:end]:
+            s = ln.strip()
+            if (not s or s == "［＃改ページ］" or _MIDASHI_LINE_RE.match(s)
+                    or s == title.strip()
+                    or _FIG_PLAIN_RE.fullmatch(s) or _FIG_CAP_RE.fullmatch(s)):
+                continue
+            body_chars += len(s)
+        if body_chars > 8:
+            continue
+        # 複数の章マーカーを含む見出し＝目次ページの章題連結 → 無条件で取り消す
+        if len(_CHAPTER_MARK_RE.findall(title)) >= 2:
+            drop_idx.append((i, title))
+            continue
+        # 記号が3割を超える見出し＝口絵・帯の飾りノイズ → 無条件で取り消す
+        core = re.sub(r'\s', '', title)
+        syms = len(re.findall(
+            r'[^ぁ-ゖァ-ヺー㐀-鿿々〆〇0-9０-９a-zA-Zａ-ｚＡ-Ｚ]', core))
+        if core and syms / len(core) > 0.3:
+            drop_idx.append((i, title))
+            continue
+        # 後方に類似見出しがあるか（漢数字も章番号として比較する）
+        norm = dedup_norm_heading(title)
+        digits = "".join(re.findall(r'[0-9０-９一二三四五六七八九十百]', norm))
+        for _, later in heads[n + 1:]:
+            l_norm = dedup_norm_heading(later)
+            l_digits = "".join(
+                re.findall(r'[0-9０-９一二三四五六七八九十百]', l_norm))
+            contained = len(norm) >= 4 and norm in l_norm
+            # 数字（漢数字含む）の厳格比較は取り消し候補側に数字がある場合のみ
+            # （(1)(2)(3)のような連続章の誤取り消し防止）。数字が読めていない
+            # 目次由来の見出しは類似度・包含だけで判定する
+            if digits and digits != l_digits:
+                continue
+            # 縦書き目次のOCRは読み順が崩れるため、文字集合の重なりでも判定
+            _ca, _cb = Counter(norm), Counter(l_norm)
+            char_overlap = (sum((_ca & _cb).values())
+                            / max(min(len(norm), len(l_norm)), 1)
+                            if min(len(norm), len(l_norm)) >= 5 else 0.0)
+            if (norm == l_norm or contained or char_overlap >= 0.75
+                    or difflib.SequenceMatcher(
+                        None, norm, l_norm).ratio() >= 0.70):
+                drop_idx.append((i, title))
+                break
+
+    # 見出しブロック（開始・タイトル行・終わり・直後の空行）を後ろから除去
+    for i, title in reversed(drop_idx):
+        j = i
+        end = min(i + 4, len(out))
+        block = []
+        for k in range(i, end):
+            s = out[k].strip()
+            if (_MIDASHI_LINE_RE.match(s) or s == title.strip()
+                    or (not s and k > i)):
+                block.append(k)
+            else:
+                break
+        for k in reversed(block):
+            del out[k]
 
 
 # ── OCR系統誤りの後処理正規化 ──────────────────────────
@@ -1875,15 +2075,82 @@ def _make_cover_image_xhtml(title: str, fmt: str = "jpg") -> str:
 
 
 def _make_episode_xhtml(ep_title: str, body_text: str,
-                        horizontal: bool = False) -> str:
-    """1話分のXHTMLを生成する。"""
-    body = (
-        f'<h2 class="ep-title">{_esc(ep_title)}</h2>\n'
-        + _body_lines_to_xhtml(body_text, horizontal=horizontal)
-    )
+                        horizontal: bool = False,
+                        show_title: bool = True) -> str:
+    """1話分のXHTMLを生成する。show_title=False は画像ページ分割の続き用。"""
+    h2 = f'<h2 class="ep-title">{_esc(ep_title)}</h2>\n' if show_title else ''
+    body = h2 + _body_lines_to_xhtml(body_text, horizontal=horizontal)
     return _XHTML_TMPL.format(title=_esc(ep_title), body=body,
                                html_class="hltr" if horizontal else "vrtl",
                                epub_type='')
+
+
+def _make_image_page_xhtml(fname: str, alt: str = "挿絵") -> str:
+    """全画面表示の画像ページXHTML（挿絵・口絵・章頭用、表紙ページと同構造）。"""
+    return f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xml:lang="ja" lang="ja"
+      class="hltr">
+<head>
+  <meta charset="UTF-8"/>
+  <title>{_esc(alt)}</title>
+  <style type="text/css">
+    html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; }}
+    img {{ width: 100%; height: 100%; object-fit: contain; display: block; }}
+  </style>
+</head>
+<body>
+  <img src="images/{_esc(fname)}" alt="{_esc(alt)}"/>
+</body>
+</html>
+"""
+
+
+def _split_episode_images(body: str) -> list:
+    """
+    エピソード本文から「改ページに挟まれた単独の図タグ」を専用画像ページとして
+    分離する。戻り値: [("text", 本文), ("image", ファイル名, alt), ...]。
+    段落中のインライン図タグはそのまま本文に残す（<figure> 描画）。
+    分離した図の前後の［＃改ページ］はファイル境界が改ページになるため除去する。
+    """
+    lines = body.split("\n")
+    segs, buf = [], []
+
+    def _is_break(ln):
+        return _PAGE_BREAK_LINE_RE.fullmatch(ln.strip()) is not None
+
+    def _flush():
+        txt = "\n".join(buf)
+        if txt.strip():
+            segs.append(("text", txt))
+        buf.clear()
+
+    i, n = 0, len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        m = (_FIG_PLAIN_RE.fullmatch(stripped)
+             or _FIG_CAP_RE.fullmatch(stripped))
+        if m:
+            # 前後の非空行が改ページ（または本文の先頭/終端）なら単独ページ
+            j = len(buf) - 1
+            while j >= 0 and not buf[j].strip():
+                j -= 1
+            k = i + 1
+            while k < n and not lines[k].strip():
+                k += 1
+            if (j < 0 or _is_break(buf[j])) and (k >= n or _is_break(lines[k])):
+                if j >= 0:
+                    del buf[j:]          # 直前の改ページを除去
+                _flush()
+                segs.append(("image", m.group(2), m.group(1) or "挿絵"))
+                i = k + 1 if k < n else k   # 直後の改ページも消費
+                continue
+        buf.append(lines[i])
+        i += 1
+    _flush()
+    return segs
 
 
 def _make_colophon_xhtml(title: str, source_url: str, site_name: str,
@@ -2052,7 +2319,8 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
               toc_at_end: bool = False,
               inline_images: list = None,
               synopsis: str = "",
-              horizontal: bool = False) -> str:
+              horizontal: bool = False,
+              doc_items: list = None) -> str:
     """
     OPF（package.opf）を生成する。
     cover_fmt: "png" | "svg" | "" (表紙画像なし)
@@ -2112,12 +2380,16 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
     if not toc_at_end:
         spine_items.append('<itemref idref="toc"/>')
 
-    for i, _ in enumerate(ep_titles):
-        n = i + 1
+    # doc_items: [(id, href)] — 画像ページ・分割ファイルを含む本文spine構成。
+    # 未指定時は従来どおりエピソード1話=1ファイル
+    if doc_items is None:
+        doc_items = [(f"ep{i+1:04d}", f"ep{i+1:04d}.xhtml")
+                     for i in range(len(ep_titles))]
+    for did, href in doc_items:
         manifest_items.append(
-            f'<item id="ep{n:04d}" href="ep{n:04d}.xhtml" media-type="application/xhtml+xml"/>'
+            f'<item id="{did}" href="{href}" media-type="application/xhtml+xml"/>'
         )
-        spine_items.append(f'<itemref idref="ep{n:04d}"/>')
+        spine_items.append(f'<itemref idref="{did}"/>')
     manifest_items.append(
         '<item id="colophon" href="colophon.xhtml" media-type="application/xhtml+xml"/>'
     )
@@ -2685,6 +2957,27 @@ def build_epub(
     book_id   = str(uuid.uuid4())
     ep_titles = [ep["title"] for ep in episodes]
 
+    # エピソード本文から専用画像ページを分離して本文spine構成を決める。
+    # 各エピソードの先頭ファイルは ep{n:04d}.xhtml（toc/nav のリンク先）で固定し、
+    # 続きの本文は ep{n:04d}_2.xhtml…、画像ページは img{m:04d}.xhtml とする。
+    doc_plan = []   # (id, href, seg, ep, show_title)
+    img_page_no = 0
+    for _i, _ep in enumerate(episodes):
+        segs = _split_episode_images(_ep["body"]) or [("text", _ep["body"])]
+        title_shown = False
+        for _si, _seg in enumerate(segs):
+            if _si == 0:
+                did = f"ep{_i+1:04d}"
+            elif _seg[0] == "text":
+                did = f"ep{_i+1:04d}_{_si+1}"
+            else:
+                img_page_no += 1
+                did = f"img{img_page_no:04d}"
+            show_title = _seg[0] == "text" and not title_shown
+            if _seg[0] == "text":
+                title_shown = True
+            doc_plan.append((did, did + ".xhtml", _seg, _ep, show_title))
+
     # 表紙画像：生データ指定 > 外部ファイル指定 > 自動生成
     if cover_image_data:
         cover_data, cover_fmt = cover_image_data, cover_image_fmt
@@ -2743,7 +3036,8 @@ def build_epub(
                               toc_at_end=toc_at_end,
                               inline_images=list(images.keys()) if images else None,
                               synopsis=synopsis,
-                              horizontal=horizontal))
+                              horizontal=horizontal,
+                              doc_items=[(d, h) for d, h, _s, _e, _t in doc_plan]))
 
         # nav.xhtml（RS向け機械読み取り専用、spine には linear="no" で含める）
         zf.writestr("OEBPS/nav.xhtml",
@@ -2775,11 +3069,15 @@ def build_epub(
                                       source_url=source_url, site_name=site_name,
                                       horizontal=horizontal))
 
-        # 各話
-        for i, ep in enumerate(episodes):
-            zf.writestr(f"OEBPS/ep{i+1:04d}.xhtml",
-                        _make_episode_xhtml(ep["title"], ep["body"],
-                                            horizontal=horizontal))
+        # 各話（本文パート＋専用画像ページ）
+        for did, href, seg, ep, show_title in doc_plan:
+            if seg[0] == "text":
+                content = _make_episode_xhtml(ep["title"], seg[1],
+                                              horizontal=horizontal,
+                                              show_title=show_title)
+            else:
+                content = _make_image_page_xhtml(seg[1], seg[2])
+            zf.writestr("OEBPS/" + href, content)
 
         # インライン画像（青空文庫 ZIP 内の挿絵等）
         if images:
@@ -2968,6 +3266,8 @@ def main():
     ap.add_argument("--no-ocr-fix", action="store_true",
                     help="OCR系統誤りの後処理正規化（ｌ/Ｉ→――、○→〇、"
                          "〃″→〝〟、小書きカナ並字化）を行わない")
+    ap.add_argument("--no-images", action="store_true",
+                    help="挿絵・口絵・章頭ページの画像ページ化を行わない")
     ap.add_argument("--epub", action="store_true",
                     help="リフロー型縦書きePub3も生成する")
     ap.add_argument("--cover-page", type=int, default=1, metavar="N",
@@ -2985,6 +3285,10 @@ def main():
     doc = fitz.open(args.pdf)
     npages = len(doc)
     page_nums = parse_pages_arg(args.pages, npages)
+    # 表紙ページはePub表紙として使うため本文抽出から除外（帯・タイトルの
+    # OCRノイズが冒頭に混入するのを防ぐ）。--cover-page 0 で無効化
+    if args.cover_page > 0:
+        page_nums = [i for i in page_nums if i != args.cover_page - 1]
 
     # 本文サイズ推定（対象ページの中央部からサンプリング）
     sample = page_nums[len(page_nums) // 4: len(page_nums) * 3 // 4] or page_nums
@@ -3014,21 +3318,40 @@ def main():
           f"柱・ノンブル除去 {len(drop)} 行 / 見出し候補 {len(headings)} 個 / "
           f"柱パターン {len(hashira_keys)} 種")
 
+    title = args.title or os.path.splitext(os.path.basename(args.pdf))[0]
+    author = args.author
+    out_path = args.output or os.path.join(
+        os.path.dirname(os.path.abspath(args.pdf)) or ".", title + ".txt")
+
+    # 画像ページ（挿絵・口絵・画像主体の章頭）の検出とレンダリング
+    image_page_map = {}   # page_num -> ファイル名
+    images_data = {}      # ファイル名 -> JPEGバイト列
+    if not args.no_images:
+        img_nums = classify_image_pages(doc, pages, drop)
+        if args.cover_page > 0:
+            img_nums.discard(args.cover_page - 1)   # 表紙ページは除外
+        for pnum in sorted(img_nums):
+            fname = f"p{pnum + 1:04d}.jpg"
+            images_data[fname] = render_image_page(doc, pnum)
+            image_page_map[pnum] = fname
+        if image_page_map:
+            img_dir = os.path.splitext(out_path)[0] + "_images"
+            os.makedirs(img_dir, exist_ok=True)
+            for fname, data in images_data.items():
+                with open(os.path.join(img_dir, fname), "wb") as f:
+                    f.write(data)
+            print(f"画像ページ検出: {len(image_page_map)} 枚 → {img_dir}/")
+
     body = assemble_text(pages, drop, headings, body_size,
                          body_top, body_bottom, hashira_keys,
-                         indent=not args.no_indent, verbose=args.verbose)
+                         indent=not args.no_indent, verbose=args.verbose,
+                         image_pages=image_page_map)
 
     if not args.no_ocr_fix:
         body, fix_stats = normalize_ocr_text(body)
         if fix_stats:
             detail = " / ".join(f"{k} {v}" for k, v in fix_stats.most_common())
             print(f"OCR後処理正規化: {sum(fix_stats.values())} 箇所（{detail}）")
-
-    title = args.title or os.path.splitext(os.path.basename(args.pdf))[0]
-    author = args.author
-
-    out_path = args.output or os.path.join(
-        os.path.dirname(os.path.abspath(args.pdf)) or ".", title + ".txt")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"{title}\n{author}\n\n{body}\n")
     print(f"✅ 青空文庫形式テキスト出力: {out_path}")
@@ -3054,7 +3377,8 @@ def main():
         build_epub(epub_path, title, author, synopsis, "", "自炊PDF",
                    episodes, cover_bg=args.cover_bg,
                    cover_image_path=args.cover_image or "",
-                   cover_image_data=cover_bytes)
+                   cover_image_data=cover_bytes,
+                   images=images_data or None)
         print(f"✅ ePub出力完了: {epub_path}")
 
 
