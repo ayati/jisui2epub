@@ -1038,6 +1038,18 @@ _DIGIT_CHARS = '0-9０-９〇一二三四五六七八九十百千万'
 _CIRCLE_L_RE = re.compile(rf'(?<=[{_DIGIT_CHARS}])[○◯]')
 _CIRCLE_R_RE = re.compile(rf'[○◯](?=[{_DIGIT_CHARS}])')
 
+# 文末の句点「。」を中黒「・」に誤認識するOCR誤り。正当な中黒はカタカナ語・
+# 人名（ドロシー・ギルマン）・漢字語の区切りがほぼ全てで、閉じ括弧の直前や
+# 行末に来る正当例は正解テキスト5冊・中黒約530個中0件だった（グリックの
+# 手作業校正版にも見逃された「〜よ・」「お休み・」の2件が残っていた）。
+# ひらがな・ひらがな等の文中の中黒は正当例があるため触れない。
+#   1) 和文字・点類の直後 + 閉じ括弧の直前 → 。（「……・」→「……。」含む）
+#   2) 和文字の直後 + 行末 → 。（点類直後は目次のリーダー罫の可能性があり除外）
+#   3) 和文字・閉じ括弧の直後 + 。の直前 → 除去（た・。→た。）
+_DOT_CLOSE_RE  = re.compile(r'(?<=[ぁ-ゖァ-ヶー一-鿿々》…・．：])・(?=[」』）])')
+_DOT_EOL_RE    = re.compile(r'(?<=[ぁ-ゖァ-ヶー一-鿿々》])・$', re.MULTILINE)
+_DOT_PERIOD_RE = re.compile(r'(?<=[ぁ-ゖァ-ヶー一-鿿々」』）])・(?=。)')
+
 # 小書きカナ→並字。直前の文字が拗音として成立する場合のみ小書きを残す。
 # 対象は拗音（ャュョ）と数詞のヵのみ:
 #   - ヶは地名（関ヶ原・市ヶ谷）で数詞以外にも正当なため対象外
@@ -1085,6 +1097,11 @@ def normalize_ocr_text(text):
     text = _count_sub(_DASH_ONBIKI2_RE, 'ー', text, '長音ー')
     text = _count_sub(_DASH_RE, '――', text, 'ダッシュ――')
 
+    # 文末の中黒→句点
+    text = _count_sub(_DOT_CLOSE_RE, '。', text, '文末。')
+    text = _count_sub(_DOT_EOL_RE, '。', text, '文末。')
+    text = _count_sub(_DOT_PERIOD_RE, '', text, '文末。')
+
     # ○→〇（数字連続を辿るため収束まで反復）
     while True:
         t2 = _CIRCLE_L_RE.sub('〇', text)
@@ -1113,6 +1130,60 @@ def normalize_ocr_text(text):
     return '\n'.join(fixed_lines), stats
 
 
+# ── ルビ内漢字混入の自動訂正 ──────────────────────────
+#
+# 通常の作品でひらがなルビの途中に漢字がまじるのは、まぎらわしい仮名を
+# OCRが漢字に誤認識したもの（こ→二、み→巳、な→念 等）。同じ親文字への
+# 正常な（仮名のみの）ルビは同じ本の中に多数出現するので、本の中の
+# 多数決＋かな部分の類似度で置換する（霧のむこうのふしぎな町で
+# OK48/NG4を確認。NGはいずれも置換前より悪化しない仮名置換）。
+
+_RUBY_PAIR_RE  = re.compile(r"(?:｜([^｜《》\n]+)|([一-鿿々〆〇ヶ]+))《([^《》]+)》")
+_RUBY_KANJI_RE = re.compile(r"[一-鿿々〆〇]")
+_RUBY_KANA_RE  = re.compile(r"[ぁ-ゖァ-ヶーゝゞヽヾ]")
+# 「正常ルビ」判定。ゑ・ゐは現代の作品のルビにほぼ現れず、み等のOCR破損
+# （すみか→すゑか）の方が多いため正常扱いしない
+_RUBY_CLEAN_RE = re.compile(r"[ぁ-わをんゔゕゖァ-ワヲンヴヵヶーゝゞヽヾ]+")
+
+
+def fix_ruby_kanji(text):
+    """ルビ内に混入した漢字を本内の多数決で訂正した (テキスト, 修正数) を返す。"""
+    # 第1パス: 親文字ごとの正常ルビ（仮名のみ）の頻度を集計
+    readings = {}
+    for m in _RUBY_PAIR_RE.finditer(text):
+        parent, ruby = m.group(1) or m.group(2), m.group(3)
+        if _RUBY_CLEAN_RE.fullmatch(ruby):
+            readings.setdefault(parent, Counter())[ruby] += 1
+
+    fixed = 0
+
+    def _repl(m):
+        nonlocal fixed
+        parent, ruby = m.group(1) or m.group(2), m.group(3)
+        if not _RUBY_KANJI_RE.search(ruby):
+            return m.group(0)
+        cands = readings.get(parent)
+        if not cands:
+            return m.group(0)          # 同じ親の正常ルビが本内にない → 保留
+        # 頻度1の候補は、同じ親に頻度4以上の候補があるなら自身もOCR破損の
+        # 疑いが濃いので除外（売《やつ》←売《う》×10 のような誤り候補対策）
+        max_freq = max(cands.values())
+        kana = "".join(_RUBY_KANA_RE.findall(ruby))
+        scored = [(difflib.SequenceMatcher(None, kana, c).ratio(), f, c)
+                  for c, f in cands.items() if f > 1 or max_freq < 4]
+        top = max(r for r, _, _ in scored)
+        if top < 0.5:
+            return m.group(0)          # かな部分が似た候補なし → 保留
+        # 最高類似度から0.25以内の候補のうち最頻のものを採用
+        # （だいどぢ×1 より だいどころ×3、こシス×1 より こえ×37 を優先）
+        _, _, best = max((f, r, c) for r, f, c in scored if r >= top - 0.25)
+        fixed += 1
+        prefix = "｜" + parent if m.group(1) else parent
+        return f"{prefix}《{best}》"
+
+    return _RUBY_PAIR_RE.sub(_repl, text), fixed
+
+
 # ── メイン ──────────────────────────────────────────
 
 def parse_pages_arg(arg, npages):
@@ -1130,6 +1201,20 @@ def parse_pages_arg(arg, npages):
         elif part:
             result.append(int(part) - 1)
     return sorted(set(i for i in result if 0 <= i < npages))
+
+
+def parse_meta_from_filename(path):
+    """「タイトル_作者名.pdf」形式のファイル名から (title, author) を推定する。
+    区切りは最初の _ を優先、次いで -（mangaP2ePub と同方式）。
+    区切りがなければ (ファイル名, "") を返す。"""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    for sep in ("_", "-"):
+        if sep in stem:
+            title, _, author = stem.partition(sep)
+            title, author = title.strip(), author.strip()
+            if title and author:
+                return title, author
+    return stem.strip(), ""
 
 
 def inspect_page(doc, num, body_size):
@@ -3251,13 +3336,106 @@ def parse_aozora_text(content: str) -> tuple:
     return title, author, synopsis, episodes
 
 
+def _pdf_cover_bytes(args, doc, npages):
+    """--cover-page 指定に従いPDFページを表紙JPEGにレンダリングする。
+    --cover-image 指定時や自動生成表紙（--cover-page 0）では b"" を返す。"""
+    if args.cover_image or args.cover_page <= 0:
+        return b""
+    if args.cover_page > npages:
+        print(f"警告: --cover-page {args.cover_page} はページ範囲外。"
+              "表紙を自動生成します。", file=sys.stderr)
+        return b""
+    pix = doc[args.cover_page - 1].get_pixmap(matrix=fitz.Matrix(2, 2))
+    return pix.tobytes("jpeg", jpg_quality=85)
+
+
+def run_from_text(args, doc, npages):
+    """校正済みの青空文庫形式テキストと元PDFからePubを再生成する。
+
+    テキストはこのツールの出力形式（1行目タイトル・2行目著者）を想定。
+    本文が参照する画像ページは、テキスト隣の <名前>_images/ ディレクトリに
+    ファイルがあればそれを使い、なければファイル名 pNNNN.jpg のページ番号で
+    PDFから再レンダリングする（校正でファイル名を変えなければ再現できる）。
+    """
+    txt_path = args.from_text
+    if not os.path.exists(txt_path):
+        print(f"エラー: ファイルが見つかりません: {txt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    content = None
+    for enc in ("utf-8-sig", "utf-8", "cp932"):
+        try:
+            with open(txt_path, "r", encoding=enc) as f:
+                content = f.read()
+            break
+        except UnicodeDecodeError:
+            continue
+    if content is None:
+        print(f"エラー: テキストを読み込めません（エンコーディング不明）: {txt_path}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    title, author, synopsis, episodes = parse_aozora_text(content)
+    if args.title:
+        title = args.title
+    if args.author:
+        author = args.author
+    if not title:
+        title = os.path.splitext(os.path.basename(txt_path))[0]
+    if not episodes:
+        print("エラー: ePub生成用の本文を抽出できませんでした。", file=sys.stderr)
+        sys.exit(1)
+
+    # 本文が参照する画像を収集
+    img_dir = os.path.splitext(txt_path)[0] + "_images"
+    images_data = {}
+    rerendered = 0
+    for ep in episodes:
+        figs = list(_FIG_CAP_RE.finditer(ep["body"])) \
+             + list(_FIG_PLAIN_RE.finditer(ep["body"]))
+        for m in figs:
+            fname = m.group(2)
+            if fname in images_data:
+                continue
+            path = os.path.join(img_dir, fname)
+            pm = re.fullmatch(r"p(\d+)\.jpe?g", fname, re.IGNORECASE)
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    images_data[fname] = f.read()
+            elif pm and 1 <= int(pm.group(1)) <= npages:
+                images_data[fname] = render_image_page(doc, int(pm.group(1)) - 1)
+                rerendered += 1
+            else:
+                print(f"警告: 画像が見つかりません: {fname}", file=sys.stderr)
+
+    print(f"校正済みテキスト: {txt_path}")
+    print(f"  タイトル: {title} / 著者: {author or '（なし）'} / {len(episodes)} 章"
+          + (f" / 画像 {len(images_data)} 枚（PDFから再取得 {rerendered} 枚）"
+             if images_data else ""))
+
+    out = args.output or txt_path
+    epub_path = os.path.splitext(out)[0] + ".epub"
+    cover_bytes = _pdf_cover_bytes(args, doc, npages)
+    print(f"📖 ePub生成中: {epub_path}")
+    build_epub(epub_path, title, author, synopsis, "", "自炊PDF",
+               episodes, cover_bg=args.cover_bg,
+               cover_image_path=args.cover_image or "",
+               cover_image_data=cover_bytes,
+               images=images_data or None)
+    print(f"✅ ePub出力完了: {epub_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="自炊PDF（OCR済み）→ 青空文庫形式テキスト変換")
     ap.add_argument("pdf", help="入力PDF（OCRテキスト層付き）")
     ap.add_argument("-o", "--output", help="出力テキストファイル")
-    ap.add_argument("--title", help="タイトル（省略時はファイル名）")
-    ap.add_argument("--author", default="", help="著者名")
+    ap.add_argument("--title", help="タイトル（省略時は「タイトル_作者名.pdf」"
+                                    "形式のファイル名から自動取得）")
+    ap.add_argument("--author", default="", help="著者名（省略時はファイル名から自動取得）")
+    ap.add_argument("--from-text", metavar="FILE",
+                    help="校正済みの青空文庫形式テキストからePubを再生成する"
+                         "（PDFは表紙・画像ページの取得にのみ使用。--epub 不要）")
     ap.add_argument("--pages", help="対象ページ範囲（例: 10-360 / 5,8,10-）")
     ap.add_argument("--ruby", choices=["aozora", "drop"], default="aozora",
                     help="ルビ処理: aozora=《》変換（既定） drop=除去")
@@ -3265,7 +3443,8 @@ def main():
                     help="段落頭の全角空白を入れない")
     ap.add_argument("--no-ocr-fix", action="store_true",
                     help="OCR系統誤りの後処理正規化（ｌ/Ｉ→――、○→〇、"
-                         "〃″→〝〟、小書きカナ並字化）を行わない")
+                         "〃″→〝〟、文末の・→。、小書きカナ並字化、"
+                         "ルビ内漢字の自動訂正）を行わない")
     ap.add_argument("--no-images", action="store_true",
                     help="挿絵・口絵・章頭ページの画像ページ化を行わない")
     ap.add_argument("--epub", action="store_true",
@@ -3284,6 +3463,11 @@ def main():
 
     doc = fitz.open(args.pdf)
     npages = len(doc)
+
+    if args.from_text:
+        run_from_text(args, doc, npages)
+        return
+
     page_nums = parse_pages_arg(args.pages, npages)
     # 表紙ページはePub表紙として使うため本文抽出から除外（帯・タイトルの
     # OCRノイズが冒頭に混入するのを防ぐ）。--cover-page 0 で無効化
@@ -3318,10 +3502,12 @@ def main():
           f"柱・ノンブル除去 {len(drop)} 行 / 見出し候補 {len(headings)} 個 / "
           f"柱パターン {len(hashira_keys)} 種")
 
-    title = args.title or os.path.splitext(os.path.basename(args.pdf))[0]
-    author = args.author
+    fn_title, fn_author = parse_meta_from_filename(args.pdf)
+    title = args.title or fn_title
+    author = args.author or fn_author
+    out_base = f"{title}_{author}" if author else title
     out_path = args.output or os.path.join(
-        os.path.dirname(os.path.abspath(args.pdf)) or ".", title + ".txt")
+        os.path.dirname(os.path.abspath(args.pdf)) or ".", out_base + ".txt")
 
     # 画像ページ（挿絵・口絵・画像主体の章頭）の検出とレンダリング
     image_page_map = {}   # page_num -> ファイル名
@@ -3352,6 +3538,10 @@ def main():
         if fix_stats:
             detail = " / ".join(f"{k} {v}" for k, v in fix_stats.most_common())
             print(f"OCR後処理正規化: {sum(fix_stats.values())} 箇所（{detail}）")
+        if args.ruby != "drop":
+            body, ruby_fixed = fix_ruby_kanji(body)
+            if ruby_fixed:
+                print(f"ルビ内漢字の自動訂正: {ruby_fixed} 箇所")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"{title}\n{author}\n\n{body}\n")
     print(f"✅ 青空文庫形式テキスト出力: {out_path}")
@@ -3364,15 +3554,7 @@ def main():
             print("エラー: ePub生成用の本文を抽出できませんでした。",
                   file=sys.stderr)
             sys.exit(1)
-        cover_bytes = b""
-        if not args.cover_image and args.cover_page > 0:
-            if args.cover_page <= npages:
-                pix = doc[args.cover_page - 1].get_pixmap(
-                    matrix=fitz.Matrix(2, 2))
-                cover_bytes = pix.tobytes("jpeg", jpg_quality=85)
-            else:
-                print(f"警告: --cover-page {args.cover_page} はページ範囲外。"
-                      "表紙を自動生成します。", file=sys.stderr)
+        cover_bytes = _pdf_cover_bytes(args, doc, npages)
         print(f"📖 ePub生成中: {epub_path}（{len(episodes)} 章）")
         build_epub(epub_path, title, author, synopsis, "", "自炊PDF",
                    episodes, cover_bg=args.cover_bg,
