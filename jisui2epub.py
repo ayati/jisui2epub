@@ -105,8 +105,24 @@ class VLine:
         return (self.x0 + self.x1) / 2
 
     def cell_height(self):
+        """文字セルの送り（ピッチ）。セルY開始位置の隣接差の中央値を返す。
+
+        インク高さ（c[2]-c[1]）の中央値だと、フォントの字面外マージン分だけ
+        実際の文字送りより大きい値になる入力（vision_reocr.py の書き戻しは
+        描画メトリクス上インク高さ≈フォントサイズ×1.2）で、attach_rubies の
+        Y座標→文字インデックス変換が累積的にずれ、ルビが後方の親文字に
+        誤って紐付く（ルビ密度の高い本ではペア一致率が2割以下まで崩壊）。
+        1行1スパンの旧OCRではセルは均等分割なので隣接差＝従来値となり
+        挙動は変わらない。"""
         if not self.cells:
             return self.size
+        if len(self.cells) >= 2:
+            diffs = [self.cells[i + 1][1] - self.cells[i][1]
+                     for i in range(len(self.cells) - 1)]
+            # 濁点分割などで同位置に重なったスパン由来のほぼ0の差は除く
+            diffs = [d for d in diffs if d > 0.5]
+            if diffs:
+                return statistics.median(diffs)
         hs = [c[2] - c[1] for c in self.cells]
         return statistics.median(hs) if hs else self.size
 
