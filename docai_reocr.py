@@ -53,6 +53,7 @@ from vision_reocr import (
     RETRY_BASE_WAIT,
     RUBY_FONTSIZE_RATIO,
     _atomic_save,
+    _dedup_symbols,
     _snap_column_x,
     insert_invisible_text,
     largest_embedded_image,
@@ -69,9 +70,9 @@ CALIBRATION_MAX_PAGES = 15
 CALIBRATION_TARGET_CHARS = 800
 
 # 同一文字の二重検出（DocAIがまれに同じルビ字形を2回返す。実測:
-# 地下室からのふしぎな旅の住所《じゅうしょ》が「じじゅゅううししょ」化）を
-# 重複とみなすX/Y座標の許容ずれ(pt)
-DEDUP_TOLERANCE = 2.0
+# 地下室からのふしぎな旅の住所《じゅうしょ》が「じじゅゅううししょ」化）の
+# 除去は vision_reocr._dedup_symbols を共有する（Vision側にも同症状があった
+# ため本体を移管した）
 
 
 def _default_project_id():
@@ -161,23 +162,6 @@ def _sym_rect(sym, sx, sy, img_w, img_h):
         xs = [v.x * img_w * sx for v in poly.normalized_vertices]
         ys = [v.y * img_h * sy for v in poly.normalized_vertices]
     return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
-
-
-def _dedup_symbols(symbols):
-    """同一文字がほぼ同一座標で二重検出されたものを除く"""
-    kept = []
-    seen = {}  # text -> [(x0, y0)]
-    for text, rect in symbols:
-        dup = False
-        for x0, y0 in seen.get(text, ()):
-            if abs(rect.x0 - x0) < DEDUP_TOLERANCE and abs(rect.y0 - y0) < DEDUP_TOLERANCE:
-                dup = True
-                break
-        if dup:
-            continue
-        seen.setdefault(text, []).append((rect.x0, rect.y0))
-        kept.append((text, rect))
-    return kept
 
 
 def collect_page_symbols_docai(document, page, img_size):
@@ -334,7 +318,7 @@ def reocr_pdf(client, processor_name, input_path, output_path, start_page, end_p
                 _atomic_save(doc, output_path)
                 print(f"  [チェックポイント保存: {output_path}]")
     finally:
-        _atomic_save(doc, output_path)
+        _atomic_save(doc, output_path, final=True)
         doc.close()
 
     elapsed = time.time() - t0

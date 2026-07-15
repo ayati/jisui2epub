@@ -94,6 +94,35 @@ RUBY_FONTSIZE_RATIO = 0.5
 # 地下室17.8%→46%、霧11.9%→44%まで改善済み）
 FONT_HEIGHT_RATIO = 1.2
 
+# 見出し（大きめ活字）のサイズ信号を保存するための閾値と上限。
+# 一律 target_body_fontsize で書き戻すと、章見出しが本文より大きい活字である
+# という信号が消え、jisui2epub.py 本体の is_big 判定（本文比1.18以上）が
+# 発火しなくなる（実例: 霧のむこうのふしぎな町。旧OCRは見出し16.8pt/本文
+# 13.5pt=1.24倍で検出できていたが、全ページVision化で章見出しが全滅した）。
+# → 縦書き列単位で「文字送りピッチ」（隣接文字のY開始位置差の中央値）が
+# ページの本文ピッチ中央値の BIG_SIZE_RATIO 倍以上の列だけ、ピッチ比を
+# 保って target_body_fontsize × (列ピッチ/本文ピッチ) で書き戻す。
+# インク幅で判定・スケールしてはならない: Visionのインク幅は列ぐるみで
+# ±20〜30%揺れる（実測・霧: 本文列が幅比1.23や1.34、逆に章見出しが幅比
+# 0.96や1.18）。ピッチは安定しており、同じ列で見出し1.27〜1.39、
+# 本文1.00〜1.05と明確に分離する（全224ページのシミュレーションで
+# 誤検出は旧OCRでも見出し扱いだった巻末広告の飾りタイトルのみ）。
+# 閾値1.21の根拠: 真の章見出しのピッチ比は霧の全8章＋あとがきで1.24〜1.45、
+# ソフロニア嬢の章相当（危機その…）で1.24〜1.28と、1.24以上に分布する。
+# 一方、誤検出候補の最大は黒牢城本文中のダッシュ強調行
+# 「――いや。ただ一人だけ――」の1.20（字間が広い演出行）で、1.21が
+# ちょうど両者を分離する（既存Vision PDF 5冊の文字位置による全ページ
+# シミュレーションで確認。巻末広告・奥付の飾りタイトルは閾値を超えるが、
+# それらは旧OCR直接変換でも見出し扱いになる既存挙動と同等）。
+# is_big の1.18より上なので、拡大された列は本体側でそのまま見出し候補になる。
+# 大きくする分にはルビ0.68倍しきい値の誤爆リスクはない。飾り文字対策として
+# 上限 BIG_SIZE_MAX_SCALE 倍でキャップする。
+# 横書きの見出し（岩波少年文庫型）は列グルーピングに乗らないため
+# この機構では保存されない（未対応）
+BIG_SIZE_RATIO = 1.21
+BIG_SIZE_MAX_SCALE = 3.0
+BIG_SIZE_MIN_CHARS = 4  # これ未満の短い列はピッチが不安定なので対象外
+
 # Visionが半角で返すがこの作品群では正文が全角である記号の対応表
 _FULLWIDTH_PUNCT = {"!": "！", "?": "？"}
 
@@ -199,7 +228,9 @@ def collect_page_symbols(annotation, page, img_size):
         key=lambda syms: sum(r.x0 + r.x1 for _, r in syms) / (2 * len(syms)),
         reverse=True,
     )
-    return _snap_column_x([sym for block in blocks for sym in block])
+    return _dedup_symbols(
+        _snap_column_x([sym for block in blocks for sym in block])
+    )
 
 
 # 縦書きの同一列が複数のVisionブロックに分断された際、ブロック間のX座標に
@@ -207,6 +238,31 @@ def collect_page_symbols(annotation, page, img_size):
 # 本文の列間隔（実測8〜14pt程度）よりは十分小さく、観測されたジッターよりは
 # 十分大きい値
 COLUMN_SNAP_TOLERANCE = 3.0
+
+# 二重検出とみなす座標差（pt）。DocAIで常用していたが、Visionも装飾的な
+# 章題文字などをまれに二重検出する（実測: 霧P.29の章見出しが
+# 「2ピピココッット屋敷という下宿」化）ため両エンジンで共有する
+DEDUP_TOLERANCE = 2.0
+
+
+def _dedup_symbols(symbols):
+    """同一文字がほぼ同一座標で二重検出されたものを除く"""
+    kept = []
+    seen = {}  # text -> [(x0, y0)]
+    for text, rect in symbols:
+        dup = False
+        for x0, y0 in seen.get(text, ()):
+            if (
+                abs(rect.x0 - x0) < DEDUP_TOLERANCE
+                and abs(rect.y0 - y0) < DEDUP_TOLERANCE
+            ):
+                dup = True
+                break
+        if dup:
+            continue
+        seen.setdefault(text, []).append((rect.x0, rect.y0))
+        kept.append((text, rect))
+    return kept
 
 
 def _snap_column_x(symbols):
@@ -379,10 +435,41 @@ def insert_invisible_text(
 
     count = 0
     ruby_count = 0
+    # 見出しサイズ信号の保存（詳細はBIG_SIZE_RATIOのコメント参照）:
+    # 縦書き列（_snap_column_xでX座標が完全一致している）ごとにピッチを
+    # 実測し、本文ピッチより有意に大きい非ルビ列だけ拡大スケールを記録する
+    big_scale_by_x = {}
+    col_stats = {}
+    cols = {}
+    for text, rect in symbols:
+        if not text.isascii():
+            cols.setdefault(rect.x0, []).append(rect)
+    body_pitches = []
+    for x0, rects in cols.items():
+        if len(rects) < BIG_SIZE_MIN_CHARS:
+            continue
+        ys = sorted(r.y0 for r in rects)
+        diffs = [b - a for a, b in zip(ys, ys[1:]) if b - a > 0.5]
+        if not diffs:
+            continue
+        wmed = statistics.median(r.width for r in rects)
+        if wmed < ruby_threshold:
+            continue  # ルビ列はピッチ基準にも拡大対象にもしない
+        pitch = statistics.median(diffs)
+        col_stats[x0] = pitch
+        body_pitches.append(pitch)
+    if len(body_pitches) >= 3:
+        page_pitch = statistics.median(body_pitches)
+        for x0, pitch in col_stats.items():
+            if pitch >= page_pitch * BIG_SIZE_RATIO:
+                big_scale_by_x[x0] = min(pitch / page_pitch, BIG_SIZE_MAX_SCALE)
+
     for text, rect in symbols:
         is_ruby = not text.isascii() and rect.width < ruby_threshold
         text = _FULLWIDTH_PUNCT.get(text, text)
         fontsize = ruby_fontsize if is_ruby else target_body_fontsize
+        if not is_ruby and rect.x0 in big_scale_by_x:
+            fontsize = target_body_fontsize * big_scale_by_x[rect.x0]
         # 挿入基準はベースライン指定だが、描画bboxの「上端」がVision実測の
         # 字面上端(rect.y0)に一致するようベースラインを置く
         # （baseline = y0 + ascender×fontsize。fontname="japan"のascenderは
@@ -419,13 +506,26 @@ def insert_invisible_text(
     return count, ruby_count
 
 
-def _atomic_save(doc, output_path):
+def _atomic_save(doc, output_path, final=False):
     """一時ファイルに保存してから置き換える。チェックポイント保存中の中断で
     出力ファイルが壊れるのを防ぐ。--start で再開する場合、出力パスから
     開いたdocをそのまま同じ output_path に doc.save() することはできない
-    （PyMuPDFの制約でincremental保存以外は不可）ため、この方式が必須"""
+    （PyMuPDFの制約でincremental保存以外は不可）ため、この方式が必須。
+
+    garbage回収は最終保存（final=True、以降docに書き込まない）に限る。
+    garbage付き保存はin-memoryのxrefを再番号付けするが、PyMuPDFが
+    insert_text用にキャッシュしているフォントxrefは古い番号のまま残るため、
+    保存後に処理したページの /Resources/Font/japan が無関係なオブジェクトを
+    指し、テキスト抽出がUTF-16BEコードポイント素通しの文字化けになる
+    （実測: 霧_scansnap 224ページ中チェックポイント直後のp21以降が全滅）。
+
+    最終保存もgarbage=2（未参照除去＋xref圧縮）までにとどめる。
+    garbage=4（ストリーム重複排除）は、--start再開などで「本ツールが生成
+    したPDFを開き直したdoc」に対して病的に遅くなる（実測: 霧30MBで
+    10分以上完了せずCPU100%。元のスキャンPDFから開いたdocなら数秒）。
+    redactionの残骸（旧テキスト層）はgarbage=2で除去できる"""
     tmp_path = output_path + ".tmp"
-    doc.save(tmp_path, garbage=4, deflate=True)
+    doc.save(tmp_path, garbage=2 if final else 0, deflate=True)
     os.replace(tmp_path, output_path)
 
 
@@ -575,7 +675,7 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
                 print(f"  [チェックポイント保存: {output_path}]")
     finally:
         # 例外時も直近のチェックポイント以降の分をできる限り保存する
-        _atomic_save(doc, output_path)
+        _atomic_save(doc, output_path, final=True)
         doc.close()
 
     elapsed = time.time() - t0
