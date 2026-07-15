@@ -237,6 +237,54 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"
   （上記の縦行分断バグ等）と混同しないよう、疑わしい場合は同じ本の
   未処理ページで同じ症状が出るか比較すること
 
+## docai_reocr.py（前処理: Google Cloud Document AIによる再OCR）
+
+vision_reocr.py のOCRエンジンを Document AI (Enterprise Document OCR,
+pretrained-ocr-v2.1) に差し替えた版。無料枠なし・$1.50/1000ページの従量課金
+だが精度を優先するユーザー向けの選択肢。
+
+```bash
+.venv/bin/pip install google-cloud-documentai
+# Document AI API有効化＋課金有効化の上、プロセッサを作成（初回のみ）
+.venv/bin/python docai_reocr.py --create-processor
+.venv/bin/python docai_reocr.py input.pdf   # 既定出力は <入力>_docai.pdf
+# プロセッサは自動検出（環境変数DOCAI_PROCESSORまたは--processorで明示も可）
+```
+
+VisionとのA/B実測（同一ページ・同一評価基盤、2026-07-16）:
+
+- ルビペア一致率: 地下室92.0%(Vision90.6) / 霧88.3%(88.5) / 蘇我氏66.7%(73.9) /
+  黒牢城76.0%(76.9) — ほぼ互角（蘇我氏の差はn=42での数件差）
+- **本文はDocAIが質的にきれい**: 地下室P.4-13の本文精密比較でVision誤り
+  14箇所42字（「こし」→「そ」等の内容レベルの脱落・化けを含む）に対し
+  DocAI誤り7箇所30字、うち実質誤読は「大→犬」の1字のみ
+  （残りはダッシュ／三点リーダの字種揺れとノンブル混入）
+- **2エンジンの誤り箇所はほとんど重ならない**（15箇所+8箇所中、共通3箇所のみ）
+  → 将来「両方でOCRして不一致箇所だけ人が確認する校正支援」の可能性がある
+- DocAIはVisionが検出漏れする1文字の極小ルビ（手《て》等）を自前検出できる
+  （旧OCR補完なしでも地下室91.2%を維持）。補完機構は位置照合で重複を防ぐ
+  ためそのまま併用している
+- 処理速度は約2秒/ページ（Visionの約4倍遅い）。同期APIの画像サイズ上限20MB
+
+実装の要点:
+
+- 書き戻しヒューリスティック（`_snap_column_x`・`insert_invisible_text`・
+  `_gapfill_missing_rubies`・`_atomic_save`等）は**vision_reocr.pyからimport
+  して共有**。二重実装による将来の乖離を防ぐ。このためvision_reocr.py側は
+  `google.cloud.vision` のimportを関数内に遅延化してあり、DocAIだけ使う
+  ユーザーはgoogle-cloud-vision未インストールでも動く
+- Document AIはシンボルがページ直下のフラット配列で来る（Visionのような
+  block→paragraph→word→symbol階層でない）ため、`text_anchor`の文字範囲で
+  ブロックに帰属させてから、Visionと同じX座標降順ソート＋列スナップを適用
+- シンボルのバウンディングボックスは`bounding_poly.vertices`（ピクセル座標）
+  優先、なければ`normalized_vertices`×画像サイズ
+- `enable_symbol=True`（OcrConfig）を指定しないとシンボル単位の座標が返らない
+- **DocAIはまれに同じルビ字形を二重検出する**（実測: 地下室の住所《じゅうしょ》
+  が「じじゅゅううししょ」化）→ 同一文字がX/Y2pt以内で重複したら除去
+  （`_dedup_symbols`）。この対処でルビ一致率91.2%→92.0%
+- プロセッサは`--create-processor`で作成（OCR_PROCESSORタイプ）、実行時は
+  認証JSONのproject_idから自動検出
+
 テスト用サンプル: `temp_sample/` に入力PDF・正解テキスト・公式ePubがある
 （グリックの冒険=古いOCR・挿絵多、ほんものの魔法使=新OCR、伯爵夫人=見出し弱、
 書を捨てよ=NORMAL/SUPERFINE両画質・エッセイ集、タイム・リープ上下=章頭画像・口絵、

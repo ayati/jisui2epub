@@ -55,8 +55,12 @@ import time
 
 import fitz  # PyMuPDF
 from google.api_core import exceptions as gexc
-from google.cloud import vision
 
+# google.cloud.vision のimportはVision APIを実際に呼ぶ関数内で行う（遅延import）。
+# 本モジュールの書き戻しヒューリスティック（_snap_column_x・
+# insert_invisible_text・_gapfill_missing_rubies等）は docai_reocr.py からも
+# importして共有しており、Document AIだけを使うユーザーが
+# google-cloud-vision 未インストールでも動かせるようにするため
 from jisui2epub import analyze_page, detect_body_size, RUBY_SIZE_RATIO
 
 # ルビ判定閾値: 本文の縦書き列幅の何倍未満をルビ（小書き文字）とみなすか。
@@ -137,6 +141,8 @@ def largest_embedded_image(doc, page):
 
 
 def ocr_page_with_vision(client, doc, page_index):
+    from google.cloud import vision
+
     page = doc[page_index]
     found = largest_embedded_image(doc, page)
     if found is None:
@@ -465,6 +471,8 @@ def _calibrate_body_fontsize(client, doc, start_page, end_page, cache):
 
 
 def reocr_pdf(input_path, output_path, start_page, end_page):
+    from google.cloud import vision
+
     client = vision.ImageAnnotatorClient()
     doc = fitz.open(input_path)
     end_page = min(end_page, len(doc))
