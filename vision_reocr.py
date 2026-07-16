@@ -61,7 +61,7 @@ from google.api_core import exceptions as gexc
 # insert_invisible_text・_gapfill_missing_rubies等）は docai_reocr.py からも
 # importして共有しており、Document AIだけを使うユーザーが
 # google-cloud-vision 未インストールでも動かせるようにするため
-from jisui2epub import analyze_page, detect_body_size, RUBY_SIZE_RATIO
+from jisui2epub import analyze_page, detect_body_size, KANA_RE, RUBY_SIZE_RATIO
 
 # ルビ判定閾値: 本文の縦書き列幅の何倍未満をルビ（小書き文字）とみなすか。
 # jisui2epub.py 本体のルビ判定(RUBY_SIZE_RATIO=0.68倍以下)と揃えている
@@ -125,6 +125,23 @@ BIG_SIZE_MIN_CHARS = 4  # これ未満の短い列はピッチが不安定なの
 
 # Visionが半角で返すがこの作品群では正文が全角である記号の対応表
 _FULLWIDTH_PUNCT = {"!": "！", "?": "？"}
+
+# ルビ（振り仮名）に原理的に出現しない約物。Visionのシンボル単位インク幅は
+# 「」・句読点・ダッシュ類では本文の文字でも細く出るため、幅だけでルビ判定
+# するとこれらがルビサイズで書き戻され、jisui2epub.py側のルビ列グルーピング
+# が隣の本当のルビに巻き込んで誤結合する（実測: 地下室の店《「みせ》×3・
+# 大《。おお》・師匠《‐ししよう》）。このセットの文字は幅によらず常に本文
+# として書き戻す。長音「ー」はカタカナ語のルビ（頁《ぺーじ》等）に正当に
+# 現れるため含めない。中黒「・」は外国人名ルビの区切りに使う本も稀にあるが、
+# 誤判定の実害の方がはるかに多いため含める
+_NEVER_RUBY = set("、。，．・：；！？「」『』（）〔〕｛｝〈〉《》【】"
+                  "…‥―—‐“”‘’〝〟゛゜´｀¨〜～※＊■□●○◎▲△▼▽")
+
+
+def _is_ruby_symbol(text, rect, ruby_threshold):
+    """このシンボルをルビとして書き戻すか（幅判定＋約物・半角英数の除外）"""
+    return (not text.isascii() and text not in _NEVER_RUBY
+            and rect.width < ruby_threshold)
 
 # 一時的なAPIエラーのリトライ回数・待機秒（指数バックオフ）
 MAX_RETRIES = 4
@@ -352,12 +369,17 @@ def _gapfill_missing_rubies(symbols, old_rubies, ruby_threshold, target_ruby_fon
     （実測で確認したバグ）。cell_hを使えば実寸に近いサイズで描画され、
     target_ruby_fontsizeより大きくなることもない（安全のためcapする）"""
     vision_ruby_symbols = [
-        (t, r) for t, r in symbols if not t.isascii() and r.width < ruby_threshold
+        (t, r) for t, r in symbols if _is_ruby_symbol(t, r, ruby_threshold)
     ]
     filled = []
     for old_ruby in old_rubies:
         text = old_ruby.text.strip()
-        if not text or _old_ruby_covered(old_ruby, vision_ruby_symbols):
+        # かなを含まない旧「ルビ」はノンブル・挿絵ノイズの誤分類
+        # （旧OCRはノンブルを小フォントで申告するためルビ判定に食い込む）。
+        # 補完するとノンブルがルビとして復活する（実測: 霧P.24のルビ'24'）
+        if not text or not KANA_RE.search(text):
+            continue
+        if _old_ruby_covered(old_ruby, vision_ruby_symbols):
             continue
         n = len(text)
         cell_h = (old_ruby.y1 - old_ruby.y0) / n
@@ -420,7 +442,7 @@ def insert_invisible_text(
 
     ruby_widths = [
         rect.width for text, rect in symbols
-        if not text.isascii() and rect.width < ruby_threshold
+        if _is_ruby_symbol(text, rect, ruby_threshold)
     ]
     if ruby_widths:
         ruby_fontsize = min(statistics.median(ruby_widths), target_ruby_fontsize)
@@ -465,7 +487,7 @@ def insert_invisible_text(
                 big_scale_by_x[x0] = min(pitch / page_pitch, BIG_SIZE_MAX_SCALE)
 
     for text, rect in symbols:
-        is_ruby = not text.isascii() and rect.width < ruby_threshold
+        is_ruby = _is_ruby_symbol(text, rect, ruby_threshold)
         text = _FULLWIDTH_PUNCT.get(text, text)
         fontsize = ruby_fontsize if is_ruby else target_body_fontsize
         if not is_ruby and rect.x0 in big_scale_by_x:

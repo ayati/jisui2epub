@@ -56,6 +56,15 @@ except ImportError:
 RUBYABLE_RE = re.compile(r'[㐀-鿿豈-﫿々〆ヶ〇]')
 # ノンブル（ページ番号）: 半角/全角数字・漢数字のみ
 NOMBRE_RE = re.compile(r'^[0-9０-９一二三四五六七八九十百]+$')
+# 本文列の端に吸着したノンブル剥がしの対象。漢数字は本文に正当に出るため
+# 含めない。半角記号・英字も含めるのは、Visionがノンブルを「1/6」（176）の
+# ように誤読することがあり、数字限定だと非数字で剥がしが止まるため。
+# 判定は本文領域外の列端に限るので、本文中の正当なASCIIには影響しない
+_ARABIC_DIGITS = set("０１２３４５６７８９")
+
+
+def _nombre_junk_char(ch):
+    return ch.isascii() or ch in _ARABIC_DIGITS
 # 頻度カウント用に数字を潰す
 DIGIT_RE = re.compile(r'[0-9０-９]')
 
@@ -431,17 +440,49 @@ def classify_marginals(pages, body_size):
       headings : {(page_num, id(line)): text} — 見出しとして残す行
       hashira_keys : {正規化テキスト: 出現ページ数} — 柱テキスト一覧
     """
-    # 本文領域（縦行の上端・下端の中央値）
+    # 本文領域（縦行の上端・下端の中央値）。
+    # Vision再OCR経路ではノンブルの数字が本文サイズで書き戻されるため、
+    # ページ端の数字が最寄りの本文列の末尾に吸着していることがある
+    # （霧P.24: 本文列が「…うっそうとした木2」になり列下端も約22pt伸びる）。
+    # 領域推定に数字セルを含めると本文下端がノンブル位置まで膨らみ、
+    # ノンブル行が「本文領域内」と誤判定されて除去に乗らなくなるので、
+    # 算用数字以外のセルの範囲で推定する
     tops, bottoms = [], []
     for pg in pages:
-        body = [v for v in pg.vlines
-                if len(v.cells) >= 3 and v.size >= body_size * 0.8]
-        if body:
-            tops.append(min(v.y0 for v in body))
-            bottoms.append(max(v.y1 for v in body))
+        pg_tops, pg_bottoms = [], []
+        for v in pg.vlines:
+            if len(v.cells) < 3 or v.size < body_size * 0.8:
+                continue
+            nd = [c for c in v.cells if not _nombre_junk_char(c[0])]
+            if nd:
+                pg_tops.append(min(c[1] for c in nd))
+                pg_bottoms.append(max(c[2] for c in nd))
+        if pg_tops:
+            tops.append(min(pg_tops))
+            bottoms.append(max(pg_bottoms))
     body_top = statistics.median(tops) if tops else 0
     body_bottom = statistics.median(bottoms) if bottoms else 1e9
     cell = body_size
+
+    # 本文列の端に吸着したノンブル数字を剥がす。対象は「数字・ASCII のセル」
+    # かつ「y中心が本文領域の外」のものだけ（章見出し先頭の章番号は
+    # 本文領域内なので残る）。剥がした結果空になった縦行はページから除く
+    for pg in pages:
+        kept = []
+        for vl in pg.vlines:
+            while vl.cells and _nombre_junk_char(vl.cells[-1][0]) and \
+                    (vl.cells[-1][1] + vl.cells[-1][2]) / 2 > \
+                    body_bottom + cell * 0.3:
+                vl.cells.pop()
+            while vl.cells and _nombre_junk_char(vl.cells[0][0]) and \
+                    (vl.cells[0][1] + vl.cells[0][2]) / 2 < \
+                    body_top - cell * 0.3:
+                vl.cells.pop(0)
+            if vl.cells:
+                vl.y0 = min(c[1] for c in vl.cells)
+                vl.y1 = max(c[2] for c in vl.cells)
+                kept.append(vl)
+        pg.vlines = kept
 
     # 柱・ノンブルはフォントが小さく「ルビ」に誤分類されていることがある。
     # 本文領域の外にあるルビはマージン行（柱・ノンブル候補）に移す。
@@ -1193,6 +1234,117 @@ def fix_ruby_kanji(text):
         # 最高類似度から0.25以内の候補のうち最頻のものを採用
         # （だいどぢ×1 より だいどころ×3、こシス×1 より こえ×37 を優先）
         _, _, best = max((f, r, c) for r, f, c in scored if r >= top - 0.25)
+        fixed += 1
+        prefix = "｜" + parent if m.group(1) else parent
+        return f"{prefix}《{best}》"
+
+    return _RUBY_PAIR_RE.sub(_repl, text), fixed
+
+
+# ── ルビ読みの濁点・半濁点・小書き誤読の自動訂正 ──────────────
+#
+# 極小活字のルビでは ゛/゜ の混同（くび→くぴ・ばな→ぱな）、濁点の
+# 有無（あたま→あだま）、小書き/並字の混同（ちょうめ→ちようめ・
+# じゅず→じゆず）が誤りの最大勢力（地下室からのふしぎな旅・Vision経路の
+# 全文実測: 不一致1148件中423件）。総ルビの本では同じ親文字への正しい
+# ルビが多数出現するので、「濁点・半濁点・小書きの置換だけで一致する
+# 読み（＝スケルトン一致）」が本内に圧倒的多数あればそれに合わせる。
+#
+# 選択は「音韻の事前知識票 → 本内頻度」の2段階:
+#   1. 事前知識票: 日本語の読みでほぼ成立しない並びを「違反」として数え、
+#      違反数が自分より少ない同型候補があれば頻度不問でそれを採用する。
+#      違反 = 小書きゃゅょがイ段以外の直後 / 並字やゆよがイ段の直後 /
+#      ひらがな半濁点ぱ行がっ・ん以外の直後。系統的な誤読（ゆび→ゆぴ、
+#      しゃめん→しやめん）は本内で誤りの方が多数派になることがあり
+#      （地下室で実測: 指《ゆぴ》が《ゆび》より高頻度）、頻度だけの多数決
+#      では正解の側が壊されるため、この票を頻度より優先する。
+#      実測（4冊）: 頻度のみ＝改善66/悪化15 → 事前知識票あり＝改善326/悪化6
+#      （悪化6件は全てGOAL側の残存誤りや表記揺れで、実質的な悪化は無し）
+#   2. 頻度: 違反数で差がつかない組（あたま/あだま等の濁点有無）は連濁
+#      （橋: はし/ばし、本: ほん/ぼん/ぽん）と衝突しうるため保守的に、
+#      定着候補（頻度2以上）が一意で、頻度 RUBY_VARIANT_MIN_FREQ 以上かつ
+#      自身の RUBY_VARIANT_DOMINANCE 倍以上のときだけ訂正する
+
+RUBY_VARIANT_MIN_FREQ = 4   # 頻度票での訂正先に要求する本内最低出現数
+RUBY_VARIANT_DOMINANCE = 3  # 頻度票での訂正先に要求する自身との頻度比
+
+_DAKUTEN_MARKS = ("゙", "゚")   # 結合用濁点・半濁点（NFD分解後）
+_SMALL2BIG_KANA = str.maketrans(
+    "ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ",
+    "あいうえおつやゆよわかけアイウエオツヤユヨワカケ")
+
+_IDAN_KANA = set("きぎしじちぢにひびぴみりキギシジチヂニヒビピミリ")
+_SMALL_YAYUYO = set("ゃゅょ")
+_LARGE_YAYUYO = set("やゆよ")
+_HANDAKU_HIRA = set("ぱぴぷぺぽ")   # カタカナのパ行は語頭でも正当（頁《ぺーじ》）
+_SOKUON_N = set("っんッン")
+
+
+def _kana_skeleton(s):
+    """濁点・半濁点を除去し小書きを並字化した読みの骨格。OCRが混同しやすい
+    字形クラス（ば/ぱ/は、よ/ょ、つ/っ…）を同一視するために使う。"""
+    out = [ch for ch in unicodedata.normalize("NFD", s)
+           if ch not in _DAKUTEN_MARKS]
+    return "".join(out).translate(_SMALL2BIG_KANA)
+
+
+def _reading_violations(s):
+    """読みとして不自然な並びの数。同型候補の優先順位付けに使う。
+    自由《じゆう》・器用《きよう》・視野《しや》のような例外は違反に
+    数えてしまうが、訂正は同じ親文字にスケルトン一致の別候補が実在する
+    ときしか起きないため、実害はない（4冊の実測で誤爆0）。"""
+    v = 0
+    for i, ch in enumerate(s):
+        prev = s[i - 1] if i else ""
+        if ch in _SMALL_YAYUYO and prev not in _IDAN_KANA:
+            v += 1
+        elif ch in _LARGE_YAYUYO and prev in _IDAN_KANA:
+            v += 1
+        elif ch in _HANDAKU_HIRA and prev not in _SOKUON_N:
+            v += 1
+    return v
+
+
+def fix_ruby_variants(text):
+    """濁点・半濁点・小書きの誤読ルビを本内多数決で訂正した (テキスト, 修正数)。"""
+    readings = {}
+    for m in _RUBY_PAIR_RE.finditer(text):
+        parent, ruby = m.group(1) or m.group(2), m.group(3)
+        if _RUBY_CLEAN_RE.fullmatch(ruby):
+            readings.setdefault(parent, Counter())[ruby] += 1
+
+    fixed = 0
+
+    def _repl(m):
+        nonlocal fixed
+        parent, ruby = m.group(1) or m.group(2), m.group(3)
+        if not _RUBY_CLEAN_RE.fullmatch(ruby):
+            return m.group(0)
+        cands = readings.get(parent)
+        if not cands:
+            return m.group(0)
+        sk = _kana_skeleton(ruby)
+        equivalents = [c for c in cands
+                       if c != ruby and _kana_skeleton(c) == sk]
+        if not equivalents:
+            return m.group(0)
+        vr = _reading_violations(ruby)
+        best = None
+        # 第1票: 音韻の事前知識（違反数が減る候補があれば頻度不問で採用）
+        better = [c for c in equivalents if _reading_violations(c) < vr]
+        if better:
+            best = min(better, key=lambda c: (_reading_violations(c),
+                                              -cands[c]))
+        else:
+            # 第2票: 本内頻度（定着候補が一意で圧倒的なときだけ）
+            settled = [c for c in equivalents
+                       if cands[c] >= 2 and _reading_violations(c) <= vr]
+            if len(settled) == 1 and \
+                    cands[settled[0]] >= max(RUBY_VARIANT_MIN_FREQ,
+                                             cands[ruby] * RUBY_VARIANT_DOMINANCE):
+                best = settled[0]
+        if best is None:
+            return m.group(0)
         fixed += 1
         prefix = "｜" + parent if m.group(1) else parent
         return f"{prefix}《{best}》"
@@ -3558,6 +3710,9 @@ def main():
             body, ruby_fixed = fix_ruby_kanji(body)
             if ruby_fixed:
                 print(f"ルビ内漢字の自動訂正: {ruby_fixed} 箇所")
+            body, variant_fixed = fix_ruby_variants(body)
+            if variant_fixed:
+                print(f"ルビ濁点・小書き誤読の自動訂正: {variant_fixed} 箇所")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"{title}\n{author}\n\n{body}\n")
     print(f"✅ 青空文庫形式テキスト出力: {out_path}")
