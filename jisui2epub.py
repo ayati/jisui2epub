@@ -1069,6 +1069,396 @@ def _demote_image_only_headings(out):
             del out[k]
 
 
+# ── 紙の目次ページを章題辞書として使う見出し精錬 ──────────────
+#
+# 章頭の見出し検出は「位置」は正確だが「表記」が弱い: 縦中横の2桁章番号は
+# ほぼ確実に化け（11→ｕ、12→胆、17→Ⅳ。ほんものの魔法使で20章中9章）、
+# 章題自体の誤字（ジェイン→ジエガイン）や章の取りこぼし（訳者あとがき）も
+# 起きる。一方、前付けの目次ページは章題部分のOCRがきれい（同書で全章正確）
+# だが、読み順が崩れて章番号と題の対応が取れず、ページ数の列はジャンク化
+# するため、目次ページから直接目次を生成することはできない。
+# → 本文の見出し（位置）を主、目次ページ（表記）を辞書として突き合わせる。
+#
+# 処理: (1)目次セグメント特定（見出しへのあいまい一致3行以上、または
+# 目次ラベル＋2行以上） (2)見出し⇔エントリのスコア降順貪欲マッチ。見出し
+# 先頭の1〜2文字をスキップした方が良く一致すれば化けた章番号とみなす
+# (3)表記が食い違えば柱テキストに近い方を採用（目次側も誤る: マジェイァ）
+# (4)章番号の連番再構成（正しく読めた番号をアンカーに、スロット数が合う
+# 区間のみ内挿。末尾方向は番号の証拠か目次一致がある見出しに限り外挿し、
+# あとがき類で打ち切る） (5)目次にあって見出しに無い章を改ページ直後の
+# 本文行から回収 (6)書名と同一の見出し（扉）を目次に無い場合のみ降格
+# （書名と同名の表題章がある本を守る） (7)目次ページ本文の除去
+# （ePubではnav目次が役割を代替する）
+
+_TOC_LABEL_RE = re.compile(r'^[　\s]*(目\s*次|もくじ|くじ)[　\s]*$')
+# 番号を振らない見出し（前後付け）。連番の末尾外挿はここで打ち切る
+_UNNUMBERED_RE = re.compile(
+    r'^(序[章文]?|プロローグ|エピローグ|まえがき|はじめに)$'
+    r'|あとがき|解説|おわりに|訳者|参考文献|初出|謝辞|付録|年表|索引')
+_LEADNUM_RE = re.compile(r'^(第?)([0-9０-９]{1,3})([章話部]|[　\s])?')
+_ZEN2HAN = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def _heading_fuzzy_score(a, b):
+    """見出しと目次エントリの類似度。縦書き目次は読み順が崩れることがある
+    ため、difflib比と文字集合オーバーラップの大きい方を使う。"""
+    if not a or not b:
+        return 0.0
+    r = difflib.SequenceMatcher(None, a, b).ratio()
+    if min(len(a), len(b)) >= 4:
+        ca, cb = Counter(a), Counter(b)
+        r = max(r, sum((ca & cb).values()) / min(len(a), len(b)))
+    return r
+
+
+def _toc_entry_of_line(line):
+    """目次セグメントの1行を章題エントリに正規化する。エントリでない行は
+    None。ルビ（ページ数の巻き込み等ジャンクが多い）と末尾に付いた
+    漢数字・数字のページ番号を落とす。"""
+    s = re.sub(r'《[^《》]*》|[｜]', '', line).strip("　 \t")
+    if (not s or s.startswith("［＃") or _TOC_LABEL_RE.match(s)
+            or is_junk_line(s)):
+        return None
+    # 末尾のページ番号（漢数字・数字の連なり）を除去。
+    # 「一にお芝居」のような先頭の漢数字は残る
+    s = re.sub(r'[0-9０-９一二三四五六七八九十百千〇=＝・．\s　]+$', '', s)
+    # 数字を除いてかな・漢字を2文字以上含まない行はページ数列・ノイズ
+    core = re.sub(r'[0-9０-９一二三四五六七八九十百千〇\s　]', '', s)
+    if len(core) < 2 or len(s) > HEADING_MAX_LEN:
+        return None
+    return s
+
+
+def _norm_t(s):
+    return re.sub(r'[\s　]', '', s)
+
+
+def refine_headings_with_toc(body, book_title, hashira_keys=None,
+                             verbose=False):
+    """紙の目次ページと本文見出しを突き合わせて見出しを精錬した本文と
+    処理統計を返す。目次ページが見つからない本でも章番号の内挿だけは行う。"""
+    hashira_keys = hashira_keys or {}
+    out = body.split("\n")
+
+    heads = [i for i, ln in enumerate(out)
+             if (m := _MIDASHI_LINE_RE.match(ln)) and not m.group(2)]
+    if not heads:
+        return body, {}
+
+    def head_title(i):
+        return _MIDASHI_LINE_RE.match(out[i]).group(1)
+
+    stats = {}
+
+    # ── 1. 目次セグメントの特定（改ページ・見出しブロックで区切る）──
+    # 誤検出は本文の大量削除に直結するため、条件は保守的に:
+    #   - 前付けにあること（本文の先頭15%以内 かつ 4番目の見出しより前）。
+    #     詩集の詩行・巻末広告など「見出しに似た短行の多いページ」が
+    #     本文中に現れても目次と誤認しない（書を捨てよ・霧で実測した事故）
+    #   - 一致判定は difflib 比0.75以上（文字集合オーバーラップは短い行が
+    #     多い総ルビ本の本文に誤ヒットするためセグメント判定には使わない）
+    #   - セグメント数の上限3。超えたら判定自体が疑わしいので照合を中止
+    titles_norm = [_norm_t(head_title(i)) for i in heads]
+    head_set = set(heads)
+    segments = []
+    seg_start = 0
+    for i in range(len(out) + 1):
+        ln = out[i] if i < len(out) else "［＃改ページ］"
+        if ln.strip() == "［＃改ページ］" or i in head_set:
+            if i > seg_start:
+                segments.append((seg_start, i))
+            seg_start = i if i in head_set else i + 1
+    front_limit = min(int(len(out) * 0.15),
+                      heads[3] if len(heads) > 3 else len(out))
+    toc_spans = []
+    toc_entries = []
+    for a, b in segments:
+        if a > front_limit:
+            continue
+        entries = []
+        has_label = False
+        contains_heading = False
+        for j in range(a, b):
+            if _MIDASHI_LINE_RE.match(out[j]):
+                contains_heading = True
+                break
+            if _TOC_LABEL_RE.match(out[j]):
+                has_label = True
+                continue
+            e = _toc_entry_of_line(out[j])
+            if e:
+                entries.append(e)
+        if contains_heading or not entries:
+            continue
+        n_match = sum(1 for e in entries
+                      if any(difflib.SequenceMatcher(
+                          None, _norm_t(e), t).ratio() >= 0.75
+                          for t in titles_norm))
+        if n_match >= 3 or (has_label and n_match >= 2):
+            toc_spans.append((a, b))
+            toc_entries.extend(entries)
+    if len(toc_spans) > 3:
+        toc_spans = []
+
+    if not toc_spans:
+        n = _renumber_headings(out, heads, {})
+        if n:
+            stats["章番号再構成"] = n
+        return "\n".join(out), stats
+    stats["目次ページ"] = len(toc_spans)
+
+    # ── 2. 見出し⇔エントリの対応付け（スコア降順の貪欲マッチ）──
+    cands = []
+    for hi, i in enumerate(heads):
+        t = _norm_t(head_title(i))
+        for ei, e in enumerate(toc_entries):
+            en = _norm_t(e)
+            for skip in (0, 1, 2):
+                if len(t) - skip < 2:
+                    break
+                sc = _heading_fuzzy_score(t[skip:], en)
+                if sc >= 0.70:
+                    cands.append((sc, -skip, hi, ei))
+    cands.sort(reverse=True)
+    matched = {}          # hi -> (エントリ文字列, skip)
+    used_ei = set()
+    for sc, nskip, hi, ei in cands:
+        if hi in matched or ei in used_ei:
+            continue
+        matched[hi] = (toc_entries[ei], -nskip)
+        used_ei.add(ei)
+
+    # ── 3. 表記の修復（柱を審判に、目次エントリと見出しの良い方を採用）──
+    def hashira_vote(a, b):
+        """柱テキスト群に近いのは a か b か。同点なら a（現状維持）。"""
+        best_a = max((difflib.SequenceMatcher(None, norm_hashira(a), k).ratio()
+                      for k in hashira_keys), default=0.0)
+        best_b = max((difflib.SequenceMatcher(None, norm_hashira(b), k).ratio()
+                      for k in hashira_keys), default=0.0)
+        return a if best_a >= best_b else b
+
+    info = {}   # 行index -> (番号なし章題, 番号があった証拠, 目次一致)
+    n_repair = 0
+    for hi, i in enumerate(heads):
+        title = head_title(i)
+        m = _LEADNUM_RE.match(title)
+        lead_num = m is not None
+        rest = title[m.end():] if m else title
+        evidence = lead_num
+        if hi in matched:
+            e, skip = matched[hi]
+            if skip and not lead_num:
+                evidence = True       # 化けた番号をスキップして一致した
+                rest = title[skip:]
+            # 目次エントリ側にも章番号が付いている本（グリック等）があるため、
+            # エントリの先頭番号を剥がしてから比較・採用する（剥がさないと
+            # 「第１部第１部」「６　６ドブネズミ…」のような二重番号になる）
+            me = _LEADNUM_RE.match(e)
+            e_core = e[me.end():].strip("　 ") if me else e
+            if e_core and _norm_t(rest) != _norm_t(e_core):
+                fixed = hashira_vote(rest, e_core)
+                if _norm_t(fixed) != _norm_t(rest):
+                    n_repair += 1
+                rest = fixed
+        info[i] = (rest.strip("　 "), evidence, hi in matched)
+    if n_repair:
+        stats["章題修復"] = n_repair
+
+    # ── 6. 書名と同一の見出しの降格（目次に載っていない場合のみ）──
+    title_norm = _norm_t(book_title or "")
+    demote = set()
+    if title_norm:
+        for hi, i in enumerate(heads):
+            if hi in matched:
+                continue
+            if _heading_fuzzy_score(_norm_t(info[i][0]), title_norm) >= 0.85:
+                demote.add(i)
+    if demote:
+        stats["扉見出し降格"] = len(demote)
+
+    # ── 5. 欠落章の検出（改ページ直後の本文行から。目次ページ内は除く）──
+    # 連番の再構成より先に検出だけ行い、あとがき類が回収された場合に
+    # 末尾方向の外挿がそこで正しく打ち切られるようにする
+    in_toc = set()
+    for a, b in toc_spans:
+        in_toc.update(range(a, b))
+    # 回収は本文行の見出し昇格＝誤ると本文構造を壊すため、判定は
+    # difflib比0.85以上（オーバーラップ不使用）・回収数は5件まで
+    used_texts = {e for e, _ in matched.values()}
+    recovered = []
+    for e in toc_entries:
+        if len(recovered) >= 5:
+            break
+        if e in used_texts or len(_norm_t(e)) < 4:
+            continue
+        en = _norm_t(e)
+        for j, ln in enumerate(out):
+            if j in in_toc or j in head_set:
+                continue
+            s = ln.strip("　 ")
+            if not s or s.startswith("［＃"):
+                continue
+            prev = [x for x in out[max(0, j - 3):j] if x.strip()]
+            if not prev or prev[-1].strip() != "［＃改ページ］":
+                continue
+            if difflib.SequenceMatcher(None, _norm_t(s), en).ratio() >= 0.85:
+                recovered.append((j, e))
+                used_texts.add(e)
+                break
+
+    # ── 4. 章番号の再構成＋修復章題の反映 ──
+    keep_heads = [i for i in heads if i not in demote]
+    n_renum = _renumber_headings(out, keep_heads, info,
+                                 breaks=[j for j, _ in recovered])
+    if n_renum:
+        stats["章番号再構成"] = n_renum
+
+    for j, e in recovered:
+        out[j] = (f"［＃「{e}」は中見出し］\n{e}\n"
+                  f"［＃「{e}」は中見出し終わり］")
+    if recovered:
+        stats["欠落章回収"] = len(recovered)
+
+    # ── 6b/7. 扉見出しのマーカー除去・目次ページ本文の除去 ──
+    for i in demote:
+        for k in range(i, min(i + 4, len(out))):
+            if _MIDASHI_LINE_RE.match(out[k]):
+                out[k] = None
+    for a, b in toc_spans:
+        for k in range(a, b):
+            if out[k] is None:
+                continue
+            s = out[k].strip()
+            if _FIG_PLAIN_RE.fullmatch(s) or _FIG_CAP_RE.fullmatch(s):
+                continue   # 図タグは残す（目次ページが画像化された場合）
+            out[k] = None
+
+    out = [ln for ln in out if ln is not None]
+    cleaned = []
+    for ln in out:
+        if (ln.strip() == "［＃改ページ］" and cleaned
+                and cleaned[-1].strip() == "［＃改ページ］"):
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned), stats
+
+
+def _renumber_headings(out, head_idx, info, breaks=()):
+    """見出しの章番号を連番で再構成し、修復済み章題も反映する
+    （outをインプレースで書き換え、変更した見出し数を返す）。
+    info が空の場合（目次なし）は見出し行から番号だけ解析して内挿する。
+    breaks: これから見出しに昇格する行index（欠落章の回収位置）。連番の
+    切れ目として扱い、内挿・外挿はここをまたがない。"""
+    chapters = []   # [行index, 章題, 番号orNone, 書式, 証拠, 目次一致, 番号対象外]
+    for i in sorted(set(head_idx) | set(breaks)):
+        if i in head_idx:
+            m = _MIDASHI_LINE_RE.match(out[i])
+            if not m:
+                continue
+            title = m.group(1)
+            virtual = False
+        else:
+            title = out[i].strip("　 ")
+            virtual = True
+        mnum = _LEADNUM_RE.match(title)
+        num = int(mnum.group(2).translate(_ZEN2HAN)) if mnum else None
+        fmt = (mnum.group(1) or "", mnum.group(3) or "") if mnum else ("", "")
+        if virtual:
+            rest, evidence, toc_ok = title, False, False
+        elif info:
+            rest, evidence, toc_ok = info.get(i, (title, False, False))
+        else:
+            rest = title[mnum.end():].strip("　 ") if mnum else title
+            evidence, toc_ok = num is not None, False
+        # 「第一章」等の漢数字番号付き・あとがき類・回収予定行は番号対象外
+        no_num = bool(virtual or _UNNUMBERED_RE.search(rest[:10])
+                      or _CHAPTER_HEAD_RE.match(rest))
+        chapters.append([i, rest, num, fmt, evidence, toc_ok, no_num, virtual])
+
+    anchors = []    # (chapters内位置, 番号)
+    for pos, c in enumerate(chapters):
+        if c[2] is not None and not c[6]:
+            if not anchors or c[2] > anchors[-1][1]:
+                anchors.append((pos, c[2]))
+
+    assign = {}
+    if len(anchors) >= 3:
+        def span_ok(lo, hi):
+            return all(not chapters[k][6] for k in range(lo, hi))
+        # 先頭方向: スロット数が番号とちょうど合う場合のみ
+        p0, n0 = anchors[0]
+        if n0 - 1 == p0 and span_ok(0, p0):
+            for k in range(p0):
+                assign[k] = n0 - (p0 - k)
+        # アンカー間: スロット数が一致する場合のみ内挿
+        for (pa, na), (pb, nb) in zip(anchors, anchors[1:]):
+            if nb - na == pb - pa and span_ok(pa + 1, pb):
+                for k in range(pa + 1, pb):
+                    assign[k] = na + (k - pa)
+        # 末尾方向: 番号の証拠か目次一致がある見出しに限り外挿し、
+        # あとがき類・回収章（番号対象外）で打ち切る
+        pk, nk = anchors[-1]
+        nxt = nk
+        for k in range(pk + 1, len(chapters)):
+            c = chapters[k]
+            if c[6]:
+                break
+            if c[4] or c[5]:
+                nxt += 1
+                assign[k] = nxt
+            else:
+                break
+        for pos, c in enumerate(chapters):
+            if c[2] is not None and not c[6]:
+                assign.setdefault(pos, c[2])
+
+    # 書式: アンカーの書式（第/章の有無）を引き継ぐ。無指定は
+    # 1桁=全角数字・2桁=半角（縦中横の印刷慣行に合わせる）
+    fmt_default = chapters[anchors[-1][0]][3] if anchors else ("", "")
+
+    n_changed = 0
+    for pos, c in enumerate(chapters):
+        if c[7]:
+            continue    # 回収予定行は切れ目マーカーとしてのみ使う
+        i, rest, num0, fmt = c[0], c[1], c[2], c[3]
+        num = assign.get(pos)
+        if num is not None:
+            # 数字は1桁=全角・2桁以上=半角（縦中横の印刷慣行に合わせる）
+            digits = str(num) if num >= 10 else chr(0xFF10 + num)
+            pre, post = fmt if num0 is not None else fmt_default
+            if pre or (post and post not in "　 "):
+                numstr = f"{pre}{digits}{post}"
+            else:
+                numstr = digits
+            new_title = f"{numstr}　{rest}".strip("　 ")
+        elif num0 is not None:
+            # 番号は再構成できなかったが元の番号がある → 元の書式のまま
+            mnum = _LEADNUM_RE.match(_MIDASHI_LINE_RE.match(out[i]).group(1))
+            new_title = (mnum.group(0) + rest).strip("　 ") if mnum else rest
+        else:
+            new_title = rest.strip("　 ")
+        if _replace_heading(out, i, new_title):
+            n_changed += 1
+    return n_changed
+
+
+def _replace_heading(out, i, new_title):
+    """行 i から始まる見出しブロックのタイトルを差し替える。"""
+    m = _MIDASHI_LINE_RE.match(out[i])
+    if not m or not new_title:
+        return False
+    old = m.group(1)
+    if old == new_title:
+        return False
+    out[i] = f"［＃「{new_title}」は中見出し］"
+    for k in range(i + 1, min(i + 3, len(out))):
+        if out[k].strip("　 ") == old:
+            out[k] = new_title
+        elif _MIDASHI_LINE_RE.match(out[k]):
+            out[k] = f"［＃「{new_title}」は中見出し終わり］"
+    return True
+
+
 # ── OCR系統誤りの後処理正規化 ──────────────────────────
 #
 # スキャン解像度を上げても残るOCRの系統誤り（NORMAL/SUPERFINE比較実験で
@@ -3613,6 +4003,8 @@ def main():
                     help="OCR系統誤りの後処理正規化（ｌ/Ｉ→――、○→〇、"
                          "〃″→〝〟、文末の・→。、小書きカナ並字化、"
                          "ルビ内漢字の自動訂正）を行わない")
+    ap.add_argument("--no-toc-refine", action="store_true",
+                    help="紙の目次ページとの照合による見出し精錬を行わない")
     ap.add_argument("--no-images", action="store_true",
                     help="挿絵・口絵・章頭ページの画像ページ化を行わない")
     ap.add_argument("--epub", action="store_true",
@@ -3700,6 +4092,13 @@ def main():
                          body_top, body_bottom, hashira_keys,
                          indent=not args.no_indent, verbose=args.verbose,
                          image_pages=image_page_map)
+
+    if not args.no_toc_refine:
+        body, toc_stats = refine_headings_with_toc(
+            body, title, hashira_keys, verbose=args.verbose)
+        if toc_stats:
+            detail = " / ".join(f"{k} {v}" for k, v in toc_stats.items())
+            print(f"目次照合: {detail}")
 
     if not args.no_ocr_fix:
         body, fix_stats = normalize_ocr_text(body)
