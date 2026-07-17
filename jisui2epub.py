@@ -22,6 +22,7 @@ ScanSnap 等でスキャン+OCR した縦書き小説PDFから本文テキスト
 """
 
 import argparse
+import bisect
 import difflib
 import os
 import re
@@ -661,13 +662,18 @@ def attach_rubies(pg, body_size, verbose=False):
 
         cells = best.cells
         ch = best.cell_height() or body_size
-        # ルビのy範囲 → 文字インデックス範囲
+        # ルビのy範囲 → 文字インデックス範囲。
+        # cells[0]からの等ピッチ割り算は、行内の文字送りの揺れ（実測で
+        # 同一行内に8.6〜10.7pt）が累積ドリフトになり、行末尾に近いルビの
+        # 親範囲が1文字ずれる（背中《せなか》→中《せなか》型のunder、
+        # 二階《かい》型のover）。セルの実Y開始位置を境界として二分探索で
+        # 引くことで解消する。等間隔セル（1行1スパン旧OCRの均等分割）では
+        # 従来の割り算と完全に同値なので旧OCR経路は回帰しない
+        starts = [c[1] for c in cells]
         yc0 = run.y0 + ch * 0.15
         yc1 = run.y1 - ch * 0.15
-        i0 = max(0, min(len(cells) - 1,
-                        int((yc0 - cells[0][1]) / ch)))
-        i1 = max(0, min(len(cells) - 1,
-                        int((yc1 - cells[0][1]) / ch)))
+        i0 = max(0, min(len(cells) - 1, bisect.bisect_right(starts, yc0) - 1))
+        i1 = max(0, min(len(cells) - 1, bisect.bisect_right(starts, yc1) - 1))
         if i1 < i0:
             i0, i1 = i1, i0
 
@@ -700,26 +706,38 @@ def attach_rubies(pg, body_size, verbose=False):
         if i1 < i0:
             continue
 
-        result.setdefault(id(best), []).append((i0, i1, run.text))
+        result.setdefault(id(best), []).append((i0, i1, run.text, run.y0, run.y1))
 
     # 同一行内で親文字範囲が重複、または1文字（漢字）を挟んで隣接する
-    # ルビを統合する（OCRが「やし」→「や」「し」のように分割する対策）
+    # ルビを統合する（OCRが「やし」→「や」「し」のように分割する対策）。
+    # ただし物理的にY方向が連続しているルビ同士だけ統合する。分断された
+    # 1本のルビはbboxがほぼ隙間なく連続するのに対し、ルビなし漢字
+    # （多くは数字: 第「一」円通路）を挟んで隣接する別の語のルビは
+    # 親1文字分（本文セル高）以上の隙間が空く。例外は熟字訓
+    # （香具師《やし》）＝かな数が親字数以下の分散配置ルビで、これは
+    # 正当なギャップが空くため統合を許す。
     for key, lst in result.items():
         lst.sort()
         # 対応する縦行を探す
         vl = next((v for v in pg.vlines if id(v) == key), None)
         merged = []
-        for i0, i1, txt in lst:
+        for i0, i1, txt, ry0, ry1 in lst:
             if merged:
-                p0, p1, ptxt = merged[-1]
-                gap_ok = (i0 - p1 <= 2 and
+                p0, p1, ptxt, py0, py1 = merged[-1]
+                n_ruby = max(1, len(ptxt) + len(txt))
+                ruby_ch = ((py1 - py0) + (ry1 - ry0)) / n_ruby
+                phys_ok = ry0 - py1 <= max(ruby_ch, body_size * 0.5)
+                span_len = max(p1, i1) - p0 + 1
+                sparse_ok = n_ruby <= span_len
+                gap_ok = (i0 - p1 <= 2 and (phys_ok or sparse_ok) and
                           all(RUBYABLE_RE.match(vl.cells[j][0])
                               for j in range(p1 + 1, i0)) if vl else False)
-                if i0 <= p1 + 1 or gap_ok:
-                    merged[-1] = (p0, max(p1, i1), ptxt + txt)
+                if (i0 <= p1 + 1 and phys_ok) or gap_ok:
+                    merged[-1] = (p0, max(p1, i1), ptxt + txt,
+                                  min(py0, ry0), max(py1, ry1))
                     continue
-            merged.append((i0, i1, txt))
-        result[key] = merged
+            merged.append((i0, i1, txt, ry0, ry1))
+        result[key] = [(a, b, t) for a, b, t, _, _ in merged]
     return result
 
 

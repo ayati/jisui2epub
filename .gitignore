@@ -13,3 +13,6 @@ output/
 .venv/
 __pycache__/
 *.pyc
+
+# Windows用ビルド済みバイナリ（リリースzipにのみ同梱）
+forwindows/
