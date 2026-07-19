@@ -88,6 +88,8 @@ python3 -m venv .venv
 export GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"
 
 # 再OCR実行（既定出力は <入力>_vision.pdf）
+# 二段OCR（極小ルビ回収）用にPillowも入れておく（任意。無ければ自動で無効化）
+.venv/bin/pip install Pillow
 .venv/bin/python vision_reocr.py 本.pdf
 
 # 途中で中断した場合、続きのページから再開できる
@@ -102,6 +104,12 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"
 
 本文とルビは異なるフォントサイズ（本文の約半分）で書き戻されるため、
 jisui2epub.py本体のルビ検出・柱ノンブル除去はそのまま機能する。
+
+Visionが検出漏れする高さ3pt級の極小ルビ（手《て》等）は、**二段OCR**が
+該当領域だけを切り出し4倍拡大して自動回収する（文字は旧OCR・位置は
+Vision実測のハイブリッド書き戻し。`--no-ruby-rescue` で無効化）。
+追加のAPIユニットは欠落領域をタイル画像にまとめて送るため数%程度。
+使用ユニット数は実行中・完了時に必ず表示される（無料枠は月1000ユニット）。
 
 ルビの親文字への対応付けは、正解テキストとのルビペア単位の実測で
 74〜92%（ルビ密度が非常に高い児童書・新書4冊で検証。詳細はCLAUDE.md）。

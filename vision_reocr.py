@@ -150,8 +150,24 @@ RETRY_BASE_WAIT = 2.0
 # 何ページ処理するごとに出力PDFを保存するか（中断時の作業消失を防ぐ）
 CHECKPOINT_EVERY = 20
 
+# 二段OCR（極小ルビ回収）: Visionが検出しなかった旧OCRルビの領域だけを
+# 切り出して拡大再OCRする。ページ全面の再OCR（ユニット2倍）でなく、
+# 欠落領域の切り出しを1枚のタイル画像に詰めて送ることで、追加ユニットを
+# 数%に抑える。実測: 高さ3ptの「て」「ひ」（全ページOCRでは検出不可）が
+# 4x拡大で検出できる（地下室P.5）
+RESCUE_UPSCALE = 4        # 切り出しの拡大倍率
+RESCUE_MARGIN_X = 4.0     # 切り出し余白（pt、ルビ帯の左右）
+RESCUE_MARGIN_Y = 12.0    # 切り出し余白（pt、上下の文脈。孤立文字はOCRされにくい）
+RESCUE_TILE_MAX = 4000    # タイル画像の1辺上限（px）
+RESCUE_TILE_GAP = 48      # タイル内の切り出し同士の白余白（px、隣接誤結合防止）
+RESCUE_ACCEPT_TOL = 2.0   # 回収シンボルを受理する旧ルビ枠からの許容ずれ（pt）
 
-def call_vision_with_retry(client, image):
+# Vision APIの使用ユニット数（1リクエスト=1ユニット）。実行ごとにリセットし、
+# チェックポイント・完了時にユーザーへ報告する
+API_UNITS = {"page": 0, "rescue": 0}
+
+
+def call_vision_with_retry(client, image, kind="page"):
     last_err = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -160,6 +176,7 @@ def call_vision_with_retry(client, image):
             )
             if response.error.message:
                 raise RuntimeError(f"Vision APIエラー: {response.error.message}")
+            API_UNITS[kind] += 1
             return response
         except (
             gexc.ServiceUnavailable,
@@ -368,10 +385,24 @@ def _gapfill_missing_rubies(symbols, old_rubies, ruby_threshold, target_ruby_fon
     判定）が2つの別々のルビを「てひ」のように誤って1本に結合してしまう
     （実測で確認したバグ）。cell_hを使えば実寸に近いサイズで描画され、
     target_ruby_fontsizeより大きくなることもない（安全のためcapする）"""
+    return [
+        item
+        for g in _collect_gap_groups(
+            symbols, old_rubies, ruby_threshold, target_ruby_fontsize)
+        for item in g["items"]
+    ]
+
+
+def _collect_gap_groups(symbols, old_rubies, ruby_threshold, target_ruby_fontsize):
+    """Vision検出がない旧OCRルビを「旧ルビ1本＝1グループ」で収集する。
+    各グループは items（旧OCR座標そのままの補完文字列＝フォールバック用）と
+    clip（旧ルビのbbox＝二段OCRの切り出し・受理範囲）、cap（ルビ書き戻し
+    サイズの上限）を持つ。_gapfill_missing_rubies（従来の即時補完）と
+    二段OCR（_rescue_missing_rubies）の両方がこのグループを共有する"""
     vision_ruby_symbols = [
         (t, r) for t, r in symbols if _is_ruby_symbol(t, r, ruby_threshold)
     ]
-    filled = []
+    groups = []
     for old_ruby in old_rubies:
         text = old_ruby.text.strip()
         # かなを含まない旧「ルビ」はノンブル・挿絵ノイズの誤分類
@@ -384,11 +415,33 @@ def _gapfill_missing_rubies(symbols, old_rubies, ruby_threshold, target_ruby_fon
         n = len(text)
         cell_h = (old_ruby.y1 - old_ruby.y0) / n
         fontsize = max(1.0, min(cell_h * 0.95, target_ruby_fontsize))
+        items = []
         for i, ch in enumerate(text):
             y0 = old_ruby.y0 + i * cell_h
             y1 = old_ruby.y0 + (i + 1) * cell_h
-            filled.append((ch, fitz.Rect(old_ruby.x0, y0, old_ruby.x1, y1), fontsize))
-    return filled
+            items.append((ch, fitz.Rect(old_ruby.x0, y0, old_ruby.x1, y1), fontsize))
+        groups.append({
+            "items": items,
+            "clip": fitz.Rect(old_ruby.x0, old_ruby.y0, old_ruby.x1, old_ruby.y1),
+            "cap": target_ruby_fontsize,
+        })
+    return groups
+
+
+def _ruby_params(symbols, target_ruby_fontsize):
+    """ページのルビ判定しきい値と書き戻しルビフォントサイズを求める
+    （insert_invisible_text と二段OCRのグループ収集が同条件を共有する）"""
+    local_body_width = statistics.median(rect.width for _, rect in symbols)
+    ruby_threshold = local_body_width * RUBY_WIDTH_RATIO
+    ruby_widths = [
+        rect.width for text, rect in symbols
+        if _is_ruby_symbol(text, rect, ruby_threshold)
+    ]
+    if ruby_widths:
+        ruby_fontsize = min(statistics.median(ruby_widths), target_ruby_fontsize)
+    else:
+        ruby_fontsize = target_ruby_fontsize
+    return ruby_threshold, ruby_fontsize
 
 
 def insert_invisible_text(
@@ -437,17 +490,7 @@ def insert_invisible_text(
     if not symbols:
         return 0, 0
 
-    local_body_width = statistics.median(rect.width for _, rect in symbols)
-    ruby_threshold = local_body_width * RUBY_WIDTH_RATIO
-
-    ruby_widths = [
-        rect.width for text, rect in symbols
-        if _is_ruby_symbol(text, rect, ruby_threshold)
-    ]
-    if ruby_widths:
-        ruby_fontsize = min(statistics.median(ruby_widths), target_ruby_fontsize)
-    else:
-        ruby_fontsize = target_ruby_fontsize
+    ruby_threshold, ruby_fontsize = _ruby_params(symbols, target_ruby_fontsize)
 
     gapfilled = (
         _gapfill_missing_rubies(symbols, old_rubies, ruby_threshold, ruby_fontsize)
@@ -526,6 +569,203 @@ def insert_invisible_text(
         count += 1
         ruby_count += 1
     return count, ruby_count
+
+
+def _flat_symbols(annotation):
+    """full_text_annotation から (text, x0, y0, x1, y1) のフラット列を返す
+    （タイル画像用。ブロック順の並べ替えは不要）"""
+    out = []
+    if annotation is None:
+        return out
+    for pageinfo in annotation.pages:
+        for block in pageinfo.blocks:
+            for para in block.paragraphs:
+                for word in para.words:
+                    for s in word.symbols:
+                        v = s.bounding_box.vertices
+                        xs = [p.x for p in v]
+                        ys = [p.y for p in v]
+                        out.append((s.text, min(xs), min(ys), max(xs), max(ys)))
+    return out
+
+
+def _pack_tiles(crops):
+    """切り出し画像群をシェルフ法で白キャンバスに詰める。
+    戻り値: [(canvasイメージ, [cropに"pos"=(x,y)を書き足したリスト]), ...]"""
+    from PIL import Image
+    tiles = []
+    cur = []
+    x = y = colw = 0
+    for c in crops:
+        w, h = c["img"].size
+        if cur and (y + h > RESCUE_TILE_MAX):
+            x += colw + RESCUE_TILE_GAP
+            y = 0
+            colw = 0
+        if cur and (x + w > RESCUE_TILE_MAX):
+            tiles.append(cur)
+            cur = []
+            x = y = colw = 0
+        c["pos"] = (x, y)
+        cur.append(c)
+        y += h + RESCUE_TILE_GAP
+        colw = max(colw, w)
+    if cur:
+        tiles.append(cur)
+    out = []
+    for placed in tiles:
+        W = max(c["pos"][0] + c["img"].size[0] for c in placed)
+        H = max(c["pos"][1] + c["img"].size[1] for c in placed)
+        canvas = Image.new("L", (W, H), 255)
+        for c in placed:
+            canvas.paste(c["img"], c["pos"])
+        out.append((canvas, placed))
+    return out
+
+
+def _rescue_missing_rubies(client, doc, pending, api=True):
+    """二段OCR: Visionが検出しなかった旧OCRルビの領域（pending内の各グループ）
+    を切り出し・拡大してタイル画像で再OCRし、検出できたかなを「Vision実測
+    座標」で書き戻す。検出できなかったグループは従来どおり旧OCR座標の
+    補完（items）にフォールバックする。
+
+    背景: Visionの全ページOCRは高さ3pt級の極小ルビ（手《て》・引《ひ》）を
+    検出できないが、同じ領域を4x拡大した画像なら検出できる（地下室P.5で
+    実証）。従来のgapfillは旧OCRの申告座標をそのまま書き戻すため、旧OCRの
+    座標ずれ（±1セル）ごと持ち込み、ルビの親ずれの残存原因になっていた。
+    Vision実測座標で書き戻せばこの依存を絶てる。
+
+    コスト: ページ全面の再OCR（ユニット2倍）ではなく、欠落領域だけを
+    1枚のタイルに詰めて送るため、追加ユニットはチェックポイント区間
+    （20ページ）あたり通常1〜2に収まる。
+
+    api=False（例外時の後始末やPillow未導入時）は再OCRせず全グループを
+    フォールバック補完だけして保存に備える。
+    戻り値: (Vision回収グループ数, フォールバックグループ数, 使用タイル数)"""
+    if not pending:
+        return 0, 0, 0
+    if api:
+        try:
+            import io
+            from PIL import Image
+        except ImportError:
+            print("  [二段OCR: Pillow未インストールのため旧OCR座標の補完に"
+                  "フォールバックします（.venv/bin/pip install Pillow で有効化）]")
+            api = False
+    if api:
+        from google.cloud import vision
+        img_cache = {}
+        crops = []
+        for g in pending:
+            g["syms"] = None
+            idx = g["page_idx"]
+            if idx not in img_cache:
+                found = largest_embedded_image(doc, doc[idx])
+                if found is None:
+                    img_cache[idx] = None
+                else:
+                    b, w, h = found
+                    pr = doc[idx].rect
+                    img_cache[idx] = (
+                        Image.open(io.BytesIO(b)).convert("L"),
+                        w / pr.width, h / pr.height,
+                    )
+            if img_cache[idx] is None:
+                continue
+            im, sx, sy = img_cache[idx]
+            clip = g["clip"]
+            x0 = max(0, int((clip.x0 - RESCUE_MARGIN_X) * sx))
+            y0 = max(0, int((clip.y0 - RESCUE_MARGIN_Y) * sy))
+            x1 = min(im.width, int((clip.x1 + RESCUE_MARGIN_X) * sx) + 1)
+            y1 = min(im.height, int((clip.y1 + RESCUE_MARGIN_Y) * sy) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = im.crop((x0, y0, x1, y1))
+            crop = crop.resize(
+                (crop.width * RESCUE_UPSCALE, crop.height * RESCUE_UPSCALE),
+                Image.LANCZOS,
+            )
+            crops.append({"g": g, "img": crop, "src_x0": x0, "src_y0": y0,
+                          "sx": sx, "sy": sy})
+        n_tiles = 0
+        for canvas, placed in _pack_tiles(crops):
+            buf = io.BytesIO()
+            canvas.save(buf, format="PNG")
+            resp = call_vision_with_retry(
+                client, vision.Image(content=buf.getvalue()), kind="rescue")
+            n_tiles += 1
+            syms = _flat_symbols(resp.full_text_annotation)
+            for c in placed:
+                cx, cy = c["pos"]
+                w, h = c["img"].size
+                found = []
+                for t, sx0, sy0, sx1, sy1 in syms:
+                    mx = (sx0 + sx1) / 2
+                    my = (sy0 + sy1) / 2
+                    if not (cx <= mx < cx + w and cy <= my < cy + h):
+                        continue
+                    # タイルpx → 切り出し前の元画像px → PDF pt
+                    px0 = c["src_x0"] + (sx0 - cx) / RESCUE_UPSCALE
+                    px1 = c["src_x0"] + (sx1 - cx) / RESCUE_UPSCALE
+                    py0 = c["src_y0"] + (sy0 - cy) / RESCUE_UPSCALE
+                    py1 = c["src_y0"] + (sy1 - cy) / RESCUE_UPSCALE
+                    rect = fitz.Rect(px0 / c["sx"], py0 / c["sy"],
+                                     px1 / c["sx"], py1 / c["sy"])
+                    found.append((t, rect))
+                c["g"]["syms"] = found
+    else:
+        n_tiles = 0
+        for g in pending:
+            g.setdefault("syms", None)
+
+    rescued = fallback = 0
+    for g in pending:
+        page = doc[g["page_idx"]]
+        clip = g["clip"]
+        accepted = []
+        for t, rect in (g["syms"] or []):
+            # 受理条件: 旧ルビ枠の近傍（余白の文脈文字を拾わない）・かな1文字・
+            # 約物や数字はルビとして書き戻さない（_NEVER_RUBY と同じ思想）
+            if len(t) != 1 or t.isascii() or t in _NEVER_RUBY:
+                continue
+            if not KANA_RE.search(t):
+                continue
+            mx = (rect.x0 + rect.x1) / 2
+            my = (rect.y0 + rect.y1) / 2
+            if not (clip.x0 - RESCUE_ACCEPT_TOL <= mx <= clip.x1 + RESCUE_ACCEPT_TOL
+                    and clip.y0 - RESCUE_ACCEPT_TOL <= my
+                    <= clip.y1 + RESCUE_ACCEPT_TOL):
+                continue
+            accepted.append((t, rect))
+        if accepted:
+            # 文字は旧OCR・位置はVision実測のハイブリッドで書き戻す。
+            # 拡大再OCRでも極小字の「読み」自体は誤りやすい（実測: ちか→
+            # しょちか・くぴ→し・つ→わ）が、検出位置は正確（旧OCR申告が
+            # 3ptずれていた「ひ」を正しい位置に補正できた）。旧OCRの読みは
+            # 概ね正しく、残る誤りは後段の fix_ruby_kanji / fix_ruby_variants
+            # が本内多数決で訂正できるため、テキストは旧OCRを採用し、
+            # Visionからは検出範囲（Y範囲・X位置・文字幅）だけを取り込む
+            ext_y0 = min(r.y0 for _, r in accepted)
+            ext_y1 = max(r.y1 for _, r in accepted)
+            x0 = statistics.median(r.x0 for _, r in accepted)
+            widths = [r.width for _, r in accepted]
+            fs = max(1.0, min(statistics.median(widths), g["cap"]))
+            old_text = "".join(t for t, _, _ in g["items"])
+            n = max(1, len(old_text))
+            cell = max((ext_y1 - ext_y0) / n, 0.5)
+            for k, t in enumerate(old_text):
+                page.insert_text(
+                    fitz.Point(x0, ext_y0 + k * cell + fs),
+                    t, fontsize=fs, fontname="japan", render_mode=3)
+            rescued += 1
+        else:
+            for t, rect, fs in g["items"]:
+                page.insert_text(
+                    fitz.Point(rect.x0, rect.y0 + fs),
+                    t, fontsize=fs, fontname="japan", render_mode=3)
+            fallback += 1
+    pending.clear()
+    return rescued, fallback, n_tiles
 
 
 def _atomic_save(doc, output_path, final=False):
@@ -608,12 +848,13 @@ def _calibrate_body_fontsize(client, doc, start_page, end_page, cache):
     return statistics.median(widths) if widths else None
 
 
-def reocr_pdf(input_path, output_path, start_page, end_page):
+def reocr_pdf(input_path, output_path, start_page, end_page, ruby_rescue=True):
     from google.cloud import vision
 
     client = vision.ImageAnnotatorClient()
     doc = _open_source_pdf(input_path, output_path)
     end_page = min(end_page, len(doc))
+    API_UNITS["page"] = API_UNITS["rescue"] = 0
 
     # 書き戻す本文フォントサイズの基準値を決める。
     # Vision実測（実際の文字間隔に忠実。地下室からのふしぎな旅・霧の
@@ -658,7 +899,19 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
     total_chars = 0
     total_ruby = 0
     processed = 0
+    rescue_stats = [0, 0, 0]  # Vision回収 / フォールバック / タイル数
+    pending = []  # 二段OCR待ちの欠落ルビグループ
     t0 = time.time()
+
+    def _flush_rescue():
+        if not pending:
+            return
+        r, f, t = _rescue_missing_rubies(client, doc, pending)
+        rescue_stats[0] += r
+        rescue_stats[1] += f
+        rescue_stats[2] += t
+        print(f"  [二段OCR: 欠落ルビ{r + f}箇所中{r}箇所をVision再検出で回収"
+              f"（タイル{t}枚・旧OCR補完へのフォールバック{f}箇所）]")
 
     try:
         for i, p1 in enumerate(range(start_page, end_page + 1), 1):
@@ -699,8 +952,22 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
                 graphics=fitz.PDF_REDACT_LINE_ART_NONE,
             )
 
+            # 二段OCRが有効なら、旧OCR補完（gapfill）を即時挿入せず
+            # 欠落グループとして保留し、チェックポイントごとにまとめて
+            # 拡大再OCRで回収する（検出不可分のみ従来の補完に落ちる）
+            if ruby_rescue and old_rubies and symbols:
+                thr, rfs = _ruby_params(symbols, target_ruby_fontsize)
+                groups = _collect_gap_groups(symbols, old_rubies, thr, rfs)
+                for g in groups:
+                    g["page_idx"] = idx
+                pending.extend(groups)
+                old_for_insert = ()
+            else:
+                old_for_insert = old_rubies
+
             n, n_ruby = insert_invisible_text(
-                page, symbols, target_body_fontsize, target_ruby_fontsize, old_rubies
+                page, symbols, target_body_fontsize, target_ruby_fontsize,
+                old_for_insert
             )
             total_chars += n
             total_ruby += n_ruby
@@ -709,18 +976,33 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
             print(f"ページ{p1}: {n}文字書き戻し（うちルビ{n_ruby}） [{elapsed:.0f}秒経過]")
 
             if i % CHECKPOINT_EVERY == 0:
+                _flush_rescue()
                 _atomic_save(doc, output_path)
-                print(f"  [チェックポイント保存: {output_path}]")
+                print(f"  [チェックポイント保存: {output_path}"
+                      f"（APIユニット累計 {API_UNITS['page'] + API_UNITS['rescue']}）]")
+        _flush_rescue()
     finally:
-        # 例外時も直近のチェックポイント以降の分をできる限り保存する
+        # 例外時も直近のチェックポイント以降の分をできる限り保存する。
+        # 未処理の欠落グループが残っていたら（＝二段OCRの前に例外）、
+        # APIを呼ばず従来の旧OCR補完だけ済ませてから保存する
+        if pending:
+            _rescue_missing_rubies(client, doc, pending, api=False)
         _atomic_save(doc, output_path, final=True)
         doc.close()
+        units = API_UNITS["page"] + API_UNITS["rescue"]
+        print(f"Vision API使用ユニット: 合計{units}"
+              f"（ページOCR {API_UNITS['page']} ＋ 二段OCR {API_UNITS['rescue']}。"
+              f"無料枠は月1000ユニット）")
 
     elapsed = time.time() - t0
     print(
         f"完了: {processed}ページ処理 / "
         f"文字数{total_chars}（うちルビ{total_ruby}） / {elapsed:.0f}秒"
     )
+    if rescue_stats[0] + rescue_stats[1]:
+        print(f"二段OCR: 欠落ルビ{rescue_stats[0] + rescue_stats[1]}箇所中"
+              f"{rescue_stats[0]}箇所をVision再検出で回収"
+              f"（タイル{rescue_stats[2]}枚・フォールバック{rescue_stats[1]}箇所）")
     print(f"保存しました: {output_path}")
 
 
@@ -737,6 +1019,11 @@ def main():
     )
     parser.add_argument(
         "-o", "--output", default=None, help="出力PDFパス（既定: <入力>_vision.pdf）"
+    )
+    parser.add_argument(
+        "--no-ruby-rescue", action="store_true",
+        help="二段OCR（極小ルビの拡大再OCR回収）を無効化し、"
+             "従来どおり旧OCR座標の補完だけを行う",
     )
     args = parser.parse_args()
 
@@ -759,7 +1046,8 @@ def main():
         source = output_path
 
     try:
-        reocr_pdf(source, output_path, args.start, end_page)
+        reocr_pdf(source, output_path, args.start, end_page,
+                  ruby_rescue=not args.no_ruby_rescue)
     except Exception:
         print(
             f"エラーで中断しました。{output_path} には直近のチェックポイントまでの"
