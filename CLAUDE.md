@@ -326,6 +326,15 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"
   `--start`で再開できる。ただし同じファイルを開いたまま`doc.save()`することは
   PyMuPDFの制約でできない（"save to original must be incremental"）ため、
   一時ファイルに保存してから`os.replace`で置き換える。
+  **`--start`再開時（入力＝出力ファイル）は`_open_source_pdf`がバイト列で
+  読み込みメモリから開く**。通常の`fitz.open`だとOSのファイルハンドルを
+  掴んだまま`os.replace`で自分自身を置き換えることになり、POSIXでは正常
+  動作だが**WindowsではWinError 5（ERROR_ACCESS_DENIED）で必ず失敗する**
+  （MuPDFはfopenで開くためFILE_SHARE_DELETEなし。実測: Windows実機で
+  地下室の--start再開が初回チェックポイントで落ちた。WSL上の検証では
+  顕在化しない）。なお`_atomic_save`自体が失敗しても書き戻し済みの
+  `.tmp`は完全なPDFなので、リネームして`--start`で続きから再開できる
+  （API再課金なしで復旧可能）。docai_reocr.pyも同関数を共有
   **チェックポイント保存でgarbage回収を使ってはならない**（`_atomic_save`は
   最終保存`final=True`のみgarbage=4）。garbage付き保存はin-memory xrefを
   再番号付けするが、PyMuPDFがinsert_text用にキャッシュするフォントxrefは

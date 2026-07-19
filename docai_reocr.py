@@ -54,6 +54,7 @@ from vision_reocr import (
     RUBY_FONTSIZE_RATIO,
     _atomic_save,
     _dedup_symbols,
+    _open_source_pdf,
     _snap_column_x,
     insert_invisible_text,
     largest_embedded_image,
@@ -233,7 +234,10 @@ def _calibrate_body_fontsize(client, processor_name, doc, start_page, end_page, 
 
 
 def reocr_pdf(client, processor_name, input_path, output_path, start_page, end_page):
-    doc = fitz.open(input_path)
+    # --start再開時（入力＝出力）はメモリから開く（Windowsでチェックポイント
+    # のos.replaceが自分自身のハンドルと衝突してWinError 5になる対策。
+    # 詳細は vision_reocr._open_source_pdf）
+    doc = _open_source_pdf(input_path, output_path)
     end_page = min(end_page, len(doc))
 
     # 書き戻す本文フォントサイズの基準値: DocAI実測列幅と旧OCR申告の大きい方

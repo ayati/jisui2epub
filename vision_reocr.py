@@ -551,6 +551,22 @@ def _atomic_save(doc, output_path, final=False):
     os.replace(tmp_path, output_path)
 
 
+def _open_source_pdf(input_path, output_path):
+    """処理の土台にするPDFを開く。--start再開時は入力＝出力ファイル自身の
+    ため、通常の fitz.open だとOSのファイルハンドルを掴んだまま
+    _atomic_save の os.replace で自分自身を置き換えることになる。
+    POSIXでは開いているファイルのrename置換は正常動作だが、Windowsでは
+    ERROR_ACCESS_DENIED（WinError 5）で失敗する（MuPDFはfopenで開くため
+    FILE_SHARE_DELETEが付かない。実測: 地下室の--start再開の初回
+    チェックポイントで必ず落ちる）。バイト列で読み込んでメモリから
+    開けばハンドルを掴まないため、Windowsでも置換できる。
+    新規実行（入力≠出力）は従来どおりファイルから開く（メモリ節約）。"""
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        with open(input_path, "rb") as f:
+            return fitz.open(stream=f.read(), filetype="pdf")
+    return fitz.open(input_path)
+
+
 # 書き戻すフォントサイズの基準値を求めるために事前OCRするページ数・文字数の上限
 CALIBRATION_MAX_PAGES = 15
 CALIBRATION_TARGET_CHARS = 800
@@ -596,7 +612,7 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
     from google.cloud import vision
 
     client = vision.ImageAnnotatorClient()
-    doc = fitz.open(input_path)
+    doc = _open_source_pdf(input_path, output_path)
     end_page = min(end_page, len(doc))
 
     # 書き戻す本文フォントサイズの基準値を決める。
