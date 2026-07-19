@@ -698,7 +698,8 @@ def attach_rubies(pg, body_size, verbose=False):
                 continue
             i0 = i1 = found
 
-        # 端の非漢字を落とす（bbox由来の範囲を信頼し、拡張はしない）
+        # 端の非漢字を落とす（bbox由来の範囲を信頼し、安易な拡張はしない）
+        r0, r1 = i0, i1  # トリム前の生範囲（シフト・トゥ・フィット用）
         while i0 <= i1 and not rubyable(i0):
             i0 += 1
         while i1 >= i0 and not rubyable(i1):
@@ -706,7 +707,68 @@ def attach_rubies(pg, body_size, verbose=False):
         if i1 < i0:
             continue
 
-        result.setdefault(id(best), []).append((i0, i1, run.text, run.y0, run.y1))
+        result.setdefault(id(best), []).append(
+            [i0, i1, run.text, run.y0, run.y1, r0, r1])
+
+    # ── シフト・トゥ・フィット ──
+    # 旧OCRはルビbbox自体を±1セルずれて申告することがある（例: 背中の
+    # 「せなか」が「中へ」の位置）。生範囲の端が非漢字でトリムされた場合、
+    # 生範囲と同じ長さの窓を隣接する漢字連続内にずらした配置を試す。誤爆防止:
+    # (1) ルビのかな数 >= 窓長（各漢字に読み1文字以上。時計台の「だい」が
+    #     計台に広がるのを防ぐ）
+    # (2) 同じ縦行の他のルビが既に付いている文字へはシフトしない
+    # (3) ルビbboxとの物理重なりが「厳密に」増える場合のみ採用。同点は
+    #     bboxがかな側にはみ出しているだけで隣の漢字とは重なっていない
+    #     （＝拡張の裏付けがない）ケースなので棄却する（同点を許すと
+    #     名匠組合《ギルド》→匠組合のような誤拡張が多発する）
+    for key, lst in result.items():
+        vl = next((v for v in pg.vlines if id(v) == key), None)
+        if vl is None:
+            continue
+        cells_v = vl.cells
+        ch_v = vl.cell_height() or body_size
+        covered = set()
+        for ent in lst:
+            covered.update(range(ent[0], ent[1] + 1))
+
+        def win_overlap(a, b, ry0, ry1):
+            top = cells_v[a][1]
+            bot = (cells_v[b + 1][1] if b + 1 < len(cells_v)
+                   else cells_v[b][1] + ch_v)
+            return max(0.0, min(ry1, bot) - max(ry0, top))
+
+        for ent in lst:
+            i0, i1, txt, ry0, ry1, r0, r1 = ent
+            if (i0, i1) == (r0, r1):
+                continue  # トリムなし＝bboxが素直に漢字上にある
+            L = r1 - r0 + 1
+            kana_n = len(KANA_RE.findall(txt))
+            if kana_n < L:
+                continue
+            own = set(range(i0, i1 + 1))
+            others = covered - own
+            best_win = None
+            for a in range(max(0, r0 - L + 1), min(len(cells_v) - L, r1) + 1):
+                b = a + L - 1
+                if b < r0 or a > r1:
+                    continue  # 生範囲と重ならない配置は不可
+                if any(j in others for j in range(a, b + 1)):
+                    continue
+                if not all(RUBYABLE_RE.match(cells_v[j][0])
+                           for j in range(a, b + 1)):
+                    continue
+                ov = win_overlap(a, b, ry0, ry1)
+                cand = (ov, -abs(a - i0))
+                if best_win is None or cand > best_win[0]:
+                    best_win = (cand, a, b)
+            if best_win is None:
+                continue
+            (ov_new, _), a, b = best_win
+            if ov_new > win_overlap(i0, i1, ry0, ry1) + 1e-6:
+                covered -= own
+                ent[0], ent[1] = a, b
+                covered.update(range(a, b + 1))
+        result[key] = [(e[0], e[1], e[2], e[3], e[4]) for e in lst]
 
     # 同一行内で親文字範囲が重複、または1文字（漢字）を挟んで隣接する
     # ルビを統合する（OCRが「やし」→「や」「し」のように分割する対策）。
@@ -1758,6 +1820,55 @@ def fix_ruby_variants(text):
         return f"{prefix}《{best}》"
 
     return _RUBY_PAIR_RE.sub(_repl, text), fixed
+
+
+_PARENT_EXT_KANJI_RE = re.compile(r"[一-鿿々〆〇ヶ]")
+_PARENT_EXT_ALLKANJI_RE = re.compile(r"[一-鿿々〆〇ヶ]+")
+
+
+def fix_ruby_parent_extend(text):
+    """親文字範囲の語頭欠落を本内多数決で拡張した (テキスト, 修正数)。
+
+    旧OCRはルビのbboxを±1セルずれて申告することがあり、幾何ベースの
+    対応付け（attach_rubies のシフト・トゥ・フィット含む）では、bboxが
+    丸ごと隣のセルに乗った完全ずれを救えない。読みが完全なまま親の
+    1文字だけ欠けた形（背｜中《せなか》）は、本内に正しい形
+    （背中《せなか》）が複数回出現することを利用してテキスト後処理で
+    拡張できる。直前の漢字Xを含めた XP《R》 が本内に2回以上、かつ
+    現状の P《R》 と同数以上出現する場合のみ拡張する
+    （5冊の実測で拡張16箇所中、悪化は1箇所のみ）。"""
+    cnt = Counter()
+    for m in _RUBY_PAIR_RE.finditer(text):
+        parent, ruby = m.group(1) or m.group(2), m.group(3)
+        cnt[(parent, ruby)] += 1
+
+    out = []
+    pos = 0
+    fixed = 0
+    for m in _RUBY_PAIR_RE.finditer(text):
+        parent, ruby = m.group(1) or m.group(2), m.group(3)
+        i = m.start() - 1
+        x = text[i] if i >= 0 else ""
+        new = None
+        if x and _PARENT_EXT_KANJI_RE.match(x) and \
+                _PARENT_EXT_ALLKANJI_RE.fullmatch(parent):
+            c_ext = cnt.get((x + parent, ruby), 0)
+            c_cur = cnt.get((parent, ruby), 0)
+            if c_ext >= 2 and c_ext >= c_cur:
+                new = (i, x + parent, ruby)
+        if new:
+            i2, np_, nr = new
+            # 拡張後、さらにその前が漢字なら｜が必要
+            need_bar = i2 > 0 and _PARENT_EXT_KANJI_RE.match(text[i2 - 1])
+            out.append(text[pos:i2])
+            out.append(("｜" if need_bar else "") + np_ + "《" + nr + "》")
+            fixed += 1
+        else:
+            out.append(text[pos:m.start()])
+            out.append(m.group(0))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out), fixed
 
 
 # ── メイン ──────────────────────────────────────────
@@ -4130,6 +4241,9 @@ def main():
             body, variant_fixed = fix_ruby_variants(body)
             if variant_fixed:
                 print(f"ルビ濁点・小書き誤読の自動訂正: {variant_fixed} 箇所")
+            body, extend_fixed = fix_ruby_parent_extend(body)
+            if extend_fixed:
+                print(f"ルビ親範囲の自動拡張: {extend_fixed} 箇所")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"{title}\n{author}\n\n{body}\n")
     print(f"✅ 青空文庫形式テキスト出力: {out_path}")
