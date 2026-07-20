@@ -80,6 +80,23 @@ python3 -m venv .venv
 | `--cover-image FILE` | 表紙に任意の画像（JPEG/PNG）を使う |
 | `--inspect N` | ページ解析結果を表示して終了（チューニング用） |
 
+## GUIランチャー（jisui_gui.py）— Windowsでかんたんに実行
+
+`jisui_gui.py` は本ツール群（jisui2epub / vision_reocr / docai_reocr /
+[mangaP2ePub](https://github.com/ayati/mangaP2ePub)）をGUIから実行する
+Windows向けランチャー。PDFを選んで本の種類（小説（縦書き）／横書き／漫画）を
+選ぶだけで変換でき、再OCRのGCP認証設定・校正済みテキストからのePub再生成
+ボタン・文字サイズ変更（弱視対応）を備える。依存は標準ライブラリのみで、
+ドラッグ&ドロップもWindowsではWin32 API直叩きの依存ゼロ実装
+（ウィンドウ内のどこにドロップしてもよい）。設計と実機検証の記録は
+`DESIGN_WindowsGUI.md` を参照。
+
+```bash
+python jisui_gui.py                 # GUI起動
+python jisui_gui.py --print-jobs 本.pdf --type horizontal   # 組み立ての確認
+# Windows exe化: pyinstaller --onefile --noconsole jisui_gui.py
+```
+
 ## 再OCR前処理（vision_reocr.py / docai_reocr.py）— 古いOCRの精度を底上げ
 
 スキャナ内蔵OCR（特に古い機種）は文字化けが多く、jisui2epub.py の抽出精度の

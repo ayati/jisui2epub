@@ -42,6 +42,19 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
+# WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
+# コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
+# UnicodeEncodeError に落ちる（コンソール直接出力ではWide APIが使われる
+# ため顕在化しない。実測: GUIからのexe起動で完了メッセージがクラッシュ）。
+# エンコード不能文字は?に置換して処理を続行する。vision_reocr.py /
+# docai_reocr.py も本モジュールをimportするためこの1箇所で全ツールに効く
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(errors="replace")
+        except Exception:
+            pass
+
 # 自動生成表紙のJPEG描画用（任意）。なければ SVG 表紙にフォールバックするが、
 # 通常は --cover-page で PDF ページを表紙にするため不要。
 try:
