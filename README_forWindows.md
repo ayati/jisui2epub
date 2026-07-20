@@ -196,6 +196,10 @@ python jisui2epub.py "本_vision.pdf" --title "タイトル" --author "著者名
 
 # Pythonを入れず forwindows\jisui2epub.exe を使う場合はこちら
 ..\forwindows\jisui2epub.exe "本_vision.pdf" --title "タイトル" --author "著者名" --epub
+
+# 横書きの本（実用書など）は --horizontal を付ける（ePubも横書きになる。
+# ルビのない実用書は --ruby drop 併用を推奨。v0.9.0〜。再OCRの横書き対応は未着手）
+..\forwindows\jisui2epub.exe "横書きの本.pdf" --horizontal --ruby drop --epub
 ```
 
 **パスに関する注意:**

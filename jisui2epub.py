@@ -80,13 +80,14 @@ KANA_RE = re.compile(r'[ぁ-ゖァ-ヺー]')
 
 class VLine:
     """縦書きの1行（縦の文字列）。cells は (文字, y0, y1) のリスト。"""
-    __slots__ = ("cells", "x0", "x1", "y0", "y1", "size")
+    __slots__ = ("cells", "x0", "x1", "y0", "y1", "size", "band")
 
     def __init__(self):
         self.cells = []
         self.x0 = self.y0 = 1e9
         self.x1 = self.y1 = -1e9
         self.size = 0.0
+        self.band = -1   # 横書き段組の帯index（-1=帯なし）
 
     def add_span(self, sp):
         x0, y0, x1, y1 = sp["bbox"]
@@ -167,11 +168,12 @@ class HLine:
 
 class RubyRun:
     """ルビの1かたまり。"""
-    __slots__ = ("text", "x0", "x1", "y0", "y1")
+    __slots__ = ("text", "x0", "x1", "y0", "y1", "band")
 
-    def __init__(self, text, x0, y0, x1, y1):
+    def __init__(self, text, x0, y0, x1, y1, band=-1):
         self.text = text
         self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
+        self.band = band
 
     @property
     def xc(self):
@@ -179,7 +181,8 @@ class RubyRun:
 
 
 class Page:
-    __slots__ = ("num", "vlines", "hlines", "rubies", "width", "height")
+    __slots__ = ("num", "vlines", "hlines", "rubies", "width", "height",
+                 "bands", "band_top", "band_bottom", "no_break")
 
     def __init__(self, num, width, height):
         self.num = num
@@ -188,6 +191,11 @@ class Page:
         self.vlines = []   # 本文候補の縦行（右→左順に後でソート）
         self.hlines = []   # 横書き行（柱・見出し・ノンブル候補）
         self.rubies = []   # RubyRun
+        # 横書きモードの帯分割用。既定値なら従来動作
+        self.bands = []           # 検出済みの帯 [(左端, 右端)] 昇順
+        self.band_top = None      # 帯の本文上端（転置後y＝紙面の帯左端）
+        self.band_bottom = None   # 帯の本文下端（転置後y＝紙面の帯右端）
+        self.no_break = False     # 同一紙面ページ内の後続帯あり＝改ページ判定抑止
 
 
 # ── PDF 解析 ────────────────────────────────────────
@@ -207,6 +215,18 @@ def collect_spans(page):
                 spans.append({"text": text.strip("　 "),
                               "size": s["size"], "bbox": s["bbox"]})
     return [s for s in spans if s["text"]]
+
+
+def transpose_spans(spans, page_h):
+    """横書きモード用: スパンbboxを90度転置する（(x,y)→(H−y,x)）。
+
+    横書きの幾何が縦書きの幾何に写像され（上の行＝右の列、行内左→右＝
+    列内上→下、ルビは親の上＝親列の右）、以降のパイプラインを無改造で
+    流用できる。詳細は DESIGN_横書き対応.md §3。"""
+    for sp in spans:
+        x0, y0, x1, y1 = sp["bbox"]
+        sp["bbox"] = (page_h - y1, x0, page_h - y0, x1)
+    return spans
 
 
 def detect_body_size(doc, page_range):
@@ -235,12 +255,56 @@ def span_is_vertical(sp):
     return h > w * (1.0 if n == 2 else 1.5)
 
 
-def analyze_page(fpage, num, body_size):
-    """1ページを解析して Page オブジェクトを返す。"""
+def count_orientation_chars(doc, page_range):
+    """複数文字スパンの向き票（縦文字数, 横文字数）を数える。
+
+    書字方向の自動判別ヒント用。1文字1スパンの旧OCRでは票がほぼ
+    集まらない（両者とも小さい値になる）ため、判定は呼び出し側で
+    最低票数つきで行うこと。"""
+    v = h = 0
+    for i in page_range:
+        for sp in collect_spans(doc[i]):
+            o = span_is_vertical(sp)
+            if o is True:
+                v += len(sp["text"])
+            elif o is False:
+                h += len(sp["text"])
+    return v, h
+
+
+def analyze_page(fpage, num, body_size, horizontal=False):
+    """1ページを解析して Page オブジェクトを返す。
+
+    horizontal=True で横書きモード: スパンを転置してから同じ解析を行う。
+    以降の「縦行」は紙面の横書き行、座標は転置後（x′=H−y, y′=x）を指す。"""
     spans = collect_spans(fpage)
-    pg = Page(num, fpage.rect.width, fpage.rect.height)
+    if horizontal:
+        transpose_spans(spans, fpage.rect.height)
+        pg = Page(num, fpage.rect.height, fpage.rect.width)
+    else:
+        pg = Page(num, fpage.rect.width, fpage.rect.height)
     if not spans:
         return pg
+
+    # 横書きモード: 段組の帯（転置後y方向の区間）をスパン段階で検出する。
+    # 列クラスタリングの前に行うのが重要: 段間の溝（1字幅程度）はクラスタの
+    # Yギャップ許容（body×1.6）より狭いため、帯で仕切らないと同じ
+    # ベースライン上にある別の段の行が1本の行に融合する
+    bands = _detect_span_bands(spans, body_size) if horizontal else []
+    pg.bands = bands
+
+    def _band_of(bb):
+        if not bands:
+            return -1
+        best, bi = None, 0
+        for i, (b0, b1) in enumerate(bands):
+            ov = min(bb[3], b1) - max(bb[1], b0)   # 負値＝ギャップ（最近傍）
+            if best is None or ov > best:
+                best, bi = ov, i
+        return bi
+
+    for sp in spans:
+        sp["band"] = _band_of(sp["bbox"])
 
     ruby_max = body_size * RUBY_SIZE_RATIO
     ruby_spans = [s for s in spans if s["size"] <= ruby_max]
@@ -262,9 +326,11 @@ def analyze_page(fpage, num, body_size):
     # y方向に大きく離れたスパン同士は別の行とみなす。
     cols = []  # [VLine]
 
-    def find_col(xc, tol, y0=None, y1=None):
+    def find_col(xc, tol, y0=None, y1=None, band=-1):
         best, bd = None, tol
         for vl in cols:
+            if vl.band != band:   # 帯（段）をまたぐ統合は禁止
+                continue
             d = abs(vl.xc - xc)
             if d >= bd:
                 continue
@@ -278,11 +344,12 @@ def analyze_page(fpage, num, body_size):
     for sp in sorted(verticals, key=lambda s: (round((s["bbox"][0] + s["bbox"][2]) / 2), s["bbox"][1])):
         x0, y0, x1, y1 = sp["bbox"]
         xc = (x0 + x1) / 2
-        col = find_col(xc, max(sp["size"] * 0.5, 3.0), y0, y1)
+        col = find_col(xc, max(sp["size"] * 0.5, 3.0), y0, y1, sp["band"])
         if col is not None:
             col.add_span(sp)
         else:
             vl = VLine()
+            vl.band = sp["band"]
             vl.add_span(sp)
             cols.append(vl)
 
@@ -292,11 +359,12 @@ def analyze_page(fpage, num, body_size):
     for sp in singles:
         xc = (sp["bbox"][0] + sp["bbox"][2]) / 2
         tol = max(sp["size"] * 0.6, 3.0)
-        col = find_col(xc, tol, sp["bbox"][1], sp["bbox"][3])
+        col = find_col(xc, tol, sp["bbox"][1], sp["bbox"][3], sp["band"])
         if col is not None:
             col.add_span(sp)
         else:
             vl = VLine()
+            vl.band = sp["band"]
             vl.add_span(sp)
             cols.append(vl)
             pending.append(vl)
@@ -333,10 +401,11 @@ def analyze_page(fpage, num, body_size):
 
     # ── ルビのグルーピング ──
     # x中心の近いルビスパンを列にまとめ、y方向のギャップで分割する
+    # （帯があれば帯内に限定: 別の段の同じ高さのルビと結合させない）
     ruby_cols = {}
     for sp in ruby_spans:
         xc = round((sp["bbox"][0] + sp["bbox"][2]) / 2 / 3)  # 3pt格子
-        ruby_cols.setdefault(xc, []).append(sp)
+        ruby_cols.setdefault((sp["band"], xc), []).append(sp)
     for group in ruby_cols.values():
         group.sort(key=lambda s: s["bbox"][1])
         run = None
@@ -351,7 +420,7 @@ def analyze_page(fpage, num, body_size):
             else:
                 if run is not None:
                     pg.rubies.append(run)
-                run = RubyRun(sp["text"], x0, y0, x1, y1)
+                run = RubyRun(sp["text"], x0, y0, x1, y1, sp["band"])
         if run is not None:
             pg.rubies.append(run)
 
@@ -380,6 +449,30 @@ def valid_heading_item(text):
     return bool(re.fullmatch(
         r'第?[0-9０-９一二三四五六七八九十]+(部|章|話|節|編|幕)?|'
         r'(もくじ|目次|序|あとがき|エピローグ|プロローグ)', t))
+
+
+# 横書き図版OCRノイズの見出し署名: 一の連続（罫線・図形の誤読）、
+# ルビ記号、℃等の単位記号、長音で始まる語（日本語として不成立）
+_H_NOISE_RE = re.compile(r'一一|[《》〈〉℃]|^ー')
+
+
+def _strip_heading_ornaments(text):
+    """横書き実用書の見出し飾り囲みを剥がす（口データ収集□ → データ収集）。
+
+    囲み枠のOCR化けは幾何記号（□■）のほか漢字「口」・カタカナ「ロ」にも
+    なる。幾何記号は端にあれば無条件に剥がすが、口・ロは正当な先頭文字
+    （口コミ・ロシア等）がありうるため、元テキストの反対端にも囲み記号が
+    ある場合のみ剥がす。横書きモード専用（縦書き経路には影響しない）。"""
+    t = text.strip("　 ")
+    while len(t) >= 3 and t[0] in "□■◇◆〓":
+        t = t[1:]
+    while len(t) >= 3 and t[-1] in "□■◇◆〓":
+        t = t[:-1]
+    if len(t) >= 3 and t[0] in "口ロ" and text[-1] in "□■◇◆〓口ロ":
+        t = t[1:]
+    if len(t) >= 3 and t[-1] in "口ロ" and text[0] in "□■◇◆〓口ロ":
+        t = t[:-1]
+    return t.strip("　 ")
 
 
 def dedup_norm_heading(text):
@@ -433,13 +526,18 @@ def norm_hashira(text):
     return DIGIT_RE.sub("", re.sub(r'\s+', "", text))
 
 
-def classify_marginals(pages, body_size):
+def classify_marginals(pages, body_size, horizontal=False):
     """
     全ページを通して柱・ノンブルを特定する。
     戻り値: (drop, headings, body_top, body_bottom, hashira_keys)
       drop     : set of (page_num, id(line)) — 除去すべき行
       headings : {(page_num, id(line)): text} — 見出しとして残す行
       hashira_keys : {正規化テキスト: 出現ページ数} — 柱テキスト一覧
+
+    horizontal=True では x′方向の本文バンド判定を追加する。横書き本の
+    柱・ノンブルは本文と平行にページ天地へ出るため、転置後は本文列群と
+    平行な右端／左端の列になり、y ベースの領域外判定にかからない
+    （DESIGN_横書き対応.md §5）。
     """
     # 本文領域（縦行の上端・下端の中央値）。
     # Vision再OCR経路ではノンブルの数字が本文サイズで書き戻されるため、
@@ -502,6 +600,26 @@ def classify_marginals(pages, body_size):
                          "bbox": (run.x0, run.y0, run.x1, run.y1)})
             pg.hlines.append(hl)
 
+    # 横書きモード: x′方向（転置後x＝紙面の上下方向）の本文バンドを推定。
+    # 柱・ノンブルは本文よりフォントが小さい（柱9pt/本文12pt級）ため、
+    # サイズ・セル数フィルタで推定から外れ、中央値汚染を防ぐ
+    band_l = band_r = None
+    if horizontal:
+        lefts, rights = [], []
+        for pg in pages:
+            xs = [v.xc for v in pg.vlines
+                  if len(v.cells) >= 3 and v.size >= body_size * 0.8]
+            if xs:
+                lefts.append(min(xs))
+                rights.append(max(xs))
+        if lefts:
+            band_l = statistics.median(lefts)
+            band_r = statistics.median(rights)
+
+    def out_of_band(xc, tol):
+        return (band_l is not None and
+                (xc < band_l - tol or xc > band_r + tol))
+
     # 柱候補の頻度: 横書き行 + 本文領域外の縦行
     freq = Counter()
     candidates = []  # (pg, line, is_vline)
@@ -510,7 +628,9 @@ def classify_marginals(pages, body_size):
             candidates.append((pg, hl, False))
             freq[norm_hashira(hl.text)] += 1
         for vl in pg.vlines:
-            if vl.y1 < body_top - cell * 0.5 or vl.y0 > body_bottom + cell * 0.5:
+            if vl.y1 < body_top - cell * 0.5 or \
+                    vl.y0 > body_bottom + cell * 0.5 or \
+                    out_of_band(vl.xc, cell * 0.5):
                 candidates.append((pg, vl, True))
                 freq[norm_hashira(vl.text)] += 1
 
@@ -523,10 +643,15 @@ def classify_marginals(pages, body_size):
         # （端の座標だと柱・ノンブルが数ptの差で本文側に食い込むことがある）
         lyc = (ln.y0 + ln.y1) / 2
         in_margin = (lyc < body_top - cell * 0.3 or
-                     lyc > body_bottom + cell * 0.3)
+                     lyc > body_bottom + cell * 0.3 or
+                     out_of_band((ln.x0 + ln.x1) / 2, cell * 0.3))
         if NOMBRE_RE.match(re.sub(r'\s+', "", text)):
             drop.add((pg.num, id(ln)))           # ノンブル
-        elif is_junk_line(text):
+        elif is_junk_line(_strip_heading_ornaments(text)
+                          if horizontal else text):
+            # 横書きは飾り囲み（口標本抽出□）を剥がしてから判定する。
+            # 剥がさないと漢字のみの章題が「かな無し＋記号」でジャンク
+            # 扱いされ、バンド外候補になった章題ごと落ちる
             drop.add((pg.num, id(ln)))           # 挿絵ノイズ
         elif ln.size >= body_size * HEADING_SIZE_RATIO and not in_margin:
             # 大きな文字 → 見出し。章始めの見出しは柱と同じテキストを
@@ -830,13 +955,107 @@ def render_vline(vl, ruby_map):
     return "".join(out)
 
 
+# ── 段組（帯分割）: 横書きモード専用 ─────────────────────
+
+def _detect_span_bands(spans, body_size):
+    """横書きページの段（転置空間ではy方向の帯）をスパン段階で検出する。
+
+    単純なy区間の和集合ではOCR bboxが段間の溝に1〜2ptはみ出しただけで
+    帯が融合するため、「横書きは左揃えが強い信号」を使う: 本文級スパンの
+    左端（転置後y0）をクラスタし、3行以上のクラスタだけを帯の種にする
+    （センタリング見出し・引用ブロック・ノイズを種にしない）。範囲が
+    重なる帯は統合する（段内の字下げ引用ブロックの別帯化を吸収）。
+    戻り値: [(帯左端, 帯右端)] を昇順（紙面の左→右）。段組でなければ []。
+    """
+    rows = sorted((s["bbox"][1], s["bbox"][3]) for s in spans
+                  if s["size"] >= body_size * 0.75 and len(s["text"]) >= 4)
+    if len(rows) < 6:
+        return []
+    tol = body_size * 1.8   # 段落字下げ1字＋α
+    clusters = [[rows[0]]]
+    for r in rows[1:]:
+        if r[0] - clusters[-1][-1][0] <= tol:
+            clusters[-1].append(r)
+        else:
+            clusters.append([r])
+    seeds = [c for c in clusters if len(c) >= 3]
+    if len(seeds) <= 1:
+        return []
+    bands = []
+    for c in seeds:
+        left = min(r[0] for r in c)
+        right = statistics.median([r[1] for r in c])
+        bands.append([left, max(right, left + body_size * 2)])
+    bands.sort()
+    merged = [bands[0]]
+    for b in bands[1:]:
+        if b[0] <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b[1])
+        else:
+            merged.append(b)
+    # 帯数上限4: 超える変則ページは1段フォールバック（壊れた読み順に
+    # するよりページ内の位置順のまま出す方が校正しやすい）
+    if len(merged) <= 1 or len(merged) > 4:
+        return []
+    return [tuple(b) for b in merged]
+
+
+def split_columns(pages):
+    """横書きモード: 段組ページを帯ごとの仮想ページ列に展開する。
+
+    帯は analyze_page がスパン段階で検出済み（pg.bands。行・ルビも
+    帯indexを保持）。帯を紙面の左→右の順に直列化することで、続き物の
+    段流し（用語集の左段→右段）は既存の段落継続ロジックで結合され、
+    独立記事の並置（サイドバー型）は紙面の読み順の慣行どおりの
+    ブロック順になる。仮想ページは band_top/band_bottom（帯ローカルの
+    本文範囲）を持ち、最終帯以外は no_break（帯間の偽改ページ抑止）を
+    立てる。戻り値: (展開後ページ列, 分割したページ数)
+    """
+    out = []
+    n_split = 0
+    for pg in pages:
+        bands = pg.bands
+        if len(bands) <= 1:
+            out.append(pg)
+            continue
+        n_split += 1
+        subs = []
+        for b0, b1 in bands:
+            sub = Page(pg.num, pg.width, pg.height)
+            sub.band_top, sub.band_bottom = b0, b1
+            subs.append(sub)
+
+        def band_idx(y0, y1):
+            best, bi = None, 0
+            for i, (b0, b1) in enumerate(bands):
+                ov = min(y1, b1) - max(y0, b0)   # 負値＝ギャップ（最近傍）
+                if best is None or ov > best:
+                    best, bi = ov, i
+            return bi
+
+        for v in pg.vlines:
+            i = v.band if 0 <= v.band < len(subs) else band_idx(v.y0, v.y1)
+            subs[i].vlines.append(v)
+        for h in pg.hlines:
+            subs[band_idx(h.y0, h.y1)].hlines.append(h)
+        for r in pg.rubies:
+            i = r.band if 0 <= r.band < len(subs) else band_idx(r.y0, r.y1)
+            subs[i].rubies.append(r)
+        for sub in subs[:-1]:
+            sub.no_break = True
+        out.extend(subs)
+    return out, n_split
+
+
 # ── テキスト組み立て ──────────────────────────────────
 
 def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                   hashira_keys=None, indent=True, verbose=False,
-                  image_pages=None):
+                  image_pages=None, horizontal=False):
     """全ページから青空文庫形式の本文を組み立てる。
     image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
+    horizontal: 横書きモード。見出しの飾り囲み剥がしと見出し条件の強化
+        （2〜3文字の大活字をテキスト僅少ページで見出し化しない）を行う
     """
     hashira_keys = hashira_keys or {}
     image_pages = image_pages or {}
@@ -921,6 +1140,13 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         vlines = [v for v in pg.vlines if (pg.num, id(v)) not in drop]
         hls = [h for h in pg.hlines if (pg.num, id(h)) not in drop]
 
+        # 帯分割された仮想ページ（横書き段組）は帯ローカルの本文範囲を使う。
+        # 特に段落末尾判定（ends_short）はグローバル右端との比較のままだと
+        # 幅の狭いサイドバー帯が全行「途中終わり」＝1行1段落に壊れる
+        loc_top = pg.band_top if pg.band_top is not None else body_top
+        loc_bottom = pg.band_bottom if pg.band_bottom is not None else body_bottom
+        loc_height = max(loc_bottom - loc_top, body_size)
+
         # 柱テキストと同文の縦行（章の始まりの見出し）を数える。
         # 見出しと柱でOCR結果が微妙に異なることがあるためあいまい一致。
         def matches_hashira(text):
@@ -934,7 +1160,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
 
         hashira_match = [v for v in vlines
                          if 0 < len(v.cells) <= HEADING_MAX_LEN
-                         and (v.y1 - v.y0) < body_height * 0.75
+                         and (v.y1 - v.y0) < loc_height * 0.75
                          and matches_hashira(v.text)]
         # 3行以上が柱テキストに一致するページは目次とみなし見出し化しない
         toc_like = len(hashira_match) >= 3
@@ -947,22 +1173,29 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
             text = v.text.strip()
             if not text:
                 continue
-            if is_junk_line(text):
+            # 横書きは見出しの飾り囲み（口標本抽出□）を剥がしてから
+            # ノイズ判定する（かな無し＋記号でジャンク扱いされるため）
+            if is_junk_line(_strip_heading_ornaments(text)
+                            if horizontal else text):
                 junk_count[0] += 1
                 continue
             # 見出しは天から下がった位置（字下げ）から始まる。天付きで
             # 始まる行は前ページからの段落続き断片なので見出しにしない。
-            indented = v.y0 > body_top + body_size * 0.6
+            indented = v.y0 > loc_top + body_size * 0.6
             # 大きな文字の見出し。OCRのサイズ揺れによる誤検出を避けるため、
             # 行が短く（本文領域の7割未満）、段落末尾の断片らしくないこと。
+            # 「テキスト僅少ページの短い大活字」の見出し化免除は縦書きのみ
+            # （横書き図解本では図版内の飾り文字ノイズが2〜3文字の偽見出し
+            # になりやすい。実測: 識と・一一議）
             is_big = (v.size >= body_size * HEADING_SIZE_RATIO and
                       len(v.cells) <= HEADING_MAX_LEN and
-                      (v.y1 - v.y0) < body_height * 0.7 and
+                      (v.y1 - v.y0) < loc_height * 0.7 and
                       indented and
-                      (len(v.cells) >= 4 or n_textlines <= 3) and
+                      (len(v.cells) >= 4 or
+                       (not horizontal and n_textlines <= 3)) and
                       text[-1] not in "。」！？、）』…")
             # 章見出しは通常の段落字下げ（1字）より深く下がっている
-            deep_indented = v.y0 > body_top + body_size * 1.5
+            deep_indented = v.y0 > loc_top + body_size * 1.5
             is_hashira_head = (not toc_like and v in hashira_match and
                                deep_indented and
                                v is vlines[0])  # ページ右端の行のみ
@@ -971,17 +1204,36 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
             else:
                 body_lines.append(v)
 
-        # 横書きの見出し（柱でないもの）
+        # 横書きの見出し（柱でないもの）。
+        # 横書きモードでは hline は紙面の垂直テキスト（＝図版内の飾り文字・
+        # 背文字の断片）なので見出しに採用しない
         h_headings = []
         long_items = []      # 長すぎて見出しにできないもの → 本文段落
-        for h in hls:
-            txt = headings.get((pg.num, id(h)))
-            if txt:
-                h_headings.append((h.yc, txt))
+        if not horizontal:
+            for h in hls:
+                txt = headings.get((pg.num, id(h)))
+                if txt:
+                    h_headings.append((h.yc, txt))
 
         page_headings = ([t for _, t in sorted(h_headings)] +
                          [t for _, t in sorted(heading_lines)])
-        page_headings = [t for t in page_headings if valid_heading_item(t)]
+        if horizontal:
+            # 飾り囲み（口標本抽出□）を剥がしてから有効性判定する。
+            # 剥がさないと漢字のみの章題が「かな無し＋記号あり」でジャンク
+            # 扱いされ、囲み付き見出しが丸ごと落ちる
+            page_headings = [_strip_heading_ornaments(t) for t in page_headings]
+            # 図版OCRノイズの署名を持つ見出しを拒否
+            page_headings = [t for t in page_headings
+                             if not _H_NOISE_RE.search(t)]
+            # 純漢字の見出し（標本抽出・相関・平均回帰）は実用書で頻出する
+            # ため、かな必須の縦書きルールを緩めて2〜8字の漢字列を許可
+            # （1字は図版の飾り文字ノイズが多いため除外）
+            page_headings = [t for t in page_headings
+                             if valid_heading_item(t) or
+                             (2 <= len(t) <= 8 and
+                              re.fullmatch(r'[㐀-鿿々]+', t))]
+        else:
+            page_headings = [t for t in page_headings if valid_heading_item(t)]
         # 長すぎる「見出し」（表紙・帯・奥付などの誤検出）は本文段落に落とす
         long_items = [t for t in page_headings if len(t) > HEADING_MAX_LEN]
         page_headings = [t for t in page_headings if len(t) <= HEADING_MAX_LEN]
@@ -1002,6 +1254,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                     t = v.text.strip()
                     if (t and not is_junk_line(t)
                             and len(t) <= HEADING_MAX_LEN
+                            and not (horizontal and _H_NOISE_RE.search(t))
                             and matches_hashira(t)):
                         kept = [t]
                         break
@@ -1031,7 +1284,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         if not body_lines:
             if page_headings or long_items:
                 # 章扉など本文のないページ → 次の本文の前で改ページする
-                prev_page_short = True
+                # （帯分割の非最終帯は同一紙面内なので改ページしない）
+                prev_page_short = not pg.no_break
             # 白ページ・挿絵のみのページは判定を持ち越す（段落継続を壊さない）
             continue
 
@@ -1040,22 +1294,25 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
 
         page_top = min(v.y0 for v in body_lines)
         # 極端に見出しの下から始まるページは自身のtopを使う
-        eff_top = max(body_top, page_top) if page_top < body_top + body_size * 3 \
+        eff_top = max(loc_top, page_top) if page_top < loc_top + body_size * 3 \
             else page_top
 
         for v in body_lines:
             cell = v.cell_height() or body_size
             indent_depth = v.y0 - eff_top
             starts_indented = indent_depth > cell * 0.55
-            ends_short = v.y1 < body_bottom - cell * 1.3
+            ends_short = v.y1 < loc_bottom - cell * 1.3
 
             if starts_indented or prev_line_short:
                 flush()
             cur += render_vline(v, ruby_map)
             prev_line_short = ends_short
         # ページ末尾: 段落継続は次ページに持ち越す。
-        # 最左行が本文左端より行送り2.5本分以上手前なら意図的な改ページ
-        prev_page_short = (min(v.xc for v in body_lines) - left_edge
+        # 最左行が本文左端より行送り2.5本分以上手前なら意図的な改ページ。
+        # 帯分割の非最終帯（no_break）は判定に参加しない（サイドバー帯は
+        # 下端まで達しないのが常態で、偽の改ページが量産されるため）
+        prev_page_short = (not pg.no_break and
+                           min(v.xc for v in body_lines) - left_edge
                            >= line_pitch * 2.5)
 
     flush()
@@ -1904,9 +2161,15 @@ def parse_meta_from_filename(path):
     return stem.strip(), ""
 
 
-def inspect_page(doc, num, body_size):
-    pg = analyze_page(doc[num], num, body_size)
-    print(f"=== page {num + 1} (index {num})  body_size={body_size:.1f} ===")
+def inspect_page(doc, num, body_size, horizontal=False):
+    pg = analyze_page(doc[num], num, body_size, horizontal=horizontal)
+    mode = "横書き（転置座標: x′=H−y, y′=x。縦行＝紙面の行）" if horizontal \
+        else "縦書き"
+    print(f"=== page {num + 1} (index {num})  body_size={body_size:.1f} "
+          f"{mode} ===")
+    if horizontal and pg.bands:
+        print("帯(段): " + " / ".join(f"y{a:.0f}-{b:.0f}"
+                                      for a, b in pg.bands))
     print(f"縦行 {len(pg.vlines)} 本:")
     for v in pg.vlines:
         print(f"  x={v.x0:.0f}-{v.x1:.0f} y={v.y0:.0f}-{v.y1:.0f} "
@@ -4108,7 +4371,8 @@ def run_from_text(args, doc, npages):
                episodes, cover_bg=args.cover_bg,
                cover_image_path=args.cover_image or "",
                cover_image_data=cover_bytes,
-               images=images_data or None)
+               images=images_data or None,
+               horizontal=args.horizontal)
     print(f"✅ ePub出力完了: {epub_path}")
 
 
@@ -4136,8 +4400,12 @@ def main():
                     help="紙の目次ページとの照合による見出し精錬を行わない")
     ap.add_argument("--no-images", action="store_true",
                     help="挿絵・口絵・章頭ページの画像ページ化を行わない")
+    ap.add_argument("--horizontal", action="store_true",
+                    help="横書きの本として解析し、ePubも横書きで生成する"
+                         "（既定は縦書き。段組は左揃え2〜4段まで自動分割）")
     ap.add_argument("--epub", action="store_true",
-                    help="リフロー型縦書きePub3も生成する")
+                    help="リフロー型ePub3も生成する（既定は縦書き、"
+                         "--horizontal 指定時は横書き）")
     ap.add_argument("--cover-page", type=int, default=1, metavar="N",
                     help="ePub表紙にするPDFページ番号（1始まり、既定=1、"
                          "0で表紙を自動生成）")
@@ -4172,21 +4440,35 @@ def main():
         sys.exit(1)
     print(f"本文フォントサイズ: {body_size:.1f}pt  対象 {len(page_nums)}/{npages} ページ")
 
+    # 書字方向の自動判別ヒント（複数文字スパンの縦横アスペクト票）。
+    # 1文字1スパンの旧OCRでは票が集まらず判定不能のため警告のみで、
+    # 自動切替はしない（誤判定は全損につながる）
+    v_ch, h_ch = count_orientation_chars(doc, sample[:40])
+    if not args.horizontal and h_ch > v_ch * 2 and h_ch >= 200:
+        print(f"警告: 横書きの本の可能性があります（向き票: 横 {h_ch} / "
+              f"縦 {v_ch} 文字）。--horizontal の指定を検討してください",
+              file=sys.stderr)
+    elif args.horizontal and v_ch > h_ch * 2 and v_ch >= 200:
+        print(f"警告: 縦書きの本の可能性があります（向き票: 縦 {v_ch} / "
+              f"横 {h_ch} 文字）。--horizontal なしの実行を検討してください",
+              file=sys.stderr)
+
     if args.inspect:
         for s in args.inspect.split(","):
-            inspect_page(doc, int(s) - 1, body_size)
+            inspect_page(doc, int(s) - 1, body_size,
+                         horizontal=args.horizontal)
         return
 
     # 全ページ解析
     pages = []
     for i in page_nums:
-        pg = analyze_page(doc[i], i, body_size)
+        pg = analyze_page(doc[i], i, body_size, horizontal=args.horizontal)
         if args.ruby == "drop":
             pg.rubies = []
         pages.append(pg)
 
     drop, headings, body_top, body_bottom, hashira_keys = \
-        classify_marginals(pages, body_size)
+        classify_marginals(pages, body_size, horizontal=args.horizontal)
     print(f"本文領域: y {body_top:.0f}〜{body_bottom:.0f} / "
           f"柱・ノンブル除去 {len(drop)} 行 / 見出し候補 {len(headings)} 個 / "
           f"柱パターン {len(hashira_keys)} 種")
@@ -4217,10 +4499,18 @@ def main():
                     f.write(data)
             print(f"画像ページ検出: {len(image_page_map)} 枚 → {img_dir}/")
 
+    # 横書きモード: 段組ページを帯（段）ごとの仮想ページに分割してから組む。
+    # 画像ページ検出の後に行う（検出はページ単位の本文行数を使うため）
+    if args.horizontal:
+        pages, n_split = split_columns(pages)
+        if n_split:
+            print(f"段組分割: {n_split} ページを帯に分割")
+
     body = assemble_text(pages, drop, headings, body_size,
                          body_top, body_bottom, hashira_keys,
                          indent=not args.no_indent, verbose=args.verbose,
-                         image_pages=image_page_map)
+                         image_pages=image_page_map,
+                         horizontal=args.horizontal)
 
     if not args.no_toc_refine:
         body, toc_stats = refine_headings_with_toc(
@@ -4262,7 +4552,8 @@ def main():
                    episodes, cover_bg=args.cover_bg,
                    cover_image_path=args.cover_image or "",
                    cover_image_data=cover_bytes,
-                   images=images_data or None)
+                   images=images_data or None,
+                   horizontal=args.horizontal)
         print(f"✅ ePub出力完了: {epub_path}")
 
 
