@@ -513,6 +513,12 @@ def is_junk_line(text):
         if re.fullmatch(r'第?[0-9０-９一二三四五六七八九十]+(部|章|話|節|編|幕)?',
                         t):
             return False
+        # 純漢字の章題（第一章雪夜灯籠・終章果 等）は歴史小説の目次・章頭に
+        # 頻出し、「かな無し・6字以上」の挿絵ノイズ判定と衝突する。章マーカー
+        # 始まりなら本物の章題として保護する（bad率は上で≤0.2確定済み。挿絵
+        # ノイズが第…章/序章/終章で始まる確率は無視できる）。DESIGN_目次生成 §3-A
+        if _CHAPTER_HEAD_RE.match(t):
+            return False
         if bad > 0 or n >= 6:
             return True
     return False
@@ -1445,8 +1451,80 @@ _TOC_LABEL_RE = re.compile(r'^[　\s]*(目\s*次|もくじ|くじ)[　\s]*$')
 _UNNUMBERED_RE = re.compile(
     r'^(序[章文]?|プロローグ|エピローグ|まえがき|はじめに)$'
     r'|あとがき|解説|おわりに|訳者|参考文献|初出|謝辞|付録|年表|索引')
+# 巻末で見出しとして残す後付け「章」語（DESIGN_目次生成 §3-E 決定）。
+# TOC一次原則: 印刷目次に載る章＋これらのみ採用し、参考文献/初出/謝辞/付録/
+# 年表/索引や広告・奥付・著者名は目次に無ければ降格する。
+_BACKMATTER_KEEP_RE = re.compile(r'解説|あとがき|訳者|おわりに|エピローグ|後書')
+# 巻末で見出しを降格させる正のジャンク署名（参考文献等の後付け・奥付・広告）。
+_BACKMATTER_DROP_RE = re.compile(
+    r'参考文献|初出|謝辞|付録|年表|索引|奥付|発刊|定価|本体[0-9０-９]|'
+    r'[0-9０-９]円|ISBN|株式会社|印刷|製本|カバー|装[丁幀画]')
 _LEADNUM_RE = re.compile(r'^(第?)([0-9０-９]{1,3})([章話部]|[　\s])?')
 _ZEN2HAN = str.maketrans("０１２３４５６７８９", "0123456789")
+
+# 章番号（章の序数）抽出。第N章・その N（危機その二）・行頭裸番号に対応。
+# 漢数字は _kanji_to_int で数値化する。序章・終章など序数を持たない語は None。
+_KNUM_DIGIT = {'〇': 0, '零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+               '六': 6, '七': 7, '八': 8, '九': 9}
+_KNUM_UNIT = {'十': 10, '百': 100, '千': 1000}
+_ORD_RE = re.compile(r'第([0-9０-９一二三四五六七八九十百]+)[章話部]'
+                     r'|その([0-9０-９一二三四五六七八九十百]+)'
+                     r'|^([0-9０-９一二三四五六七八九十百]+)')
+
+
+def _kanji_to_int(s):
+    """漢数字文字列を整数に（十七→17・二十→20・百三十四→134）。不正はNone。"""
+    total, current = 0, 0
+    for ch in s:
+        if ch in _KNUM_DIGIT:
+            current = _KNUM_DIGIT[ch]
+        elif ch in _KNUM_UNIT:
+            total += (current or 1) * _KNUM_UNIT[ch]
+            current = 0
+        else:
+            return None
+    return total + current
+
+
+def _num_val(s):
+    """算用/全角/漢数字の混在を整数化。"""
+    s2 = s.translate(_ZEN2HAN)
+    if s2.isdigit():
+        return int(s2)
+    return _kanji_to_int(s)
+
+
+def _chapter_ordinal(text):
+    """章題から章の序数を取り出す（第一章雪夜灯籠→1・危機その十七…→17）。
+    序数を持たない章（序章・終章・解説・あとがき等）は None。"""
+    m = _ORD_RE.search(_norm_t(text))
+    if not m:
+        return None
+    return _num_val(m.group(1) or m.group(2) or m.group(3))
+
+
+def _max_increasing_run(entries):
+    """エントリ列の章序数から「+1刻みで増加する連続部分列」の最大長を返す。
+    詩集・広告・本文はこの連番列を作れないため、目次ページ判定の弁別子に使う
+    （DESIGN_目次生成 §3-B）。Noneの語（序章・解説等）は列を途切れさせない
+    （黒牢城の 序章/第一〜四章/終章 のように前後付けが挟まる目次に対応）。"""
+    best = run = 0
+    prev = None
+    for e in entries:
+        n = _chapter_ordinal(e)
+        if n is None:
+            continue           # 番号なし語は列を途切れさせない
+        if prev is not None and n == prev + 1:
+            run += 1
+        else:
+            run = 1
+        prev = n
+        best = max(best, run)
+    return best
+
+
+def _norm_t(s):
+    return re.sub(r'[\s　]', '', s)
 
 
 def _heading_fuzzy_score(a, b):
@@ -1479,12 +1557,8 @@ def _toc_entry_of_line(line):
     return s
 
 
-def _norm_t(s):
-    return re.sub(r'[\s　]', '', s)
-
-
 def refine_headings_with_toc(body, book_title, hashira_keys=None,
-                             verbose=False):
+                             author=None, verbose=False):
     """紙の目次ページと本文見出しを突き合わせて見出しを精錬した本文と
     処理統計を返す。目次ページが見つからない本でも章番号の内挿だけは行う。"""
     hashira_keys = hashira_keys or {}
@@ -1540,11 +1614,20 @@ def refine_headings_with_toc(body, book_title, hashira_keys=None,
                 entries.append(e)
         if contains_heading or not entries:
             continue
+        # 構造ベースの目次判定（DESIGN_目次生成 §3-B）。破損した本文見出しとの
+        # 一致数に依存すると、良い目次が本文検出の巻き添えで棄却される（鶏と卵）。
+        # 前付け限定は維持したまま、採用条件を内的規則性に置き換える:
+        #   1) 章序数の +1連番列が3以上（詩集・広告・本文は作れない最強の弁別子）
+        #   2) 目次ラベル（目次/もくじ）があり、かつエントリ3以上
+        # 番号列を作れないかな見出しのみの本のために difflib 経路も温存する。
+        n_seq = _max_increasing_run(entries)
         n_match = sum(1 for e in entries
                       if any(difflib.SequenceMatcher(
                           None, _norm_t(e), t).ratio() >= 0.75
                           for t in titles_norm))
-        if n_match >= 3 or (has_label and n_match >= 2):
+        if (n_seq >= 3
+                or (has_label and len(entries) >= 3)
+                or n_match >= 3 or (has_label and n_match >= 2)):
             toc_spans.append((a, b))
             toc_entries.extend(entries)
     if len(toc_spans) > 3:
@@ -1571,11 +1654,13 @@ def refine_headings_with_toc(body, book_title, hashira_keys=None,
                     cands.append((sc, -skip, hi, ei))
     cands.sort(reverse=True)
     matched = {}          # hi -> (エントリ文字列, skip)
+    ei_of_hi = {}         # hi -> エントリindex（Stage2-C の単調位置決め用）
     used_ei = set()
     for sc, nskip, hi, ei in cands:
         if hi in matched or ei in used_ei:
             continue
         matched[hi] = (toc_entries[ei], -nskip)
+        ei_of_hi[hi] = ei
         used_ei.add(ei)
 
     # ── 3. 表記の修復（柱を審判に、目次エントリと見出しの良い方を採用）──
@@ -1632,40 +1717,243 @@ def refine_headings_with_toc(body, book_title, hashira_keys=None,
     in_toc = set()
     for a, b in toc_spans:
         in_toc.update(range(a, b))
-    # 回収は本文行の見出し昇格＝誤ると本文構造を壊すため、判定は
-    # difflib比0.85以上（オーバーラップ不使用）・回収数は5件まで
-    used_texts = {e for e, _ in matched.values()}
-    recovered = []
-    for e in toc_entries:
-        if len(recovered) >= 5:
-            break
-        if e in used_texts or len(_norm_t(e)) < 4:
+
+    # ── 柱融合の検出（章扉検出・柱畳み込みの発火ゲート。DESIGN_目次生成 §3-D）──
+    # 柱型の本（黒牢城）は章題がページ上部の柱として毎ページ出て、ノンブル融合
+    # ＋OCR破損で「57第一章夜」等の別々の偽見出しに化ける。誤発火防止が最重要
+    # （実測: 部構成のグリック・章内反復セクションの30秒DSで実章を大量消失）。
+    # 固有シグネチャ＝「同一目次章が、先頭ノンブルの異なる3つ以上の見出しに
+    # claim され、少なくとも1つがOCR破損（entry一致<0.85）」。候補も先頭ノンブル
+    # 付きに限定。正当な多部構成章（(1)(2)(3)＝クリーンな連番）は破損条件で除外。
+    def _lead_nombre(title):
+        m = re.match(r'^[IlＩｌ]?([0-9０-９]{1,3})(?=[^0-9０-９])', title.strip("　 "))
+        return m.group(1).translate(_ZEN2HAN) if m else None
+
+    def _chapter_key(title):
+        t = _norm_t(re.sub(r'^[0-9０-９IlＩｌ・\s　]+', '', title))
+        if len(t) < 2:
+            return None, 0.0
+        best_ei, best = None, 0.55
+        for ei, e in enumerate(toc_entries):
+            s = _heading_fuzzy_score(t, _norm_t(e))
+            if s > best:
+                best, best_ei = s, ei
+        return best_ei, best
+
+    cand = {}              # hi -> (ei or None, nombre, score)
+    for hi, i in enumerate(heads):
+        if i in demote:
             continue
+        nb = _lead_nombre(head_title(i))
+        if nb is not None:
+            ei, sc = _chapter_key(head_title(i))
+            cand[hi] = (ei, nb, sc)
+    ei_cands = {}
+    for hi, (ei, nb, sc) in cand.items():
+        if ei is not None:
+            ei_cands.setdefault(ei, []).append((hi, nb, sc))
+    pillar_eis = {ei for ei, lst in ei_cands.items()
+                  if len({nb for _, nb, _ in lst}) >= 3
+                  and any(sc < 0.85 for _, _, sc in lst)}
+
+    # ── 章扉ページ検出（最優先の章境界。DESIGN_目次生成 §3-D）──
+    # 目次章題そのものが独立した本文行として改ページに挟まれて出る本（黒牢城）が
+    # ある。これは柱（毎ページの走り）より正確な章境界なので最優先で採用し、
+    # 該当章の柱見出しはノイズとして畳む。安全: 改ページ隣接＋目次エントリへの
+    # 一致0.88以上＋読み順単調。既に見出し検出済みの章題は head_set 除外で拾わない。
+    # **柱融合本（pillar_eis 非空）に限定発火**する。章扉と柱は同じ本の別現象で
+    # 併存するため、柱型と判定できた本でのみ章扉回収する（通常本＝章扉が既に
+    # 見出し検出されている本を、孤立本文行の昇格で変えないための安全ゲート。
+    # 実測: 無制限だと honmono/guri/ds30 の安定出力を+2〜4見出し動かした）。
+    tobira = {}   # ei -> 行index
+    tfloor = -1
+    for ei, e in enumerate(toc_entries):
+        if not pillar_eis:
+            break
         en = _norm_t(e)
-        for j, ln in enumerate(out):
+        if len(en) < 3:
+            continue
+        for j in range(tfloor + 1, len(out)):
             if j in in_toc or j in head_set:
                 continue
-            s = ln.strip("　 ")
+            s = out[j].strip("　 ")
+            if not s or s.startswith("［＃"):
+                continue
+            prevp = j > 0 and out[j - 1].strip() == "［＃改ページ］"
+            nextp = j + 1 < len(out) and out[j + 1].strip() == "［＃改ページ］"
+            if (prevp or nextp) and _heading_fuzzy_score(_norm_t(s), en) >= 0.88:
+                tobira[ei] = j
+                tfloor = j
+                break
+
+    # 回収は本文行の見出し昇格＝誤ると本文構造を壊すため、判定は改ページ隣接＋
+    # difflib比0.85以上（オーバーラップ不使用）。目次を一次ソースとするため
+    # 上限は撤廃し全エントリを対象にするが（DESIGN_目次生成 §3-C）、読み順の
+    # 単調性を強制する: エントリをtoc順に見て、直前に確定した章の本文位置
+    # （floor）より後ろでのみ回収候補を探す。これで同題が複数箇所に出る本での
+    # 誤アンカーと、既検出見出しより手前への逆流を防ぐ。
+    hi_of_ei = {ei: hi for hi, ei in ei_of_hi.items()}
+    recovered = []            # (行index, 章題, mode) mode: replace|prepend
+    rec_ei = set(tobira)      # 章扉で確定した章は通常回収の対象外
+    floor = -1
+    for ei, j in sorted(tobira.items(), key=lambda kv: kv[1]):
+        recovered.append((j, toc_entries[ei], "replace"))
+    for ei, e in enumerate(toc_entries):
+        if ei in tobira:
+            floor = max(floor, tobira[ei])
+            continue
+        if ei in hi_of_ei:
+            floor = max(floor, heads[hi_of_ei[ei]])
+            continue
+        en = _norm_t(e)
+        # 通常章は本文行が章題そのもの（difflib≥0.85で置換）。後付け章（解説・
+        # あとがき等）は本文冒頭に副題付きで出るので接頭辞一致を許し、本文を
+        # 消さないよう前置（prepend）する（実測: 解説ジャンルを超える…）。
+        keep_bm = bool(_BACKMATTER_KEEP_RE.search(en))
+        if len(en) < 2 or (len(en) < 4 and not keep_bm):
+            continue
+        for j in range(floor + 1, len(out)):
+            if j in in_toc or j in head_set:
+                continue
+            s = out[j].strip("　 ")
             if not s or s.startswith("［＃"):
                 continue
             prev = [x for x in out[max(0, j - 3):j] if x.strip()]
             if not prev or prev[-1].strip() != "［＃改ページ］":
                 continue
             if difflib.SequenceMatcher(None, _norm_t(s), en).ratio() >= 0.85:
-                recovered.append((j, e))
-                used_texts.add(e)
+                recovered.append((j, e, "replace"))
+                rec_ei.add(ei)
+                floor = j
+                break
+            if keep_bm and _norm_t(s).startswith(en):
+                recovered.append((j, e, "prepend"))
+                rec_ei.add(ei)
+                floor = j
+                break
+    # 序章型の先頭章は本文が直に始まり章題テキストが本文に無いので、目次の
+    # 先頭エントリを本文冒頭（目次直後の最初の本文段落）へ前置アンカーする。
+    if (toc_entries and 0 not in hi_of_ei and 0 not in rec_ei
+            and re.match(r'^(序|プロローグ)', _norm_t(toc_entries[0]))):
+        limit = heads[0] if heads else len(out)
+        for j in range(limit):
+            if j in in_toc or j in head_set:
+                continue
+            s = out[j].strip("　 ")
+            if s and not s.startswith("［＃"):
+                recovered.append((j, toc_entries[0], "prepend"))
                 break
 
+    # ── E. 巻末ジャンクの降格（DESIGN_目次生成 §3-E 決定）──
+    # 印刷目次が権威なので、最後の目次一致章より後ろの見出しは、後付け章語
+    # （解説/あとがき/訳者/おわりに/エピローグ）でなければ、次の「正のジャンク
+    # 署名」を持つものだけ降格する: 参考文献/初出/謝辞/付録/年表/索引・奥付/
+    # 広告の定型（発刊/定価/円/ISBN/株式会社/印刷/製本）・書名/著者名そのもの・
+    # HEADING_MAX_LEN 超の帯文。負の判定（目次外は全て降格）にしないのは、
+    # 終章の柱がノンブル融合＋OCR破損で「果」等に崩れ目次照合も効かない実章を
+    # 巻き添えにするため（それは Stage3 の柱再構成で正しく回収する）。
+    matched_pos = [heads[hi] for hi in matched]
+    last_matched = max(matched_pos, default=-1)
+    # 書名・著者名の照合はNFKC正規化して比較する（巻末の翻訳者クレジット・
+    # 次巻広告は半角カナ・半角中黒でOCRされ、素の照合では書名/著者名に届かない。
+    # 実測: ゲイル･キヤリガー/川野靖子訳… が著者比0.778で降格漏れ）。
+    nfkc = lambda s: _norm_t(unicodedata.normalize("NFKC", s or ""))
+    title_nfkc = nfkc(book_title)
+    author_nfkc = nfkc(author)
+    n_backdrop = 0
+    for hi, i in enumerate(heads):
+        if i <= last_matched or hi in matched or i in demote:
+            continue
+        rest = _norm_t(info[i][0])
+        if _BACKMATTER_KEEP_RE.search(rest):
+            continue
+        rest_nfkc = nfkc(info[i][0])
+        is_junk = (
+            _BACKMATTER_DROP_RE.search(rest)
+            or (title_nfkc and _heading_fuzzy_score(rest_nfkc, title_nfkc) >= 0.85)
+            or (author_nfkc and _heading_fuzzy_score(rest_nfkc, author_nfkc) >= 0.85)
+            or len(rest) > HEADING_MAX_LEN)
+        if is_junk:
+            demote.add(i)
+            n_backdrop += 1
+    if n_backdrop:
+        stats["巻末降格"] = n_backdrop
+
+    # ── D. 柱由来の重複見出しの畳み込み（DESIGN_目次生成 §3-D）──
+    # 章扉（tobira）を最優先で採用済み。ここでは柱（毎ページの走り）由来の
+    # 重複偽見出しを目次章へ集約して畳む。柱融合本（pillar_eis 非空）のみ発火。
+
+    collapse_idx = set()   # out内index（畳み込んで消す見出しブロック先頭）
+    rep_fix = {}           # out内index -> クリーン章題（代表見出し）
+    # 発火は書籍レベル: ノンブルの異なる柱重複章が1つでもあれば「柱型の本」と
+    # 判定し、以降は全ての柱候補章（単発の第三/四/終章も含む）をクリーン化する。
+    # pillar_eis が空（通常本）なら発火しない。
+    if pillar_eis:
+        reps = {}
+        for ei in ei_cands:
+            his = [hi for hi, _, _ in ei_cands[ei]]
+            # 章扉が見つかった章は、柱は全てノイズ（章扉が本命の章境界）
+            if ei in tobira:
+                for hi in his:
+                    collapse_idx.add(heads[hi])
+                continue
+            rep = min(his, key=lambda hi: heads[hi])
+            reps[ei] = rep
+            entry = re.sub(
+                r'^(第[0-9０-９一二三四五六七八九十百]+[章話部]|序章|終章)'
+                r'(?![　\s])', r'\1　', toc_entries[ei])
+            rep_fix[heads[rep]] = entry
+            for hi in his:
+                if hi != rep:
+                    collapse_idx.add(heads[hi])
+        # 位置補間: 柱重複章repの範囲内で、章に分類できなかった柱候補
+        # （ノンブル付きだが超破損＝「73章 雪」「117 夜籠」）も柱として畳む。
+        # 候補（ノンブル付き）に限るので、番号なしの実セクション見出しは触れない。
+        rep_positions = ([heads[r] for r in reps.values()]
+                         + list(tobira.values()))
+        lo = min(rep_positions)
+        hi_pos = max(rep_positions)
+        for hi, (ei, nb, sc) in cand.items():
+            i = heads[hi]
+            if i in demote or i in rep_fix or i in collapse_idx:
+                continue
+            if ei is None and lo < i < hi_pos:
+                collapse_idx.add(i)
+        # 柱型本では章repの範囲内の短い非章ジャンク（ノンブル無しの「I11」等）も
+        # 柱ノイズとして畳む。章に分類できず4字以下のものに限る。
+        for hi, i in enumerate(heads):
+            if i in demote or i in rep_fix or i in collapse_idx:
+                continue
+            if lo < i < hi_pos and hi not in cand:
+                t = head_title(i)
+                if _chapter_key(t)[0] is None and (is_junk_line(t)
+                                                   or len(_norm_t(t)) <= 4):
+                    collapse_idx.add(i)
+    if collapse_idx:
+        stats["柱重複畳み込み"] = len(collapse_idx)
+
     # ── 4. 章番号の再構成＋修復章題の反映 ──
-    keep_heads = [i for i in heads if i not in demote]
+    keep_heads = [i for i in heads
+                  if i not in demote and i not in collapse_idx and i not in rep_fix]
     n_renum = _renumber_headings(out, keep_heads, info,
-                                 breaks=[j for j, _ in recovered])
+                                 breaks=[j for j, _, _ in recovered])
     if n_renum:
         stats["章番号再構成"] = n_renum
 
-    for j, e in recovered:
-        out[j] = (f"［＃「{e}」は中見出し］\n{e}\n"
-                  f"［＃「{e}」は中見出し終わり］")
+    for idx in collapse_idx:
+        _collapse_heading_block(out, idx)
+    for idx, title in rep_fix.items():
+        _place_rep_heading(out, idx, title)
+
+    for j, e, mode in recovered:
+        e = re.sub(r'^(第[0-9０-９一二三四五六七八九十百]+[章話部]|序章|終章)'
+                   r'(?![　\s])', r'\1　', e)
+        block = (f"［＃「{e}」は中見出し］\n{e}\n"
+                 f"［＃「{e}」は中見出し終わり］")
+        if mode == "prepend":
+            out[j] = block + "\n" + out[j]   # 本文行を残して見出しを前置
+        else:
+            out[j] = block
     if recovered:
         stats["欠落章回収"] = len(recovered)
 
@@ -1802,11 +2090,101 @@ def _replace_heading(out, i, new_title):
         return False
     out[i] = f"［＃「{new_title}」は中見出し］"
     for k in range(i + 1, min(i + 3, len(out))):
+        if out[k] is None:
+            continue
         if out[k].strip("　 ") == old:
             out[k] = new_title
         elif _MIDASHI_LINE_RE.match(out[k]):
             out[k] = f"［＃「{new_title}」は中見出し終わり］"
     return True
+
+
+# 段落再結合で連結しない（＝直前が文として閉じている）文末文字
+_SENT_END = "。！？」』）】〉》…―—、"
+# 章見出しを置ける清潔な段落境界の文末文字（読点・リーダは境界にしない）
+_SENT_END_STRONG = "。！？」』）"
+
+
+def _place_rep_heading(out, idx, title):
+    """柱型本の章代表見出しを段落境界に置く（DESIGN_目次生成 §3-D）。
+    直前が文末で終わる清潔な改ページ境界ならその場で改題する。柱ページ位置で
+    段落途中なら、ブロックを畳んで段落を再結合し、直近の文末境界の直後へ
+    クリーンな見出しを挿し直す（章頭の分断＝「同道す｜る。」型を解消）。"""
+    end = idx
+    for k in range(idx + 1, min(idx + 3, len(out))):
+        if out[k] and _MIDASHI_LINE_RE.match(out[k]):
+            end = k
+            break
+    # 直前の改ページと、その前の本文行 B
+    p = idx - 1
+    while p >= 0 and (out[p] is None or out[p].strip() == ""):
+        p -= 1
+    clean = False
+    if p >= 0 and out[p] is not None and out[p].strip() == "［＃改ページ］":
+        b = p - 1
+        while b >= 0 and (out[b] is None or out[b].strip() == ""):
+            b -= 1
+        if (b >= 0 and out[b] and not out[b].startswith("［＃")
+                and out[b].rstrip()[-1:] in _SENT_END_STRONG):
+            clean = True
+    if clean:
+        _replace_heading(out, idx, title)
+        return
+    # 段落途中 → 畳んで再結合し、直近の文末境界へ挿し直す
+    _collapse_heading_block(out, idx)
+    block = (f"［＃「{title}」は中見出し］\n{title}\n"
+             f"［＃「{title}」は中見出し終わり］")
+    t = idx - 1
+    while t >= 0:
+        if (out[t] is not None and out[t].strip()
+                and not out[t].startswith("［＃")):
+            if out[t].rstrip()[-1:] in _SENT_END_STRONG:
+                out[t] = out[t] + "\n" + block
+                return
+        elif out[t] is not None and out[t].strip() == "［＃改ページ］":
+            out[t] = out[t] + "\n" + block
+            return
+        t -= 1
+
+
+def _collapse_heading_block(out, idx):
+    """柱由来の重複見出しブロックを消し、分断された段落を再結合する
+    （DESIGN_目次生成 §3-D）。見出しブロック（idx..終わり）＋その末尾の空行＋
+    直前の［＃改ページ］を除去し、直前の本文行が文末で終わっていなければ直後の
+    本文行（字下げ継続）を連結する。outはNone混じりでも安全に扱う。"""
+    if idx >= len(out) or not out[idx] or not _MIDASHI_LINE_RE.match(out[idx]):
+        return
+    end = idx
+    for k in range(idx + 1, min(idx + 3, len(out))):
+        if out[k] and _MIDASHI_LINE_RE.match(out[k]):
+            end = k
+            break
+    for k in range(idx, end + 1):
+        out[k] = None
+    # 見出し末尾の空行を除去
+    k = end + 1
+    while k < len(out) and out[k] is not None and out[k].strip() == "":
+        out[k] = None
+        k += 1
+    # 直前の空行・改ページを除去
+    p = idx - 1
+    while p >= 0 and (out[p] is None or out[p].strip() == ""):
+        p -= 1
+    if p >= 0 and out[p] is not None and out[p].strip() == "［＃改ページ］":
+        out[p] = None
+        p -= 1
+        while p >= 0 and (out[p] is None or out[p].strip() == ""):
+            p -= 1
+    b = p if (p >= 0 and out[p] and not out[p].startswith("［＃")) else None
+    q = end + 1
+    while q < len(out) and (out[q] is None or out[q].strip() == ""):
+        q += 1
+    n = q if (q < len(out) and out[q] and not out[q].startswith("［＃")) else None
+    if b is not None and n is not None:
+        btxt = out[b].rstrip()
+        if btxt and btxt[-1] not in _SENT_END and out[n].startswith("　"):
+            out[b] = btxt + out[n].lstrip("　")
+            out[n] = None
 
 
 # ── OCR系統誤りの後処理正規化 ──────────────────────────
@@ -4254,6 +4632,13 @@ def parse_aozora_text(content: str) -> tuple:
         subsections = _split_aozora_by_headings(sec)
         if subsections:
             for sub in subsections:
+                # 見出し前の前文＝章内の意図的な改ページの続き。新エピソードに
+                # せず前エピソードへ連結し（div.pagebreak で描画）、目次に
+                # 「第N話」を増やさない（見出しなしセクションと同じ扱い）。
+                if not sub["title"] and episodes:
+                    episodes[-1]["body"] = (episodes[-1]["body"].rstrip()
+                                            + "\n［＃改ページ］\n" + sub["body"])
+                    continue
                 ep_num = len(episodes) + 1
                 episodes.append({
                     "title": sub["title"] or f"第{ep_num}話",
@@ -4527,7 +4912,7 @@ def main():
 
     if not args.no_toc_refine:
         body, toc_stats = refine_headings_with_toc(
-            body, title, hashira_keys, verbose=args.verbose)
+            body, title, hashira_keys, author=author, verbose=args.verbose)
         if toc_stats:
             detail = " / ".join(f"{k} {v}" for k, v in toc_stats.items())
             print(f"目次照合: {detail}")
