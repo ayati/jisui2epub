@@ -2538,15 +2538,33 @@ def parse_pages_arg(arg, npages):
     return sorted(set(i for i in result if 0 <= i < npages))
 
 
+# OCR 方式タグ（ファイル名末尾に付けた運用で、著者名へ混入するのを防ぐ）
+_METHOD_TAGS = ("vision", "docai", "ocr")
+
+
+def _strip_method_tag(name: str) -> str:
+    """著者名末尾の OCR 方式タグ（例 「_vision」「-docai」）を除去する。
+    既知タグのみを対象とし、未知の末尾は著者名の一部として残す（安全側）。"""
+    low = name.lower()
+    for sep in ("_", "-"):
+        for tag in _METHOD_TAGS:
+            suf = sep + tag
+            if low.endswith(suf):
+                return name[:-len(suf)].strip()
+    return name
+
+
 def parse_meta_from_filename(path):
     """「タイトル_作者名.pdf」形式のファイル名から (title, author) を推定する。
+    「タイトル_作者名_方式.pdf」のように末尾へ OCR 方式タグ（vision/docai/ocr）を
+    付けた運用にも対応し、著者名からは方式タグを取り除く。
     区切りは最初の _ を優先、次いで -（mangaP2ePub と同方式）。
     区切りがなければ (ファイル名, "") を返す。"""
     stem = os.path.splitext(os.path.basename(path))[0]
     for sep in ("_", "-"):
         if sep in stem:
             title, _, author = stem.partition(sep)
-            title, author = title.strip(), author.strip()
+            title, author = title.strip(), _strip_method_tag(author.strip())
             if title and author:
                 return title, author
     return stem.strip(), ""
@@ -3746,7 +3764,8 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
               inline_images: list = None,
               synopsis: str = "",
               horizontal: bool = False,
-              doc_items: list = None) -> str:
+              doc_items: list = None,
+              publisher: str = "", source: str = "", pub_date: str = "") -> str:
     """
     OPF（package.opf）を生成する。
     cover_fmt: "png" | "svg" | "" (表紙画像なし)
@@ -3754,6 +3773,9 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
     toc_at_end: True のとき目次を奥付の後に配置（デフォルト: 表紙の後・本文の前）
     inline_images: 本文中のインライン画像ファイル名リスト（青空文庫 ZIP 内の画像等）
     synopsis: あらすじ（dc:description に設定）
+    publisher: 原出版社（dc:publisher。yomikake の書誌ブロック「出版社」欄）
+    source:    底本識別子（dc:source。自炊本は "urn:isbn:…"。yomikake が書誌検索に使用）
+    pub_date:  原刊行日（dc:date。空なら生成日を使う）
     """
     today    = date.today().strftime("%Y-%m-%d")
     now_iso  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3844,6 +3866,10 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
     spine_str    = "\n    ".join(spine_items)
     cover_meta   = ('\n    <meta name="cover" content="cover-image"/>' if cover_fmt else "")
     desc_meta    = (f"\n    <dc:description>{_esc(synopsis)}</dc:description>" if synopsis else "")
+    # 原出版社（dc:publisher）・底本識別子（dc:source）。yomikake が書誌ブロック／書誌検索に使う
+    publisher_meta = (f"\n    <dc:publisher>{_esc(publisher)}</dc:publisher>" if publisher else "")
+    source_meta    = (f"\n    <dc:source>{_esc(source)}</dc:source>" if source else "")
+    dc_date        = _esc(pub_date) if pub_date else today   # 原刊行日があれば優先、なければ生成日
     # 縦書き: iPad/iOS Kindle 縦書き対応のため primary-writing-mode を明示。横書きは不要
     writing_mode_meta = (
         "" if horizontal
@@ -3862,9 +3888,9 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
     <dc:identifier id="book-id">urn:uuid:{book_id}</dc:identifier>
     <dc:title>{_esc(title)}</dc:title>
     <dc:creator id="creator">{_esc(author)}</dc:creator>
-    <meta refines="#creator" property="role" scheme="marc:relators">aut</meta>
+    <meta refines="#creator" property="role" scheme="marc:relators">aut</meta>{publisher_meta}
     <dc:language>ja</dc:language>
-    <dc:date>{today}</dc:date>{desc_meta}
+    <dc:date>{dc_date}</dc:date>{desc_meta}{source_meta}
     <meta property="dcterms:modified">{now_iso}</meta>{cover_meta}
     <meta property="rendition:layout">reflowable</meta>
     <meta property="rendition:orientation">auto</meta>
@@ -4363,6 +4389,9 @@ def build_epub(
     toc_at_end: bool = False,
     images: dict = None,     # {"filename.png": bytes} — 本文中のインライン画像
     horizontal: bool = False,  # True: 横書きePub3を生成
+    publisher: str = "",     # 原出版社 → dc:publisher
+    isbn: str = "",          # 底本 ISBN → dc:source urn:isbn
+    pub_date: str = "",      # 原刊行日 → dc:date（空なら生成日）
 ):
     """
     ePub3ファイルを生成する。horizontal=True で横書き、False（デフォルト）で縦書き。
@@ -4456,6 +4485,8 @@ def build_epub(
 """)
 
         # package.opf（cover_fmt / font_filename を渡して manifest/spine を決定）
+        _isbn = re.sub(r"[-\s]", "", isbn)
+        _source = f"urn:isbn:{_isbn}" if _isbn else ""
         zf.writestr("OEBPS/package.opf",
                     _make_opf(title, author, book_id, ep_titles, cover_fmt,
                               font_filename=font_filename,
@@ -4463,7 +4494,8 @@ def build_epub(
                               inline_images=list(images.keys()) if images else None,
                               synopsis=synopsis,
                               horizontal=horizontal,
-                              doc_items=[(d, h) for d, h, _s, _e, _t in doc_plan]))
+                              doc_items=[(d, h) for d, h, _s, _e, _t in doc_plan],
+                              publisher=publisher, source=_source, pub_date=pub_date))
 
         # nav.xhtml（RS向け機械読み取り専用、spine には linear="no" で含める）
         zf.writestr("OEBPS/nav.xhtml",
@@ -4769,6 +4801,7 @@ def run_from_text(args, doc, npages):
                episodes, cover_bg=args.cover_bg,
                cover_image_path=args.cover_image or "",
                cover_image_data=cover_bytes,
+               publisher=args.publisher, isbn=args.isbn, pub_date=args.date,
                images=images_data or None,
                horizontal=args.horizontal)
     print(f"✅ ePub出力完了: {epub_path}")
@@ -4781,7 +4814,10 @@ def main():
     ap.add_argument("-o", "--output", help="出力テキストファイル")
     ap.add_argument("--title", help="タイトル（省略時は「タイトル_作者名.pdf」"
                                     "形式のファイル名から自動取得）")
-    ap.add_argument("--author", default="", help="著者名（省略時はファイル名から自動取得）")
+    ap.add_argument("--author", default="", help="著者名（省略時はファイル名から自動取得。末尾の方式タグ _vision/_docai/_ocr は除去）")
+    ap.add_argument("--publisher", default="", help="原出版社（dc:publisher。yomikake の書誌ブロック「出版社」欄に表示）")
+    ap.add_argument("--isbn", default="", help="底本の ISBN（dc:source urn:isbn。yomikake が国会図書館サーチ等の書誌検索リンクに使用）")
+    ap.add_argument("--date", default="", help="原刊行日（dc:date。例 2016-03-03。省略時は生成日）")
     ap.add_argument("--from-text", metavar="FILE",
                     help="校正済みの青空文庫形式テキストからePubを再生成する"
                          "（PDFは表紙・画像ページの取得にのみ使用。--epub 不要）")
@@ -4950,6 +4986,7 @@ def main():
                    episodes, cover_bg=args.cover_bg,
                    cover_image_path=args.cover_image or "",
                    cover_image_data=cover_bytes,
+                   publisher=args.publisher, isbn=args.isbn, pub_date=args.date,
                    images=images_data or None,
                    horizontal=args.horizontal)
         print(f"✅ ePub出力完了: {epub_path}")
