@@ -33,10 +33,39 @@ Pillowなしでも動作（自動生成表紙のみSVGフォールバック）�
 奥付の入力元表記・空URL行抑止、`build_epub` に `cover_image_data` 引数追加、
 フォント検出の遅延実行化。本家と機能同期する場合は同名関数を差し替える。
 書誌メタ（yomikake v2.10.0 連携）: `build_epub`/`_make_opf` は `publisher`（→`dc:publisher`）・
-`isbn`（→`dc:source urn:isbn`・ハイフン除去）・`pub_date`（→`dc:date`）を任意で受け取り、
+`isbn`（→`dc:source urn:isbn`）・`pub_date`（→`dc:date`）を任意で受け取り、
 CLI `--publisher`/`--isbn`/`--date` から渡す。`parse_meta_from_filename` は著者名末尾の
 OCR 方式タグ（`_vision`/`_docai`/`_ocr`・`_strip_method_tag`）を除去し、`dc:creator`・
 bookKey（yomikake のしおりキー）が汚れないようにする。
+
+ISBN（設計書 `DESIGN_ISBN.md` フェーズ1・実装済み）: `normalize_isbn` が `--isbn` と
+自動検出の共通ゲートで、`ISBN`接頭辞・全角ハイフンを落としチェックディジット検証の上
+**必ず13桁のISBN-13**にする（yomikakeのNDLサーチは数字13桁のみ受け付ける）。
+`--isbn` 省略時は `detect_isbn_from_doc` が末尾25ページ（無ければ先頭5ページ）の
+テキスト層から検出（`resolve_isbn` が CLI 側の窓口、`--no-isbn-detect` で無効化）。
+**縦組みOCRは1文字ずつ改行して返すため、判定前に空白を全除去する**
+（`_compact_page_text`。区切りを `[-‐‑－\s]*` にしてもこれ無しでは当たらない）。
+検出はEAN-13優先＋「ISBN」キーワード窓のISBN-10の2パス（バーコードの13桁が
+後続ノイズ数字で境界に弾かれる本があるので**両方必要**）。実測26ファイルで20件検出・
+誤検出0（未検出は1981年以前でISBNが無い本とOCR全滅の本）。
+書誌補完（フェーズ2・実装済み）: `resolve_bib_meta` が「CLI明示 > NDL > 奥付OCR」で
+書誌を解決し、`build_bib_meta` が OPF の metadata 断片を作って
+`_make_opf(bib=…)`／`build_epub(bib=…)` に渡す。**`bib=None` なら出力は従来と1バイト一致**
+（novel_downloader.py 移植部との互換を保つための設計。回帰テストもこれで行う）。
+- `detect_pubdate_from_doc`: 奥付の刊行日。和暦3文字（平成二十二年）・漢数字西暦（二○一七年、
+  ○はU+25CB）・キーワードは `発行|発売|刷|初版`。**日は「直後が日」か「1〜2字の雑音＋刊行語」の
+  ときだけ採用**（`12月2()日` の 2 を日と誤読しない）。実在しない日はカレンダー検査で年月へ縮退。
+  複数刷の奥付は `初版|第1刷` 近傍を優先し、無ければ最古。直後が「印刷」の候補は捨てる
+- `fetch_ndl_by_isbn`: NDL OpenSearch。**読みの人物対応は責任表示の自然形でなく
+  `dc:creator` 正規形の英字有無で判定する**（自然形は原著者も片仮名なので、訳者の読みが
+  原著者に付く。同じ不具合が mangaP2ePub 側に残っている）
+- **`dc:creator` を増やしてはならない**（yomikake の bookKey が title＋全creator 由来）。
+  訳者・画家は `dc:contributor`。NDL の役割だけは creator に反映する（表示名は不変なので安全）
+- `_ndl_plausible`: 書名類似(difflib 0.5)も著者一致もしなければ NDL を丸ごと捨てる（--isbn 誤り対策）
+- 刊行日は NDL の年月＋奥付の日を合成（同じ年月のときだけ）。食い違えば NDL 優先
+  （奥付OCRは後刷を拾うことがある。図南の翼で実測）
+- アクセシビリティは `_access_meta(has_images, has_ruby)` で出し分け（textual 主体、
+  画像ページありで visual 追加、ルビ出力時のみ rubyAnnotations）
 
 ## jisui_gui.py（Windows向けGUIランチャー）
 

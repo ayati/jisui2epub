@@ -23,6 +23,7 @@ ScanSnap 等でスキャン+OCR した縦書き小説PDFから本文テキスト
 
 import argparse
 import bisect
+import calendar
 import difflib
 import os
 import re
@@ -41,6 +42,8 @@ try:
 except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
+
+__version__ = "1.4.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -2543,15 +2546,18 @@ _METHOD_TAGS = ("vision", "docai", "ocr")
 
 
 def _strip_method_tag(name: str) -> str:
-    """著者名末尾の OCR 方式タグ（例 「_vision」「-docai」）を除去する。
-    既知タグのみを対象とし、未知の末尾は著者名の一部として残す（安全側）。"""
+    """著者名末尾の OCR 方式タグ（例 「_vision」「-docai」）とスキャン日を除去する。
+    既知タグのみを対象とし、未知の末尾は著者名の一部として残す（安全側）。
+    スキャン日は「堀内永人20241221」のような6桁以上の連続数字（人名には出ない）。"""
     low = name.lower()
     for sep in ("_", "-"):
         for tag in _METHOD_TAGS:
             suf = sep + tag
             if low.endswith(suf):
-                return name[:-len(suf)].strip()
-    return name
+                name = name[:-len(suf)].strip()
+                low = name.lower()
+                break
+    return re.sub(r"[\s_-]*\d{6,}$", "", name).strip() or name
 
 
 def parse_meta_from_filename(path):
@@ -2568,6 +2574,466 @@ def parse_meta_from_filename(path):
             if title and author:
                 return title, author
     return stem.strip(), ""
+
+
+# ══════════════════════════════════════════
+#  ISBN の正規化と自動検出（設計書 DESIGN_ISBN.md フェーズ1）
+# ══════════════════════════════════════════
+#
+# dc:source urn:isbn は yomikake が国立国会図書館サーチのリンクに使う。NDL は
+# 数字13桁しか受け付けないため、"ISBN" 接頭辞・全角ハイフンが残っていると
+# リンクが不発になる。normalize_isbn() を --isbn 明示指定と自動検出の共通ゲート
+# にして、常に裸の ISBN-13 を出す。
+#
+# 自動検出は末尾ページ（奥付・裏表紙バーコード）の OCR テキスト層を読む。
+# 縦組みの ScanSnap OCR は1文字ずつ改行して返すため、ページテキストは NFKC 後に
+# 空白を全除去（_compact_page_text）してから正規表現を当てる（DESIGN_ISBN.md §2.1）。
+
+# 数字間に許す区切り。compact 済みでもバーコード行の中黒等を吸収するため0個以上。
+_ISBN_SEP = r'[-‐‑－\s]*'
+# 裸の EAN-13（978/979 始まり）。前後の数字境界で、コミック裏表紙の価格コード
+# 192… や、バーコードOCRが吐く連番ノイズへの部分一致を防ぐ。
+_EAN13_RE = re.compile(r'(?<!\d)97[89](?:' + _ISBN_SEP + r'\d){10}(?!\d)')
+# ISBN-10 形のトークン（末尾のみ X 可）。「ISBN」キーワード直後の窓だけに当てる。
+_ISBN10_RE = re.compile(r'(?:\d' + _ISBN_SEP + r'){9}[\dXx]')
+_ISBN_KW_RE = re.compile(r'ISBN', re.I)
+
+
+def _isbn13_check_ok(s: str) -> bool:
+    if len(s) != 13 or not s.isdigit():
+        return False
+    total = sum((1 if i % 2 == 0 else 3) * int(d) for i, d in enumerate(s))
+    return total % 10 == 0
+
+
+def _isbn10_check_ok(s: str) -> bool:
+    if len(s) != 10:
+        return False
+    total = 0
+    for i, c in enumerate(s):
+        v = 10 if c == "X" else (int(c) if c.isdigit() else -1)
+        if v < 0:
+            return False
+        total += (10 - i) * v
+    return total % 11 == 0
+
+
+def _isbn10_to_13(s10: str) -> str:
+    core = "978" + s10[:9]
+    check = (10 - sum((1 if i % 2 == 0 else 3) * int(d)
+                      for i, d in enumerate(core)) % 10) % 10
+    return core + str(check)
+
+
+def normalize_isbn(raw):
+    """ISBN 文字列を裸の ISBN-13（13桁）へ正規化する。不正なら None。
+
+    "ISBN" 接頭辞・半角/全角ハイフン・空白・コロンを落とし（NFKC）、
+    チェックディジットを検証して、有効な ISBN-10 は ISBN-13 へ変換する。
+    13桁は 978/979 始まりのみ許可（価格コード 192… 等を弾く）。
+    すでに整形済みの ISBN-13 や "urn:isbn:978…" を渡しても同じ値を返す（冪等）。
+    """
+    if not raw:
+        return None
+    s = unicodedata.normalize("NFKC", raw)
+    s = re.sub(r"^\s*ISBN\s*[:：]?\s*", "", s, flags=re.I)
+    s = re.sub(r"[^0-9Xx]", "", s).upper()
+    if _isbn13_check_ok(s) and s[:3] in ("978", "979"):
+        return s
+    if _isbn10_check_ok(s):
+        return _isbn10_to_13(s)
+    return None
+
+
+def _compact_page_text(page) -> str:
+    """ページのテキスト層を NFKC 正規化し、空白を全除去して返す。
+
+    縦組みの OCR テキスト層は1文字ずつ改行されて出てくるため、空白を残したままだと
+    "ISBN978-4-…" が改行とハイフンの2連続で分断されて正規表現に当たらない。
+    """
+    try:
+        raw = page.get_text() or ""
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", raw))
+
+
+def _find_isbn_in_texts(texts, order):
+    """{ページindex: compact済みテキスト} から ISBN を2パスで探す。
+
+    パス1は裸の EAN-13（キーワード不要・確実に13桁を切り出せる）、
+    パス2は「ISBN」キーワード直後25文字の窓に限った ISBN-10（旧奥付）。
+    バーコードの13桁が後続の連番ノイズで境界に弾かれる本（講談社学術文庫）は
+    パス2が拾うため、両方必要（DESIGN_ISBN.md §2.3-F）。
+    """
+    for pi in order:
+        for m in _EAN13_RE.finditer(texts[pi]):
+            got = normalize_isbn(m.group(0))
+            if got:
+                return got, pi, "EAN-13"
+    for pi in order:
+        txt = texts[pi]
+        for kw in _ISBN_KW_RE.finditer(txt):
+            m = _ISBN10_RE.search(txt[kw.end():kw.end() + 25])
+            if not m:
+                continue
+            got = normalize_isbn(m.group(0))
+            if got:
+                return got, pi, "ISBN-10"
+    return None, None, None
+
+
+def detect_isbn_from_doc(doc, max_pages=25, head_pages=5):
+    """奥付・裏表紙の OCR テキストから底本の ISBN-13 を推定する（best-effort）。
+
+    末尾 max_pages ページを最終ページ側から走査し、見つからなければ先頭
+    head_pages ページ（標題紙裏）も見る。候補は必ず normalize_isbn() を通すので、
+    価格コードや OCR ノイズは弾かれる。見つからなければ None
+    （1981年以前の刊行物には ISBN 自体が無い）。
+    """
+    try:
+        npages = doc.page_count
+    except Exception:
+        return None
+    if npages <= 0:
+        return None
+
+    lo = max(0, npages - max_pages)
+    tail = {pi: _compact_page_text(doc[pi]) for pi in range(lo, npages)}
+    got, pi, kind = _find_isbn_in_texts(tail, range(npages - 1, lo - 1, -1))
+    if not got and lo > 0:
+        hi = min(head_pages, lo)
+        head = {pi: _compact_page_text(doc[pi]) for pi in range(hi)}
+        got, pi, kind = _find_isbn_in_texts(head, range(hi))
+    if got:
+        print(f"🔖 ISBN自動検出: {got}（p{pi + 1}, {kind}）")
+        return got
+    print(f"🔖 ISBN未検出（末尾{min(max_pages, npages)}ページ）")
+    return None
+
+
+def resolve_isbn(args, doc):
+    """--isbn（正規化）→ 自動検出 の順に底本 ISBN を決める。無ければ ""。"""
+    if args.isbn:
+        got = normalize_isbn(args.isbn)
+        if got:
+            return got
+        print(f"⚠ --isbn の値が ISBN として不正です: {args.isbn!r}"
+              f"（自動検出にフォールバックします）", file=sys.stderr)
+    if getattr(args, "no_isbn_detect", False):
+        return ""
+    return detect_isbn_from_doc(doc) or ""
+
+
+# ══════════════════════════════════════════
+#  奥付からの発行日検出（設計書 DESIGN_ISBN.md フェーズ2 §4.1）
+# ══════════════════════════════════════════
+#
+# dc:date は「底本＝紙の本の刊行日」。スキャン日・変換日は使わない（ePub化日時は
+# dcterms:modified にある）。縦組みの奥付は西暦も和暦も漢数字で書かれ、OCR は
+# 「年」「月」「日」そのものを化けさせるので、壊れたときは YYYY-MM / YYYY へ縮退し、
+# **誤った日付は出さない**ことを最優先にする。
+
+_KANJI_DIGIT = {"〇": 0, "○": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
+                "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "元": 1}
+_ERA_BASE = {"大正": 1911, "昭和": 1925, "平成": 1988, "令和": 2018}
+_PD_NUM = r"[0-9〇○零一二三四五六七八九十元]"
+_PUBDATE_RE = re.compile(
+    r"(?:(大正|昭和|平成|令和)\s*(" + _PD_NUM + r"{1,3})"    # 和暦（平成二十二＝3文字）
+    r"|((?:19|20)\d{2})"                                    # 西暦（算用数字）
+    r"|([〇○零一二三四五六七八九]{4}))\s*年"                  # 西暦（漢数字。○は U+25CB）
+    r"\s*(" + _PD_NUM + r"{1,3})?\s*月"
+    # 「日」は直後が日か、1〜2文字の雑音を挟んで刊行語が続くときだけ採る。
+    # 「12月2()日初版」の 2 を日と誤読しないための条件（設計書 §2.1-5）
+    r"(?:\s*(" + _PD_NUM + r"{1,3})\s*(?:日|.{0,2}(?:発行|発売|刷|初版)))?")
+_PUBDATE_FIRST_RE = re.compile(r"初版|新装版第1刷|新装版第一刷|第\s*1\s*刷|第\s*一\s*刷")
+_PUBDATE_KW_RE = re.compile(r"発行|発売|刷|初版|印刷")   # 奥付ページかどうかの判定
+_PUBDATE_NEAR_RE = re.compile(r"発行|発売|刷|初版")      # 日付候補の近傍に必要な語
+
+
+def _kanji_num(s):
+    """漢数字・算用数字の小さな数（0〜99）を int にする。読めなければ None。"""
+    if not s:
+        return None
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    if "十" in s:
+        a, _, b = s.partition("十")
+        tens = (_KANJI_DIGIT.get(a, 1) if a else 1)
+        ones = (_KANJI_DIGIT.get(b, 0) if b else 0)
+        return tens * 10 + ones
+    v = 0
+    for c in s:
+        if c not in _KANJI_DIGIT:
+            return None
+        v = v * 10 + _KANJI_DIGIT[c]
+    return v
+
+
+def _pubdate_to_iso(m):
+    """_PUBDATE_RE のマッチを ISO 日付にする。月日が壊れていれば年月・年へ縮退。"""
+    era, era_y, ad_y, kanji_y, mo, da = m.groups()
+    if era:
+        year = _ERA_BASE[era] + (_kanji_num(era_y) or 0)
+    elif ad_y:
+        year = int(ad_y)
+    else:
+        year = _kanji_num(kanji_y)
+    if year is None or not (1945 <= year <= 2035):
+        return None
+    mm, dd = _kanji_num(mo), _kanji_num(da)
+    if mm and 1 <= mm <= 12:
+        # 実在しない日（OCR誤読の 2012-02-30 等）は捨てて年月へ縮退する
+        if dd and 1 <= dd <= calendar.monthrange(year, mm)[1]:
+            return f"{year:04d}-{mm:02d}-{dd:02d}"
+        return f"{year:04d}-{mm:02d}"
+    return f"{year:04d}"
+
+
+def detect_pubdate_from_doc(doc, max_pages=20):
+    """奥付から底本の刊行日（ISO）を推定する（best-effort）。見つからなければ None。
+
+    末尾から刊行語を含むページを探し、日付候補のうち「初版・第1刷」に近いもの、
+    無ければ最も古いものを採る（何刷も重ねた本で最新刷の日付を拾わないため）。
+    直後が「印刷」の候補は発行日ではないので捨てる。
+    """
+    try:
+        npages = doc.page_count
+    except Exception:
+        return None
+    for pi in range(npages - 1, max(-1, npages - 1 - max_pages), -1):
+        txt = _compact_page_text(doc[pi])
+        if not txt or not _PUBDATE_KW_RE.search(txt):
+            continue
+        cands = []
+        for m in _PUBDATE_RE.finditer(txt):
+            if txt[m.end():].startswith("印刷"):
+                continue        # 「…二月二十日印刷」＝発行日ではない（早川書房の奥付）
+            ctx = txt[max(0, m.start() - 10):m.end() + 12]
+            if not _PUBDATE_NEAR_RE.search(ctx):
+                continue
+            iso = _pubdate_to_iso(m)
+            if iso:
+                cands.append((iso, bool(_PUBDATE_FIRST_RE.search(ctx))))
+        if cands:
+            firsts = [c for c in cands if c[1]]
+            iso = sorted(firsts or cands)[0][0]
+            print(f"📅 発行日自動検出: {iso}（p{pi + 1}, 奥付）")
+            return iso
+    print("📅 発行日未検出（奥付）")
+    return None
+
+
+# ══════════════════════════════════════════
+#  NDL（国立国会図書館サーチ）書誌照会（DESIGN_ISBN.md フェーズ2 §4.2）
+# ══════════════════════════════════════════
+#
+# ISBN を鍵に、OCR やファイル名では得られない書誌（読み仮名・責任表示の役割・
+# 版元・刊行年月・シリーズ・NDC）を引く。ネットワーク不通・未ヒット・解析失敗は
+# すべて None を返し、呼び出し側はファイル名／OCR にフォールバックする。
+# 依存は標準ライブラリのみ（urllib + ElementTree、いずれも関数内 import）。
+
+_NDL_ENDPOINT = "https://ndlsearch.ndl.go.jp/api/opensearch"
+_NDL_NS = {"dc": "http://purl.org/dc/elements/1.1/",
+           "dcndl": "http://ndl.go.jp/dcndl/terms/",
+           "dcterms": "http://purl.org/dc/terms/"}
+# 責任表示の役割語 → MARC relators コード
+_NDL_ROLE_BY_JP = {
+    "著": "aut", "作": "aut", "文": "aut", "原作": "aut", "原著": "aut",
+    "編": "edt", "編集": "edt", "編著": "edt", "監修": "edt", "校注": "edt",
+    "訳": "trl", "翻訳": "trl", "訳注": "trl", "編訳": "trl",
+    "画": "art", "作画": "art", "漫画": "art",
+    "絵": "ill", "イラスト": "ill", "挿絵": "ill", "写真": "pht",
+}
+# 巻表示ではなく版表示が dcndl:volume に入る本があるので、これらは巻として使わない
+_NDL_EDITION_RE = re.compile(r"新装版|改訂|増補|新版|普及版|愛蔵版|文庫版|完全版")
+
+
+def _ndl_kana_title(s):
+    """書名の読み（カンマ区切り）を空白区切りに均す。"""
+    if not s:
+        return None
+    return re.sub(r"\s+", " ", s.replace(",", " ")).strip() or None
+
+
+def _ndl_kana_name(s):
+    """人名の読み「カシワバ, サチコ, 1953-」→「カシワバ サチコ」。
+
+    NDL は読みの後ろに職業や生年を足すことがあるので、数字を含まない先頭2区画
+    だけを file-as に使う。
+    """
+    if not s:
+        return None
+    segs = [seg.strip() for seg in s.split(",")]
+    segs = [seg for seg in segs if seg and not re.search(r"\d", seg)]
+    if not segs:
+        return None
+    return re.sub(r"\s+", " ", " ".join(segs[:2])).strip() or None
+
+
+def _ndl_name_key(s):
+    """人名の照合キー（NFKC・空白/読点/生年を除去）。全角英字のファイル名対策込み。"""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r",?\s*\d{4}\s*-\s*(?:\d{4})?\s*$", "", s.strip())   # 末尾の生没年
+    return re.sub(r"[\s,、・.]", "", s)
+
+
+def _ndl_parse_responsibility(text):
+    """責任表示「柏葉幸子 作 ; 杉田比呂美 絵」→ [(名前, role), …]。
+
+    NDL は区切りに , 、 ; を混在させ、`[著]` `[ほか]訳` のような角括弧も付ける
+    （設計書 §2.3 修正2）。角括弧を落としてから末尾の役割語を切り出す。
+    """
+    out = []
+    text = re.sub(r"\[[^\]]*\]", "", text or "")
+    for part in re.split(r"[,、;；]", text):
+        part = part.strip()
+        if not part:
+            continue
+        role = "aut"
+        for w in (part[-2:], part[-1:]):
+            if w in _NDL_ROLE_BY_JP:
+                role = _NDL_ROLE_BY_JP[w]
+                part = part[:len(part) - len(w)].strip("　 ・")
+                break
+        if part:
+            out.append((part, role))
+    return out
+
+
+def _ndl_same_person(key_a, key_b):
+    """人名キーが同一人物とみなせるか（一方が他方を含めば可）。
+
+    ファイル名の著者は「ゲイル・キャリガー_START」のように余計な語が付くことが
+    あるので、完全一致だけだと同じ人を別人として二重に出してしまう。
+    """
+    return bool(key_a) and bool(key_b) and (key_a in key_b or key_b in key_a)
+
+
+def _fit_title_kana(title, ndl_title, kana):
+    """NDL の書名読みを、こちらの dc:title の範囲に合わせて切り詰める。
+
+    NDL の書名は副題を " : " で連結する（諸国そばの本 : そばの里とうまい店250）。
+    ファイル名由来の dc:title に副題が無いなら、読みも主題までにする。
+    """
+    if not kana or not ndl_title or " : " not in ndl_title:
+        return kana
+    sub = ndl_title.split(" : ", 1)[1].strip()
+    if sub[:4] and sub[:4] in title:
+        return kana                      # こちらの題も副題を含んでいる
+    return kana.split(" : ", 1)[0].strip() if " : " in kana else kana
+
+
+def _ndl_volume(s):
+    """dcndl:volume を巻表示として整える。版表示（": 新装版"）は None を返す。"""
+    if not s:
+        return None
+    v = s.strip().lstrip(":").strip()
+    if not v or _NDL_EDITION_RE.search(v):
+        return None
+    return v
+
+
+def _ndl_issued_to_iso(s):
+    """dcterms:issued「2013.10.1(平25)」「2015.12」「1999」→ ISO 日付。"""
+    if not s:
+        return None
+    m = re.match(r"\s*(\d{4})(?:[.\-/](\d{1,2})(?:[.\-/](\d{1,2}))?)?", s)
+    if not m:
+        return None
+    y, mo, da = m.group(1), m.group(2), m.group(3)
+    if mo and da:
+        return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
+    if mo:
+        return f"{int(y):04d}-{int(mo):02d}"
+    return y
+
+
+def fetch_ndl_by_isbn(isbn, timeout=8.0):
+    """NDL OpenSearch から書誌を引く。未ヒット・失敗時は None（警告のみ）。
+
+    返り値: {title, title_kana, creators[{name, role, kana, norm}], publisher,
+             date, series, volume, ndc}
+    """
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    try:
+        req = urllib.request.Request(
+            f"{_NDL_ENDPOINT}?isbn={isbn}",
+            headers={"User-Agent":
+                     f"jisui2epub/{__version__} (+bibliographic lookup)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        root = ET.fromstring(raw)
+    except Exception as e:
+        print(f"⚠ NDL照会をスキップしました（{type(e).__name__}）", file=sys.stderr)
+        return None
+
+    item = root.find("./channel/item")
+    if item is None:
+        print(f"📚 NDL: ISBN {isbn} の書誌は見つかりませんでした")
+        return None
+
+    def _t(path):
+        node = item.find(path, _NDL_NS)
+        return node.text.strip() if node is not None and node.text else None
+
+    norm_names = [e.text.strip() for e in item.findall("dc:creator", _NDL_NS)
+                  if e.text]
+    # 読みは日本語名の人にしか付かない（"Carriger, Gail" には無い）ので、
+    # キューから順に日本語名の人へ配る
+    kana_queue = [k for k in (_ndl_kana_name(e.text) for e
+                              in item.findall("dcndl:creatorTranscription", _NDL_NS)
+                              if e.text) if k]
+
+    desc = _t("description") or ""
+    mresp = re.search(r"責任表示：(.*?)(?:</li>|</ul>|$)", desc)
+    resp = _ndl_parse_responsibility(mresp.group(1)) if mresp else []
+
+    creators = []
+    for i in range(max(len(resp), len(norm_names))):
+        if i < len(resp):
+            name, role = resp[i]
+        else:
+            name, role = _ndl_kana_title(norm_names[i]), "aut"
+        if not name:
+            continue
+        # 読みの有無は正規形（dc:creator）で判定する。責任表示の自然形は
+        # 原著者も片仮名（ゲイル・キャリガー）なので、それで判定すると
+        # 訳者の読みを原著者に付けてしまう
+        basis = norm_names[i] if i < len(norm_names) else name
+        kana = None
+        if not re.search(r"[A-Za-z]", basis) and kana_queue:
+            kana = kana_queue.pop(0)
+        creators.append({"name": name, "role": role, "kana": kana,
+                         "norm": norm_names[i] if i < len(norm_names) else name})
+
+    ndc = None
+    for sub in item.findall("dc:subject", _NDL_NS):
+        typ = sub.get("{http://www.w3.org/2001/XMLSchema-instance}type") or ""
+        if "NDC" in typ and sub.text:
+            ndc = sub.text.strip()
+            break
+
+    rec = {
+        "title": _t("dc:title"),
+        "title_kana": _ndl_kana_title(_t("dcndl:titleTranscription")),
+        "creators": creators,
+        "publisher": _t("dc:publisher"),
+        "date": _ndl_issued_to_iso(_t("dcterms:issued") or _t("dc:date")),
+        "series": _t("dcndl:seriesTitle"),
+        "volume": _ndl_volume(_t("dcndl:volume")),
+        "ndc": ndc,
+    }
+    who = " / ".join(f"{c['name']}（{c['role']}）" for c in creators) or "?"
+    print(f"📚 NDL書誌: 「{rec['title']}」{who} / {rec['publisher']} / {rec['date']}")
+    return rec
 
 
 def inspect_page(doc, num, body_size, horizontal=False):
@@ -3597,19 +4063,43 @@ def _split_episode_images(body: str) -> list:
     return segs
 
 
+def _pubdate_ja(iso: str) -> str:
+    """ISO 日付を奥付表記（2004年12月15日 / 2015年12月 / 1976年）にする。"""
+    m = re.match(r"^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$", iso or "")
+    if not m:
+        return ""
+    y, mo, da = m.group(1), m.group(2), m.group(3)
+    s = f"{int(y)}年"
+    if mo:
+        s += f"{int(mo)}月"
+    if da:
+        s += f"{int(da)}日"
+    return s
+
+
 def _make_colophon_xhtml(title: str, source_url: str, site_name: str,
-                         horizontal: bool = False) -> str:
-    """奥付XHTMLを生成する。底本URLはハイパーリンクとして出力する。"""
+                         horizontal: bool = False,
+                         publisher: str = "", pub_date: str = "",
+                         isbn: str = "") -> str:
+    """奥付XHTMLを生成する。底本URLはハイパーリンクとして出力する。
+    publisher / pub_date / isbn が分かっていれば底本の書誌として書き添える。"""
     today = date.today().strftime("%Y年%m月%d日")
     url_line = (
         f'<p class="body-line">　　　'
         f'<a href="{_esc(source_url)}">{_esc(source_url)}</a></p>\n'
         if source_url else ""
     )
+    # 判明した書誌（発行日・ISBN）は青空文庫の奥付にならって底本の下へ添える
+    date_ja = _pubdate_ja(pub_date)
+    if date_ja:
+        url_line += f'<p class="body-line">　　　{_esc(date_ja)}発行</p>\n'
+    if isbn:
+        url_line += f'<p class="body-line">　　　ISBN {_esc(isbn)}</p>\n'
     # xmlns:epub を body に付与するため XHTML_TMPL を直接使わず個別生成
     body = (
         f'<div class="colophon">\n'
-        f'<p class="body-line">底本：「{_esc(title)}」{_esc(site_name)}</p>\n'
+        f'<p class="body-line">底本：「{_esc(title)}」'
+        f'{_esc(publisher or site_name)}</p>\n'
         f'{url_line}'
         f'<p class="body-line">入力：jisui2epub.py</p>\n'
         f'<p class="body-line">校正：未校正</p>\n'
@@ -3758,6 +4248,245 @@ def _make_nav_xhtml(title: str, episodes: list, cover_fmt: str = "",
 """
 
 
+# ══════════════════════════════════════════
+#  OPF 書誌メタの組み立て（DESIGN_ISBN.md フェーズ2 §4.3-§4.6）
+# ══════════════════════════════════════════
+#
+# ★ dc:creator を増やしてはならない: yomikake のしおりキーは
+#   makeBookKey(title, 全 dc:creator を '・' で連結) なので、訳者や画家を
+#   dc:creator に足すと既存のしおりが割れる。追加役割者は dc:contributor に出す。
+
+
+def _access_meta(has_images: bool, has_ruby: bool) -> str:
+    """アクセシビリティ metadata（schema.org / EPUB Accessibility 1.1）。
+
+    リフロー型のテキスト本なので accessMode は textual が主。挿絵・画像ページを
+    含む本だけ visual を足す（画像に代替テキストは無いので alternativeText は
+    主張しない）。accessModeSufficient は textual＝挿絵が読めなくても本文は完結する。
+    """
+    lines = ['<meta property="schema:accessMode">textual</meta>']
+    if has_images:
+        lines.append('<meta property="schema:accessMode">visual</meta>')
+    lines.append('<meta property="schema:accessModeSufficient">textual</meta>')
+    for feat in ("displayTransformability", "readingOrder",
+                 "structuralNavigation", "tableOfContents"):
+        lines.append(f'<meta property="schema:accessibilityFeature">{feat}</meta>')
+    if has_ruby:
+        lines.append('<meta property="schema:accessibilityFeature">'
+                     'rubyAnnotations</meta>')
+    lines.append('<meta property="schema:accessibilityHazard">none</meta>')
+    summary = ("リフロー型のテキスト。文字サイズ・行間・書体は読書システム側で"
+               "変更できる。"
+               + ("自炊PDFから取り出した挿絵ページを含む（代替テキストなし）。"
+                  if has_images else "")
+               + ("本文にはルビ（ruby要素）が付く。" if has_ruby else ""))
+    lines.append('<meta property="schema:accessibilitySummary">'
+                 f'{_esc(summary)}</meta>')
+    return "\n    " + "\n    ".join(lines)
+
+
+def build_bib_meta(title, title_kana, creators, contributors,
+                   publisher, publisher_kana, pub_date, isbn, description,
+                   series, volume, ndc, has_images, has_ruby) -> dict:
+    """OPF <metadata> の書誌部分を組み立てて断片の dict を返す。
+
+    creators/contributors は [{name, role, kana}, …]（role は marc:relators）。
+    読み（file-as）は分かっているものだけ refines で付ける。
+    """
+    lines = [f'<dc:title id="title">{_esc(title)}</dc:title>']
+    if title_kana:
+        lines.append('<meta refines="#title" property="file-as">'
+                     f'{_esc(title_kana)}</meta>')
+    title_meta = "\n    ".join(lines)
+
+    lines = []
+    for i, c in enumerate(creators or [{"name": "", "role": "aut", "kana": None}], 1):
+        cid = f"creator{i:02d}"
+        lines.append(f'<dc:creator id="{cid}">{_esc(c["name"])}</dc:creator>')
+        lines.append(f'<meta refines="#{cid}" property="role" '
+                     f'scheme="marc:relators">{c.get("role") or "aut"}</meta>')
+        lines.append(f'<meta refines="#{cid}" property="display-seq">{i}</meta>')
+        if c.get("kana"):
+            lines.append(f'<meta refines="#{cid}" property="file-as">'
+                         f'{_esc(c["kana"])}</meta>')
+    for i, c in enumerate(contributors or [], 1):
+        cid = f"contrib{i:02d}"
+        lines.append(f'<dc:contributor id="{cid}">{_esc(c["name"])}</dc:contributor>')
+        lines.append(f'<meta refines="#{cid}" property="role" '
+                     f'scheme="marc:relators">{c.get("role") or "aut"}</meta>')
+        if c.get("kana"):
+            lines.append(f'<meta refines="#{cid}" property="file-as">'
+                         f'{_esc(c["kana"])}</meta>')
+    creators_meta = "\n    ".join(lines)
+
+    publisher_meta = ""
+    if publisher:
+        publisher_meta = (f'\n    <dc:publisher id="publisher">'
+                          f'{_esc(publisher)}</dc:publisher>')
+        if publisher_kana:
+            publisher_meta += ('\n    <meta refines="#publisher" property="file-as">'
+                               f'{_esc(publisher_kana)}</meta>')
+
+    # dc:date は底本の刊行日のみ。不明なら出さない（生成日は dcterms:modified）
+    date_meta = f'\n    <dc:date>{_esc(pub_date)}</dc:date>' if pub_date else ""
+    _isbn = normalize_isbn(isbn)
+    source_meta = (f'\n    <dc:source>urn:isbn:{_isbn}</dc:source>' if _isbn else "")
+    description_meta = (f'\n    <dc:description>{_esc(description)}</dc:description>'
+                        if description else "")
+    subject_meta = (f'\n    <dc:subject>NDC {_esc(ndc)}</dc:subject>' if ndc else "")
+    series_meta = ""
+    if series:
+        series_meta = ('\n    <meta property="dcndl:seriesTitle">'
+                       f'{_esc(series)}</meta>')
+        if volume:
+            series_meta += ('\n    <meta property="dcndl:volume">'
+                            f'{_esc(volume)}</meta>')
+
+    return {"title_meta": title_meta, "creators_meta": creators_meta,
+            "publisher_meta": publisher_meta, "date_meta": date_meta,
+            "source_meta": source_meta, "description_meta": description_meta,
+            "subject_meta": subject_meta, "series_meta": series_meta,
+            "access_meta": _access_meta(has_images, has_ruby)}
+
+
+def _resolve_creators(author, author_kana, author_is_cli, creator_source, ndl):
+    """dc:creator と dc:contributor を決める。
+
+    既定（creator_source="filename"）では表示名は --author／ファイル名のままにし、
+    NDL は「読みの補完」と「追加役割者（訳者・画家など）の contributor 化」に
+    だけ使う。yomikake のしおりキーが dc:creator 由来なので、既存の本を再変換した
+    ときにキーが変わらないことを優先する。
+    """
+    ndl_creators = list(ndl["creators"]) if ndl else []
+    creators = []
+    if author:
+        creators.append({"name": author, "role": "aut", "kana": author_kana})
+
+    if creator_source == "ndl" and ndl_creators and not author_is_cli:
+        auts = [c for c in ndl_creators if c["role"] == "aut"] or ndl_creators[:1]
+        creators = [{"name": c["name"], "role": "aut",
+                     "kana": author_kana or c["kana"]} for c in auts]
+        print("⚠ --creator-source ndl: dc:creator を NDL 表記にしました"
+              "（yomikake のしおりキーが従来と変わります）", file=sys.stderr)
+    elif not creators and ndl_creators:
+        # ファイル名から著者が取れない本（「諸国そばの本.pdf」等）は NDL で埋める
+        first = ndl_creators[0]
+        creators = [{"name": first["name"], "role": first["role"],
+                     "kana": author_kana or first["kana"]}]
+        print(f"📚 著者名をNDL書誌から補完: {first['name']}")
+
+    contributors = []
+    if ndl_creators:
+        own_keys = [_ndl_name_key(c["name"]) for c in creators if c["name"]]
+        matched = set()
+        for c in creators:
+            key = _ndl_name_key(c["name"])
+            hit = next((x for x in ndl_creators
+                        if _ndl_same_person(key, _ndl_name_key(x["name"]))
+                        or _ndl_same_person(key, _ndl_name_key(x.get("norm") or ""))),
+                       None)
+            if hit:
+                matched.add(id(hit))
+                if not c["kana"]:
+                    c["kana"] = hit["kana"]
+                # 役割は NDL の責任表示に合わせる（編者・訳者を aut と偽らない）。
+                # 表示名は変えないのでしおりキーには影響しない
+                c["role"] = hit.get("role") or c["role"]
+            elif c["name"]:
+                names = " / ".join(x["name"] for x in ndl_creators)
+                print(f'⚠ 著者名がNDL書誌と一致しません: 「{c["name"]}」/ NDL「{names}」'
+                      f'（表示名はファイル名・--author を優先）', file=sys.stderr)
+        for c in ndl_creators:
+            if id(c) in matched:
+                continue
+            # 同姓同名でなくとも著者本人の別表記でありうるので、著者役は足さない
+            # （dc:creator を増やせない以上、二重に人が出る方が害が大きい）
+            if c["role"] == "aut" and any(
+                    _ndl_same_person(_ndl_name_key(c["name"]), k) for k in own_keys):
+                continue
+            contributors.append({"name": c["name"], "role": c["role"],
+                                 "kana": c["kana"]})
+    if not creators:
+        creators = [{"name": author or "", "role": "aut", "kana": author_kana}]
+    return creators, contributors
+
+
+def _ndl_plausible(title, author, ndl) -> bool:
+    """引いてきた NDL 書誌がこの本のものか（--isbn の打ち間違い対策）。
+
+    書名が似ているか、著者名のどれかが一致すれば採用する。どちらも外れる場合は
+    別の本の書誌なので使わない（読み・版元・刊行日まで丸ごと汚染されるため）。
+    """
+    def _norm(s):
+        return re.sub(r"[\s　:：・.,、。「」『』（）()\-—―…]", "",
+                      unicodedata.normalize("NFKC", s or ""))
+
+    ndl_title = _norm((ndl.get("title") or "").split(" : ")[0])
+    if ndl_title and _norm(title):
+        if difflib.SequenceMatcher(None, _norm(title), ndl_title).ratio() >= 0.5:
+            return True
+    akey = _ndl_name_key(author)
+    for c in ndl["creators"]:
+        if _ndl_same_person(akey, _ndl_name_key(c["name"])) \
+                or _ndl_same_person(akey, _ndl_name_key(c.get("norm") or "")):
+            return True
+    return False
+
+
+def resolve_bib_meta(args, doc, title, author, description="",
+                     has_images=False, has_ruby=False) -> dict:
+    """ePub に載せる書誌を解決する（CLI 明示 > NDL > OCR/ファイル名）。
+
+    返り値 {"publisher", "isbn", "pub_date", "opf"}。"opf" は _make_opf に渡す断片。
+    """
+    isbn = resolve_isbn(args, doc)
+
+    ndl = None
+    if isbn and not args.no_ndl:
+        ndl = fetch_ndl_by_isbn(isbn)
+        if ndl and not _ndl_plausible(title, author, ndl):
+            print(f"⚠ NDL書誌「{ndl.get('title')}」はこの本と一致しません"
+                  f"（ISBN {isbn} の誤りの可能性）。NDL の情報は使いません",
+                  file=sys.stderr)
+            ndl = None
+
+    # 刊行日: --date > NDL > 奥付OCR。ただし NDL が年月までしか持たず（2004-12）、
+    # 奥付がその年月の日まで読めている（2004-12-15）ときは詳しい方を採る。
+    # 両者が食い違う場合は NDL を信じる（奥付OCRは後刷の日付を拾うことがある）
+    pub_date = args.date
+    ndl_date = ndl.get("date") if ndl else ""
+    ocr_date = ""
+    if not pub_date and not args.no_date_detect:
+        ocr_date = detect_pubdate_from_doc(doc) or ""
+    if not pub_date:
+        if ndl_date and ocr_date and ocr_date.startswith(ndl_date) \
+                and len(ocr_date) > len(ndl_date):
+            print(f"📅 刊行日: {ocr_date}（NDL {ndl_date} に奥付の日を補完）")
+            pub_date = ocr_date
+        else:
+            pub_date = ndl_date or ocr_date or ""
+
+    publisher = args.publisher or (ndl.get("publisher") if ndl else "") or ""
+    creators, contributors = _resolve_creators(
+        author, args.author_kana or None, bool(args.author),
+        args.creator_source, ndl)
+    title_kana = args.title_kana or None
+    if not title_kana and ndl:
+        title_kana = _fit_title_kana(title, ndl.get("title") or "",
+                                     ndl.get("title_kana"))
+
+    opf = build_bib_meta(
+        title, title_kana, creators, contributors,
+        publisher, args.publisher_kana or None, pub_date, isbn,
+        args.description or description,
+        (ndl.get("series") if ndl else None),
+        (ndl.get("volume") if ndl else None),
+        (ndl.get("ndc") if ndl else None),
+        has_images, has_ruby)
+    return {"publisher": publisher, "isbn": isbn, "pub_date": pub_date,
+            "opf": opf}
+
+
 def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
               cover_fmt: str = "", font_filename: str = "",
               toc_at_end: bool = False,
@@ -3765,7 +4494,8 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
               synopsis: str = "",
               horizontal: bool = False,
               doc_items: list = None,
-              publisher: str = "", source: str = "", pub_date: str = "") -> str:
+              publisher: str = "", source: str = "", pub_date: str = "",
+              bib: dict = None) -> str:
     """
     OPF（package.opf）を生成する。
     cover_fmt: "png" | "svg" | "" (表紙画像なし)
@@ -3776,6 +4506,10 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
     publisher: 原出版社（dc:publisher。yomikake の書誌ブロック「出版社」欄）
     source:    底本識別子（dc:source。自炊本は "urn:isbn:…"。yomikake が書誌検索に使用）
     pub_date:  原刊行日（dc:date。空なら生成日を使う）
+    bib:       build_bib_meta() が返す書誌断片。指定すると file-as・contributor・
+               NDC・シリーズ・アクセシビリティまで載せた metadata を出力し、
+               publisher/source/pub_date/synopsis 引数より優先する（未指定なら
+               従来どおりの最小 metadata。novel_downloader.py 側との互換用）
     """
     today    = date.today().strftime("%Y-%m-%d")
     now_iso  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3877,24 +4611,46 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
     )
     page_dir = "ltr" if horizontal else "rtl"
 
+    if bib:
+        # 書誌つき（jisui2epub の CLI 経路）: file-as・contributor・NDC・
+        # シリーズ・アクセシビリティまで載せる。dc:date は判明時のみ
+        pkg_prefix = ('\n         prefix="schema: http://schema.org/'
+                      ' dcndl: http://ndl.go.jp/dcndl/terms/"')
+        bib_block = (
+            f'    {bib["title_meta"]}\n'
+            f'    {bib["creators_meta"]}\n'
+            f'    <dc:language>ja</dc:language>'
+            f'{bib["publisher_meta"]}{bib["date_meta"]}{bib["source_meta"]}'
+            f'{bib["description_meta"]}{bib["subject_meta"]}{bib["series_meta"]}'
+        )
+        access_meta = bib["access_meta"]
+    else:
+        # 従来の最小 metadata（novel_downloader.py からの移植コードと同じ出力）
+        pkg_prefix = ""
+        bib_block = (
+            f'    <dc:title>{_esc(title)}</dc:title>\n'
+            f'    <dc:creator id="creator">{_esc(author)}</dc:creator>\n'
+            f'    <meta refines="#creator" property="role" '
+            f'scheme="marc:relators">aut</meta>{publisher_meta}\n'
+            f'    <dc:language>ja</dc:language>\n'
+            f'    <dc:date>{dc_date}</dc:date>{desc_meta}{source_meta}'
+        )
+        access_meta = ""
+
     return f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf"
          version="3.0"
          unique-identifier="book-id"
-         xml:lang="ja">
+         xml:lang="ja"{pkg_prefix}>
 
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:identifier id="book-id">urn:uuid:{book_id}</dc:identifier>
-    <dc:title>{_esc(title)}</dc:title>
-    <dc:creator id="creator">{_esc(author)}</dc:creator>
-    <meta refines="#creator" property="role" scheme="marc:relators">aut</meta>{publisher_meta}
-    <dc:language>ja</dc:language>
-    <dc:date>{dc_date}</dc:date>{desc_meta}{source_meta}
+{bib_block}
     <meta property="dcterms:modified">{now_iso}</meta>{cover_meta}
     <meta property="rendition:layout">reflowable</meta>
     <meta property="rendition:orientation">auto</meta>
-    <meta property="rendition:spread">none</meta>{writing_mode_meta}
+    <meta property="rendition:spread">none</meta>{writing_mode_meta}{access_meta}
   </metadata>
 
   <manifest>
@@ -4392,6 +5148,7 @@ def build_epub(
     publisher: str = "",     # 原出版社 → dc:publisher
     isbn: str = "",          # 底本 ISBN → dc:source urn:isbn
     pub_date: str = "",      # 原刊行日 → dc:date（空なら生成日）
+    bib: dict = None,        # build_bib_meta() の書誌断片（あれば OPF はこちらを優先）
 ):
     """
     ePub3ファイルを生成する。horizontal=True で横書き、False（デフォルト）で縦書き。
@@ -4485,7 +5242,7 @@ def build_epub(
 """)
 
         # package.opf（cover_fmt / font_filename を渡して manifest/spine を決定）
-        _isbn = re.sub(r"[-\s]", "", isbn)
+        _isbn = normalize_isbn(isbn)
         _source = f"urn:isbn:{_isbn}" if _isbn else ""
         zf.writestr("OEBPS/package.opf",
                     _make_opf(title, author, book_id, ep_titles, cover_fmt,
@@ -4495,7 +5252,8 @@ def build_epub(
                               synopsis=synopsis,
                               horizontal=horizontal,
                               doc_items=[(d, h) for d, h, _s, _e, _t in doc_plan],
-                              publisher=publisher, source=_source, pub_date=pub_date))
+                              publisher=publisher, source=_source, pub_date=pub_date,
+                              bib=bib))
 
         # nav.xhtml（RS向け機械読み取り専用、spine には linear="no" で含める）
         zf.writestr("OEBPS/nav.xhtml",
@@ -4545,7 +5303,9 @@ def build_epub(
         # 奥付
         zf.writestr("OEBPS/colophon.xhtml",
                     _make_colophon_xhtml(title, source_url, site_name,
-                                         horizontal=horizontal))
+                                         horizontal=horizontal,
+                                         publisher=publisher, pub_date=pub_date,
+                                         isbn=normalize_isbn(isbn) or ""))
 
 
 def _strip_heading_block(lines: list) -> int:
@@ -4796,12 +5556,16 @@ def run_from_text(args, doc, npages):
     out = args.output or txt_path
     epub_path = os.path.splitext(out)[0] + ".epub"
     cover_bytes = _pdf_cover_bytes(args, doc, npages)
+    meta = resolve_bib_meta(args, doc, title, author, description=synopsis,
+                            has_images=bool(images_data),
+                            has_ruby=any("《" in ep["body"] for ep in episodes))
     print(f"📖 ePub生成中: {epub_path}")
     build_epub(epub_path, title, author, synopsis, "", "自炊PDF",
                episodes, cover_bg=args.cover_bg,
                cover_image_path=args.cover_image or "",
                cover_image_data=cover_bytes,
-               publisher=args.publisher, isbn=args.isbn, pub_date=args.date,
+               publisher=meta["publisher"], isbn=meta["isbn"],
+               pub_date=meta["pub_date"], bib=meta["opf"],
                images=images_data or None,
                horizontal=args.horizontal)
     print(f"✅ ePub出力完了: {epub_path}")
@@ -4810,14 +5574,31 @@ def run_from_text(args, doc, npages):
 def main():
     ap = argparse.ArgumentParser(
         description="自炊PDF（OCR済み）→ 青空文庫形式テキスト変換")
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {__version__}")
     ap.add_argument("pdf", help="入力PDF（OCRテキスト層付き）")
     ap.add_argument("-o", "--output", help="出力テキストファイル")
     ap.add_argument("--title", help="タイトル（省略時は「タイトル_作者名.pdf」"
                                     "形式のファイル名から自動取得）")
     ap.add_argument("--author", default="", help="著者名（省略時はファイル名から自動取得。末尾の方式タグ _vision/_docai/_ocr は除去）")
     ap.add_argument("--publisher", default="", help="原出版社（dc:publisher。yomikake の書誌ブロック「出版社」欄に表示）")
-    ap.add_argument("--isbn", default="", help="底本の ISBN（dc:source urn:isbn。yomikake が国会図書館サーチ等の書誌検索リンクに使用）")
-    ap.add_argument("--date", default="", help="原刊行日（dc:date。例 2016-03-03。省略時は生成日）")
+    ap.add_argument("--isbn", default="", help="底本の ISBN（dc:source urn:isbn。yomikake が国会図書館サーチ等の書誌検索リンクに使用）"
+                                               "。ハイフン・ISBN接頭辞つきでも可（13桁へ正規化）。省略時は奥付・裏表紙から自動検出")
+    ap.add_argument("--no-isbn-detect", action="store_true",
+                    help="奥付・裏表紙からの ISBN 自動検出を行わない")
+    ap.add_argument("--date", default="", help="底本の刊行日（dc:date。例 2016-03-03）。"
+                                               "省略時は NDL 書誌 → 奥付OCR の順に自動取得（不明なら出力しない）")
+    ap.add_argument("--no-date-detect", action="store_true",
+                    help="奥付からの発行日自動検出を行わない")
+    ap.add_argument("--no-ndl", action="store_true",
+                    help="ISBN による国立国会図書館サーチの書誌照会を行わない（オフライン時も自動で続行）")
+    ap.add_argument("--creator-source", choices=["filename", "ndl"], default="filename",
+                    help="dc:creator の表記元: filename=ファイル名/--author（既定・yomikakeのしおりキーが安定）"
+                         " ndl=NDL書誌の責任表示を採用")
+    ap.add_argument("--title-kana", default="", help="書名の読み（file-as。省略時はNDL書誌から取得）")
+    ap.add_argument("--author-kana", default="", help="著者名の読み（file-as。省略時はNDL書誌から取得）")
+    ap.add_argument("--publisher-kana", default="", help="出版社の読み（file-as）")
+    ap.add_argument("--description", default="", help="あらすじ・内容紹介（dc:description）")
     ap.add_argument("--from-text", metavar="FILE",
                     help="校正済みの青空文庫形式テキストからePubを再生成する"
                          "（PDFは表紙・画像ページの取得にのみ使用。--epub 不要）")
@@ -4981,12 +5762,16 @@ def main():
                   file=sys.stderr)
             sys.exit(1)
         cover_bytes = _pdf_cover_bytes(args, doc, npages)
+        meta = resolve_bib_meta(args, doc, title, author, description=synopsis,
+                                has_images=bool(images_data),
+                                has_ruby=("《" in body))
         print(f"📖 ePub生成中: {epub_path}（{len(episodes)} 章）")
         build_epub(epub_path, title, author, synopsis, "", "自炊PDF",
                    episodes, cover_bg=args.cover_bg,
                    cover_image_path=args.cover_image or "",
                    cover_image_data=cover_bytes,
-                   publisher=args.publisher, isbn=args.isbn, pub_date=args.date,
+                   publisher=meta["publisher"], isbn=meta["isbn"],
+                   pub_date=meta["pub_date"], bib=meta["opf"],
                    images=images_data or None,
                    horizontal=args.horizontal)
         print(f"✅ ePub出力完了: {epub_path}")
