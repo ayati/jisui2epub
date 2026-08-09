@@ -17,3 +17,4 @@ __pycache__/
 
 # Windows用ビルド済みバイナリ（リリースzipにのみ同梱）
 forwindows/
+.venv-yomitoku/

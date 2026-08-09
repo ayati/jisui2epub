@@ -59,13 +59,15 @@ import sys
 import time
 
 import fitz  # PyMuPDF
-from google.api_core import exceptions as gexc
 
-# google.cloud.vision のimportはVision APIを実際に呼ぶ関数内で行う（遅延import）。
-# 本モジュールの書き戻しヒューリスティック（_snap_column_x・
-# insert_invisible_text・_gapfill_missing_rubies等）は docai_reocr.py からも
-# importして共有しており、Document AIだけを使うユーザーが
-# google-cloud-vision 未インストールでも動かせるようにするため
+# google.cloud.vision と google.api_core のimportはVision APIを実際に呼ぶ
+# 関数内で行う（遅延import）。本モジュールの書き戻しヒューリスティック
+# （_snap_column_x・insert_invisible_text・_gapfill_missing_rubies等）は
+# docai_reocr.py・yomitoku_reocr.py からもimportして共有しており、
+# 他のバックエンドだけを使うユーザーがGoogle系パッケージ未インストールでも
+# 動かせるようにするため。google-api-core は google-cloud-documentai の
+# 依存なのでDocAI利用者には常にあるが、YomiTokuはローカル実行で
+# Google系の依存を一切持たないため、これもトップレベルに置けない
 from jisui2epub import analyze_page, detect_body_size, KANA_RE, RUBY_SIZE_RATIO
 
 # ルビ判定閾値: 本文の縦書き列幅の何倍未満をルビ（小書き文字）とみなすか。
@@ -173,6 +175,8 @@ API_UNITS = {"page": 0, "rescue": 0}
 
 
 def call_vision_with_retry(client, image, kind="page"):
+    from google.api_core import exceptions as gexc
+
     last_err = None
     for attempt in range(MAX_RETRIES):
         try:

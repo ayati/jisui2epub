@@ -81,6 +81,29 @@ python3 jisui_gui.py --print-jobs 本.pdf --type horizontal --reocr  # 組み立
 
 - ツール解決: 設定の手動パス → 同フォルダexe → 同フォルダ.py（各リポジトリの
   .venv を自動使用）。Windowsはexe優先・開発環境は.py優先
+- **`yomitoku_reocr` だけはexeを探さない（`resolve_tool` に専用分岐）**。
+  PyInstallerでexe化するとyomitoku本体のコードがexeに取り込まれ、
+  **CC BY-NC-SA素材の再配布物**になってMITのリリースzipと表記が矛盾する
+  （モデル重みは実行時DLなので含まれないが、コードだけで該当する）。
+  代わりに `find_yomitoku_python` が「yomitokuが入ったPython」を探し
+  （設定の手動パス → 同フォルダ.venv → sys.executable → PATH上のpy/python）、
+  同梱の素の `.py` と組み合わせて起動する。判定は `importlib.util.find_spec`
+  だけで行う（`import yomitoku` はtorchを読むので数秒かかる）
+- **再OCRの既定エンジンは `yomitoku`**（`ENGINE_CHOICES` の先頭）。
+  Google Cloudはアカウント作成・クレカ登録・毎月の請求という敷居があり、
+  一般ユーザーが最初に試す先としては重いため。エンジン選択に応じて
+  `on_engine_change` が下の設定行を出し分ける（yomitoku=インストール手順・
+  Python選択・非商用の注記／vision・docai=認証JSON）
+- 導入確認はワーカースレッドで行い、結果は `_yomi_result` に置いて
+  `poll()`（メインスレッド）が拾う。**Tkinterを別スレッドから触らない**原則
+- **YomiToku経路は3つの.pyを同じフォルダに要求する**
+  （`YOMITOKU_REQUIRED_SCRIPTS` = yomitoku_reocr / vision_reocr / jisui2epub）。
+  実機で1つだけコピーして `ModuleNotFoundError` になったため、
+  `missing_yomitoku_scripts()` が起動前に検出して不足名を出す。
+  pipは `yomitoku pymupdf`（jisui2epub.pyがPyMuPDFを使う）
+- **インストール手順は `messagebox.showinfo` で出してはならない**（本文を
+  選択できずコピペできない）。`Toplevel`＋`Text`＋「pipコマンドをコピー」
+  ボタンにしてある
 - 子プロセスには `PYTHONIOENCODING=utf-8:replace` を渡す（パイプ起動時に
   ツール側stdoutがcp932化して✅で落ちる対策。jisui2epub.py側にも
   `errors="replace"` の防御があり、そちらはvision/docaiにもimport経由で効く）
@@ -563,6 +586,97 @@ VisionとのA/B実測（同一ページ・同一評価基盤、2026-07-16）:
   （`_dedup_symbols`）。この対処でルビ一致率91.2%→92.0%
 - プロセッサは`--create-processor`で作成（OCR_PROCESSORタイプ）、実行時は
   認証JSONのproject_idから自動検出
+
+## yomitoku_reocr.py（前処理: YomiTokuによるローカル再OCR）
+
+設計書は `DESIGN_YomiToku.md`。OCRエンジンを YomiToku（日本語特化のローカルOCR）に
+差し替えた版。完全オフライン・無料・GCP認証不要でCPUだけで動く。
+書き戻し系（`_snap_column_x`・`insert_invisible_text`・`_atomic_save`等）は
+**vision_reocr.py からimportして共有**（docai_reocr.py と同じ方針）。
+
+```bash
+.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+.venv/bin/pip install yomitoku
+.venv/bin/python yomitoku_reocr.py input.pdf     # 既定出力 <入力>_yomitoku.pdf
+```
+
+- **ライセンスは CC BY-NC-SA 4.0（非商用）**。`yomitoku_reocr.py` 自体はMITで
+  YomiTokuのコードは含まない（公開APIを呼ぶだけ・同梱もしない）ため
+  リポジトリはMITを維持できるが、**この経路の利用者だけ非商用限定**になる。
+  YomiTokuのコード・configのコピーとモデル重みの同梱は禁止（派生物化する）
+- **`DocumentAnalyzer` ではなく `OCR` 単体を使う**。レイアウト解析・表構造認識・
+  読み順推定は jisui2epub が自前で持つため不要。実測で検出語数は完全同一(46)の
+  まま 4.73〜5.29秒/頁 → 2.50〜2.95秒/頁、初期化も約70秒→1.9秒
+- `--lite` 相当のconfigは `CONFIG_LITE_CPU` に定数化（CLIが組む値と同じものを
+  APIに渡すだけ）。Radeon 780M は ROCm 対象外なので `device="cpu"` 固定
+- **torchを先にCPU wheelで入れないとCUDA 12.8版(約3GB)を引く**。起動時の
+  ONNX version_converter エラー（Resize adapter）はtorchへフォールバックし実害なし
+- **出力は行単位ポリゴン＋テキストのみで文字単位bboxが無い**（Vision/DocAIと違う）
+  → `_expand_line_to_cells` が行ボックスを文字数で等分割して文字セルを合成する。
+  等分割は下流の想定内（`attach_rubies`はセルの実Y開始位置をbisectで引き、
+  `cell_height()`は隣接差の中央値なので等間隔セル＝1行1スパン旧OCRと同値）
+- **書字方向は `direction` フィールドを信用せずアスペクト比で決める**
+  （実測: 2文字の縦ルビ「かわ」が `horizontal` と申告される。短い行で誤申告が頻発）
+- **空白は幅ゼロで扱う**。YomiTokuは隣接ルビを1ボックスにまとめる際に境界へ
+  空白を入れる（`'ねん い じょう'`）が、ボックス実寸は空白を除く文字数×ピッチと
+  一致する（249px÷6字=41.5px、同ページの他ルビ36〜44pxの範囲内）。空白に幅を
+  配るとピッチが縮んでY→インデックス変換がずれる
+- **【重要】検出ボックス幅をそのまま渡してはならない**（`INK_WIDTH_RATIO=0.68`）。
+  YomiTokuの検出ボックス（DBNet）はunclip処理で実インクより一回り大きく、
+  下流のしきい値は実インク幅で較正されている。補正しないとルビの書き戻し
+  フォントサイズが過大になり（実測5.88pt、Visionは同じルビを3.84pt）、
+  (1)描画スパンが背高になる(7.06pt対4.61pt) (2)ルビ列グルーピングのギャップ許容
+  `size×1.7`が緩む(9.996pt対6.53pt) の両方が効いて**隣接する別語のルビが誤結合
+  される**（下《した》＋妹《いもうと》→妹《したいもうと》・車《くるま》＋音《おと》
+  など5箇所/1頁）。実測でルビペア一致率 77.0%→88.4%。縮小は幅のみ・中心を保つ
+  （検出ボックス上端はVisionの字面上端と一致する: 309.48pt対309.72pt。
+  上下も縮めると系統的な下方バイアスが乗る）
+- `rec_score`（Vision/DocAIには無い信頼度）は**書き戻しの採否には使わず**、
+  `<出力>_lowconf.tsv` に記録して校正の手掛かりにする（機械的に捨てると本文に
+  穴が開く。二段OCRの「再読テキスト採用は正解より悪化」と同種の罠）
+- 挿絵ページでジャンクを返さない（実測: 地下室p6でVisionは旧OCR同様の
+  ジャンク82字を拾うが、YomiTokuはノンブル「5」のみ）
+- 固有の誤り: 小書き`っ→つ`・`──`/`……`の脱落。半角`?`/`!`は
+  既存の `_FULLWIDTH_PUNCT` が吸収する
+- 実測（地下室P.4-15 / 霧P.7-18、eval_ruby.pyのペア単位）:
+  ルビ 88.4%/73.3%（Vision 88.8%/73.8%）、本文一致率 92.65%（Vision 92.63%）、
+  章見出し数・画像ページ数・改ページ数はすべてVisionと一致
+- **【要注意】児童文学では互角だが歴史小説では Vision が明確に上**
+  （黒牢城P.30-160の131ページ・約6万字で Vision 96.36% 対 YomiToku 95.99%）。
+  原因は2つで、どちらも児童文学のサンプルには出ない:
+  - **稀用漢字を視覚的に似た常用漢字に置換する**（`鑓→鍵`×40・`﨟→藤`×16・
+    `燭→濁`×14・`儂→優/濃`×23）。**文字セット不足ではない**（charset.txtに
+    収録済み）。`鑓`が34個ある P.128-132 で Vision 34個検出に対し lite 6個、
+    **標準モデル(`--no-lite`)は0個で改善せず**（一致率も95.21%で同一・6.6秒/頁と
+    約2倍遅い）→ 時代小説・古典は Vision/DocAI を選ぶ。lite で問題ない
+  - **縦書きの `」` を `一` と誤認**（黒牢城131頁で47件・括弧不整合+54、Visionは-2。
+    どこよりも81頁でも23件・+28）。**対策は検証済みで実装可能**（下記）
+- **`」→一` の修正は `yomitoku_reocr.py` 側に置く（実装済み・
+  `fix_closing_bracket_lines`／`BracketFixState`）。jisui2epub.py の共有コードに
+  置いてはならない**: `assemble_text` に実装して既存の再OCR済みPDFにかけると
+  Vision/DocAI版でも発火し（ソフロニア24件・黒牢城10件）、ソフロニアの24件中
+  **6件が誤爆**した（①417頁のどこかで`「`の対応が壊れると以降ずっとdepth>0に
+  なり章見出し行で発火 ②`一カ所` ③`ソフロ’一`＋次列`ア`＝「ソフロニア」の
+  列分断を`ソフロ’」ア`に壊す）。窓を入れても誤爆はゼロにならない。
+  **バックエンド側に閉じれば Vision/DocAI 出力は定義上不変**で回帰確認も不要
+- 修正規則は「段落末尾」でなく「行（列）末尾」で判定する。
+  段落末尾で見る案は実データで発火しない＝`」`が消えると段落が後続の地の文と
+  結合し、誤った`一`が段落の途中に来る（`…って思って一なぜこの高校を…`）。
+  正しい規則は `assemble_text` で (1)縦行を読み順に走査し`「『`/`」』`で引用の
+  深さを追跡 (2)行末が`一`かつ引用が開いていれば`」`に置換 (3)**次行の先頭が
+  「一に続きやすい漢字」なら置換しない**（`番度人つ緒方応瞬言体般部種件日時年回
+  面様歩生行目切等同致`）。**(3)は必須**＝無いと`一番`の列またぎ折り返し
+  （…待つのが／番だった）を誤爆する。実測（どこよりもP.10-90）:
+  保護ありで **YomiToku 24件発火・誤爆0（GOALで全件`」`と確認）／Vision 0件発火**
+  ＝既存バックエンドに完全非回帰。語中の`一一九`・`はいじゃあ一番、相葉修治一`も
+  末尾1文字だけが対象なので保たれる
+- **濁点の脱落**（`ど→と`×14・`か→が`×11・`だ→た`×9／どこよりも81頁）。
+  ルビは `fix_ruby_variants` が本内多数決で訂正するが**本文には対策が無い**
+- **元のスキャンOCRが良好な本では上積みが小さい**（どこよりも: 旧OCR 98.26% →
+  YomiToku 98.40%＝+0.14pt、Vision は 99.07%＝+0.81pt）
+- vision_reocr.py の `google.api_core` importを関数内に遅延化した（YomiTokuは
+  Google系の依存を一切持たないためトップレベルに置けない。google-api-coreは
+  google-cloud-documentaiの依存なのでDocAI利用者には常にある）
 
 テスト用サンプル: `temp_sample/` に入力PDF・正解テキスト・公式ePubがある
 （グリックの冒険=古いOCR・挿絵多、ほんものの魔法使=新OCR、伯爵夫人=見出し弱、

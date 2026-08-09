@@ -1,9 +1,13 @@
-# vision_reocr.py / docai_reocr.py を Windows で使う
+# vision_reocr.py / docai_reocr.py / yomitoku_reocr.py を Windows で使う
 
 `vision_reocr.py` はGoogle Cloud Vision APIでスキャンPDFを再OCRし、透明テキスト層を
 書き戻す前処理ツール（詳細は `README.md` を参照）。このドキュメントはWindows上で
 Python版のスクリプトを直接動かすための手順をまとめたもの。より高精度な
 Document AI版 `docai_reocr.py` を使う場合は7章も参照。
+
+**クラウドを使いたくない場合は8章の `yomitoku_reocr.py` を参照**。GCPの
+アカウント作成・課金設定・認証JSONがすべて不要になるため、以下の2章・3章を
+まるごと飛ばせる（そのかわり非商用利用限定）。
 
 必要な準備は3つ:
 
@@ -309,3 +313,93 @@ python docai_reocr.py "本.pdf"
 エラー `OCRプロセッサが見つかりません` が出た場合は `--create-processor` を
 先に実行する。`PERMISSION_DENIED` 系のエラーは本ドキュメント5章と同様に
 API有効化・課金設定・認証情報を確認すること。
+
+---
+
+## 8. クラウドを使わない yomitoku_reocr.py（ローカルOCR版）
+
+`yomitoku_reocr.py` はOCRエンジンを [YomiToku](https://github.com/kotaro-kinoshita/yomitoku)
+（日本語特化のローカルOCR）に差し替えた版。**GCPのアカウント・課金・認証JSONが
+すべて不要**になるため、本ドキュメントの2章・3章を丸ごと省略できる。
+ネット接続も（初回のモデルダウンロードを除き）不要。
+
+精度はVisionと互角以上（実測の比較表は `README.md` 参照）。処理はCPUで
+2.5〜3秒/ページ程度なので、400ページの本で約17分かかる。
+
+> **⚠️ ライセンスに注意**
+> YomiToku 本体とモデル重みは **CC BY-NC-SA 4.0（非商用）** です。
+> 個人の自炊・学術研究は無償で使えますが、**業務・商用での利用はできません**
+> （jisui2epub 自体はMITですが、この経路だけ制限がかかります）。
+> 商用利用は <https://www.mlism.com/> を参照してください。
+>
+> YomiToku © 2024 by Kotaro Kinoshita is licensed under CC BY-NC-SA 4.0
+> <https://creativecommons.org/licenses/by-nc-sa/4.0/>
+
+### 8.0 GUIから使う（推奨）
+
+`jisui_gui.exe` の「先に再OCRで文字を読み直す」にチェックを入れると、
+再OCRエンジンの選択肢が出る。**既定は YomiToku**（無料・オフライン・
+Google Cloudの登録不要）。
+
+- 未インストールなら「未インストール」と表示されるので、
+  **「インストール手順」ボタン**を押すと手順が表示される
+- Pythonを入れてもGUIが見つけられない場合は「**Pythonを選ぶ**」で
+  `python.exe` を直接指定する
+- Vision / Document AI を選んだときだけ、従来どおり認証JSONの選択欄が出る
+
+> **なぜ YomiToku だけ Python が必要なのか**
+> YomiToku は非商用ライセンス（CC BY-NC-SA 4.0）のため、exe に同梱して
+> 配布することができません（配布物が非商用扱いになってしまいます）。
+> そのため `yomitoku_reocr.py` はスクリプトのまま同梱し、お使いのPythonで
+> 実行する形にしています。Vision / Document AI は exe に同梱されているので
+> Python は不要です。
+
+### 8.1 インストール
+
+1章の仮想環境を作ったあと、**必ずこの順番で**インストールする。
+
+```powershell
+# 1) PyTorch を CPU版で先に入れる（この指定を省くとCUDA版≈3GBがダウンロードされる）
+pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+
+# 2) YomiToku 本体と PyMuPDF
+pip install yomitoku pymupdf
+```
+
+**さらに、次の3つの `.py` を同じフォルダ（`jisui_gui.exe` と同じ場所）に置く。**
+
+```
+yomitoku_reocr.py
+vision_reocr.py
+jisui2epub.py
+```
+
+`yomitoku_reocr.py` は単体では動かない。透明テキスト層の書き戻し処理を
+`vision_reocr.py` と、ページ解析を `jisui2epub.py` と共有しているため
+（同じ処理を二重に持たないための設計で、`docai_reocr.py` も同様）。
+1つでも欠けると `ModuleNotFoundError: No module named 'vision_reocr'` で
+止まる。GUIから使う場合は不足しているファイル名を教えてくれる。
+
+NVIDIAのGPUを積んでいるPCで速度を出したい場合のみ、1)を省いて
+`pip install yomitoku` だけ実行し、実行時に `--device gpu` を付ける
+（CUDA対応GPUが必要。AMDの内蔵GPUでは使えないためCPUで動かすこと）。
+
+### 8.2 実行
+
+```powershell
+# 全ページ再OCR（既定出力は <入力>_yomitoku.pdf）
+python yomitoku_reocr.py "本.pdf"
+
+# 数ページだけ試す
+python yomitoku_reocr.py "本.pdf" --start 10 --end 20 -o test.pdf
+
+# 途中で中断した場合、続きのページから再開
+python yomitoku_reocr.py "本.pdf" --start 100
+```
+
+初回実行時のみ、モデルファイルがHugging Faceから自動ダウンロードされる
+（数分かかることがある）。起動時に `No Adapter To Version $17 for Resize` という
+ONNX関連のエラーがログに出るが、自動でPyTorch推論に切り替わるため無視してよい。
+
+処理中は1ページごとに残り時間の目安が表示される。認識信頼度の低い行は
+`<出力>_lowconf.tsv` に記録されるので、校正時にそこを重点的に見るとよい。

@@ -241,3 +241,61 @@ GUI完成後も「とにかく1操作で」の代替手段として残す。
 - ツール本体のロジック変更（GUIは公開CLIオプションの組み立てのみ）
 - macOS/Linux向けGUI（開発はWSLで .py 直接起動できれば十分）
 - ePubビューア機能（既存の epub_viewer / 市販リーダーの領分）
+
+---
+
+## 追補: YomiToku（ローカル再OCR）対応
+
+### exe化してはならない
+
+`yomitoku_reocr.py` を PyInstaller で exe 化すると、**yomitoku 本体のコードが
+exe に取り込まれる**（モデル重みは実行時ダウンロードなので含まれないが、
+コードだけで十分に該当する）。yomitoku は CC BY-NC-SA 4.0 なので、その exe は
+**非商用ライセンス素材の再配布物**になり、MIT のリリース zip と表記が矛盾する。
+
+→ **リリースには素の `yomitoku_reocr.py` を同梱し、GUI はユーザーの Python で
+それを起動する**。この形なら配布物に yomitoku のコードは一切含まれない
+（ユーザーが自分で `pip install` したものを、自分のマシンで使うだけ）。
+
+`forwindows/` に置く exe は従来どおり `jisui2epub.exe` / `vision_reocr.exe` /
+`docai_reocr.exe` / `jisui_gui.exe` の4つ。**`yomitoku_reocr.exe` は作らない。**
+
+### 実装
+
+- `resolve_tool("yomitoku_reocr", …)` に専用分岐を置き、exe候補を一切見ない
+- `find_yomitoku_python(settings)` が yomitoku の入った Python を探す:
+  設定の手動パス（`python_path`）→ 同フォルダの `.venv` → `sys.executable`
+  （非frozen時のみ）→ PATH上の `py` / `python` / `python3`
+- 判定は `importlib.util.find_spec('yomitoku')` の終了コードで行う。
+  `import yomitoku` は torch を読み込むので数秒かかり、GUIの起動が固まる
+- 見つからない場合は `YOMITOKU_INSTALL_HELP`（手順＋非商用の注記）を
+  エラーメッセージとダイアログの両方で出す
+
+### UI
+
+- `ENGINE_CHOICES = ("yomitoku", "vision", "docai")` — **YomiTokuが既定**。
+  Google Cloud はアカウント作成・クレジットカード登録・毎月の請求という敷居が
+  高く、一般ユーザーが最初に試す先としては重い
+- `on_engine_change()` がエンジンに応じて下の行を出し分ける:
+  - yomitoku → 「インストール手順」ボタン・「Pythonを選ぶ」ボタン・導入状態の
+    表示・**非商用ライセンスの注記**・「時代小説はVision/DocAI推奨」の注記
+  - vision / docai → 認証JSONの選択・課金に関する注記
+- `on_reocr_toggle()` は yomitoku 選択時に認証JSONを要求しない
+- 導入確認はワーカースレッドで実行し、結果は `_yomi_result` に置いて
+  `poll()`（メインスレッド）が拾う。**Tkinterを別スレッドから触らない**原則
+
+### 実機確認で判明した点（2026-08-09）
+
+- **`yomitoku_reocr.py` 単体では動かない**。書き戻しを `vision_reocr.py` と、
+  ページ解析を `jisui2epub.py` と共有しているため、**3つの.pyを同じフォルダに
+  置く必要がある**（実機で `ModuleNotFoundError: No module named 'vision_reocr'`
+  が発生し、ユーザーが1つずつコピーして解決するはめになった）。
+  → `missing_yomitoku_scripts()` で起動前に検出し、足りないファイル名を
+  具体的に出す。`YOMITOKU_REQUIRED_SCRIPTS` が正本
+- **`pip install yomitoku` だけでは足りない**。`jisui2epub.py` が PyMuPDF を
+  使うので `pymupdf` も要る（`YOMITOKU_PIP_COMMANDS` に含めてある）
+- **`messagebox.showinfo` は本文を選択できない**。実機で「全文をコピーして
+  メモ帳に貼り、行を選び直す」手間が発生した。→ `Toplevel` ＋ `Text`
+  （編集キーだけ無効化して選択とコピーは許す）に変更し、
+  **「pipコマンドをコピー」ボタン**でクリップボードに直接入れる
+- 再OCRのチェックボックス文言から「Vision API」を削除（既定がYomiTokuのため）

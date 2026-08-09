@@ -267,6 +267,60 @@ v0.7.0 ではさらに、旧OCRがルビのbbox自体を±1セルずれて申告
 まずは無料のvision_reocr.pyを試し、誤字の多さが気になる本にdocai_reocr.pyを
 使う、という使い分けを推奨。
 
+### クラウドを使わない場合（yomitoku_reocr.py）
+
+`yomitoku_reocr.py` はOCRエンジンを [YomiToku](https://github.com/kotaro-kinoshita/yomitoku)
+（日本語特化のローカルOCR）に差し替えた版。**完全オフライン・無料・GCPの
+アカウントも認証JSONも不要**で、CPUだけで動く（実測2.5〜3秒/ページ、
+400ページの本で約17分）。
+
+精度は実測で Vision と互角以上:
+
+| | 本文一致率（児童文学） | ルビペア一致率 | 本文一致率（歴史小説） |
+|---|---|---|---|
+| Vision | 92.63% | 88.8%（地下室）/ 73.8%（霧） | **96.36%** |
+| **YomiToku** | **92.65%** | **88.4%（地下室）/ 73.3%（霧）** | 95.99% |
+
+**現代小説・児童文学では Vision と互角だが、時代小説には向かない。**
+黒牢城（131ページ）での検証では、`鑓`・`儂`・`燭` のような稀用漢字を
+視覚的に似た常用漢字に置き換えてしまう（`鑓` 34個中 Vision 34個正解に対し
+YomiToku 6個）。標準モデル（`--no-lite`）でも改善しない。また縦書きの `」` を
+`一` と誤認することがある（131ページで47件）。**時代小説・古典を扱う場合は
+Vision か Document AI を選ぶこと。**
+
+ルビが語単位でまとまって返るためVision特有のルビ誤結合が起きにくく、
+Visionが検出漏れする1文字の極小ルビも自前で検出できる。挿絵ページで
+ジャンク文字を返さないのも利点。認識信頼度が低い行は
+`<出力>_lowconf.tsv` に記録されるので校正の手掛かりになる。
+
+```bash
+# セットアップ（初回のみ）。torchを先にCPU版で入れないとCUDA版≈3GBを引く
+.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+.venv/bin/pip install yomitoku
+
+# 使い方はvision_reocr.pyと同じ（既定出力は <入力>_yomitoku.pdf）
+.venv/bin/python yomitoku_reocr.py 本.pdf
+.venv/bin/python yomitoku_reocr.py 本.pdf --start 10 --end 20 -o test.pdf
+```
+
+> **⚠️ ライセンスに注意**
+> YomiToku 本体とそのモデル重みは **CC BY-NC-SA 4.0（非商用）** です。
+> jisui2epub 自体は MIT ですが、**YomiTokuを使う経路だけは非商用利用に
+> 限られます**（`yomitoku_reocr.py` 自体はMITで、YomiTokuのコードは含まず
+> 公開APIを呼ぶだけです）。個人の自炊・学術研究は無償で利用できます。
+> 商用利用は <https://www.mlism.com/> を参照してください。
+>
+> YomiToku © 2024 by Kotaro Kinoshita is licensed under CC BY-NC-SA 4.0
+> <https://creativecommons.org/licenses/by-nc-sa/4.0/>
+
+### 3つの再OCRバックエンドの選び方
+
+| | 費用 | 速度 | ネット | 商用利用 |
+|---|---|---|---|---|
+| vision_reocr.py | 月1000ページ無料 | 約1秒/頁 | 必要 | 可 |
+| docai_reocr.py | $1.50/1000ページ | 約2秒/頁 | 必要 | 可 |
+| yomitoku_reocr.py | **無料** | 約2.5〜3秒/頁 | **不要** | **不可（非商用のみ）** |
+
 ## スキャン画質は「スーパーファイン」推奨
 
 同一の裁断済紙本『書を捨てよ、町へ出よう』（角川文庫・320ページ）を ScanSnap の
