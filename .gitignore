@@ -5,6 +5,9 @@ output/
 *.epub
 *.kepub.epub
 
+# 前処理ラボの計測結果（ページ正解にGOAL本文の抜粋を含む）
+scratchpad/preproc_out/
+
 # 変換結果
 *.txt
 *.jpg

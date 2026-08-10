@@ -53,6 +53,10 @@ from vision_reocr import (
     _snap_column_x,
     insert_invisible_text,
     largest_embedded_image,
+    preprocess_array,
+    prepare_preprocess,
+    preprocess_report,
+    set_preprocess_mode,
 )
 
 # `--lite` 相当の設定。yomitoku の CLI が組み立てるものと同じ値を公開APIに
@@ -155,6 +159,13 @@ def ocr_page_with_yomitoku(ocr, doc, page_index):
     img = _decode_image(image_bytes)
     if img is None:
         return None, None
+
+    # 画像前処理（DESIGN_画像前処理.md）。適用したら返す img_size も処理後の
+    # 寸法にする。呼び出し側は sx = page.rect.width / img_w で座標変換するので、
+    # これだけで拡縮が自動的に追随する（jisui2epub.py 本体は無改修）
+    img, applied = preprocess_array(img, "yomitoku")
+    if applied:
+        img_w, img_h = img.shape[1], img.shape[0]
 
     result, _ = ocr(img)
     return result.words, (img_w, img_h)
@@ -378,6 +389,9 @@ def reocr_pdf(ocr, input_path, output_path, start_page, end_page, lowconf_path=N
     # 詳細は vision_reocr._open_source_pdf）
     doc = _open_source_pdf(input_path, output_path)
     end_page = min(end_page, len(doc))
+    # 画像前処理の書籍代表値を先に決める（DESIGN_画像前処理.md）。
+    # ページごとの推定値は挿絵頁やしきい値付近で揺れるため判定に使えない
+    prepare_preprocess(doc, start_page, end_page)
 
     _warn_low_resolution(doc, start_page, end_page)
 
@@ -472,6 +486,9 @@ def reocr_pdf(ocr, input_path, output_path, start_page, end_page, lowconf_path=N
             if i % CHECKPOINT_EVERY == 0:
                 _atomic_save(doc, output_path)
                 print(f"  [チェックポイント保存: {output_path}]")
+                rep = preprocess_report()
+                if rep:
+                    print(f"  [{rep}]")
     finally:
         _atomic_save(doc, output_path, final=True)
         doc.close()
@@ -492,6 +509,9 @@ def reocr_pdf(ocr, input_path, output_path, start_page, end_page, lowconf_path=N
         f"完了: {processed}ページ処理 / "
         f"文字数{total_chars}（うちルビ{total_ruby}） / {elapsed:.0f}秒"
     )
+    rep = preprocess_report()
+    if rep:
+        print(rep)
     print(f"保存しました: {output_path}")
 
 
@@ -516,14 +536,23 @@ def main():
     parser.add_argument(
         "--no-lite", action="store_true",
         help="軽量モデルでなく標準モデルを使う。約2倍遅く、実測では精度が"
-             "向上しなかったため通常は不要（黒牢城P.128-132で一致率95.21%と同一、"
+             # argparse は help を % 書式で展開するため、パーセント記号は
+             # %% にしないと --help が ValueError で落ちる
+             "向上しなかったため通常は不要（黒牢城P.128-132で一致率95.21%%と同一、"
              "稀用漢字はむしろ悪化）",
     )
     parser.add_argument(
         "--no-lowconf-report", action="store_true",
         help="信頼度の低い行のTSV出力（<出力>_lowconf.tsv）を行わない",
     )
+    parser.add_argument(
+        "--preprocess", choices=["auto", "on", "off"], default="auto",
+        help="OCR前の画像前処理（本文1文字を32px相当に拡縮＋σ1.2平滑化）。"
+             "auto=劣化したスキャンのページだけ自動で適用 / on=常に適用 / "
+             "off=無効（従来と完全に同じ出力）（既定: auto）",
+    )
     args = parser.parse_args()
+    set_preprocess_mode(args.preprocess)
 
     if args.output:
         output_path = args.output

@@ -212,6 +212,260 @@ def largest_embedded_image(doc, page):
     return base_image["image"], base_image["width"], base_image["height"]
 
 
+# ---------------------------------------------------------------------------
+# 再OCR前の画像前処理（設計書: DESIGN_画像前処理.md）
+#
+# 「本文1文字が PREPROC_TARGET_PX になるよう拡縮し、ガウシアンσで平滑化する」
+# だけを行う。劣化スキャン（低解像度・走査時に1bit二値化された本）でYomiToku
+# +0.11〜+0.42pt、Vision +0.43pt / DocAI +0.18pt（二値のみ）の改善が実測されている。
+# 良好なスキャンには効かないので §除外条件 で適用対象を絞る。
+#
+# 効果の実体は「拡縮」ではなく「平滑化」（σ=0＝拡縮だけでは+0.06ptで効果なし）。
+# 拡縮は平滑化を効かせるための土台にすぎない。
+#
+# docai_reocr.py・yomitoku_reocr.py もこの実装をimportして共有する。
+# ---------------------------------------------------------------------------
+
+PREPROC_TARGET_PX = 32.0     # 正規化後の本文1文字の高さ（px）
+PREPROC_SIGMA = 1.2          # ガウシアンの標準偏差（targetに連動させない絶対値）
+PREPROC_MAX_SCALE = 4.0      # 極端な拡縮の安全弁
+
+# 除外条件のしきい値（いずれも実測値。詳細は DESIGN_画像前処理.md §5.2）
+PREPROC_SKIP_CHAR_PX = 40.0  # これ以上（600dpi級）は素で十分きれいなので触らない
+PREPROC_TONE_CHAR_PX = 26.0  # 濃淡スキャンにYomiTokuで適用してよい1文字サイズの上限
+PREPROC_BINARY_MID = 0.01    # 中間調率がこれ未満なら1bit二値スキャンとみなす
+                             # （実測: 二値の本は必ず0.00%、濃淡の本は必ず4%以上）
+PREPROC_MIN_COMPONENTS = 300 # 代表値の標本に採る本文ページの最小連結成分数
+                             # （実測: 本文ページ512〜2108個・挿絵/扉/白19〜350個）
+PREPROC_MIN_GROUP_SHARE = 0.25  # 二値/濃淡の種別を独立に扱うのに必要な標本割合
+
+PREPROCESS_MODE = "auto"     # auto（除外条件で判定）/ on（常に適用）/ off（無効）
+PREPROCESS_STATS = {"applied": 0, "skipped": 0}
+
+
+def set_preprocess_mode(mode):
+    """CLIの --preprocess を反映する。統計と書籍代表値もリセットする"""
+    global PREPROCESS_MODE
+    PREPROCESS_MODE = mode
+    PREPROCESS_STATS["applied"] = PREPROCESS_STATS["skipped"] = 0
+    _PREPROC_PLAN.update({"binary": None, "tone": None, "ready": False})
+
+
+def _import_cv2():
+    """OpenCVとnumpyを遅延importする。YomiTokuの依存として入っているが、
+    Vision/DocAIだけを使うユーザーは持っていない可能性があるため、
+    無ければ前処理をスキップする（google系importの遅延と同じ方針）"""
+    try:
+        import cv2
+        import numpy as np
+        return cv2, np
+    except ImportError:
+        return None, None
+
+
+def _char_px_and_components(gray):
+    """(推定1文字px, 採用した連結成分数) を返す。成分数は「本文ページかどうか」
+    の判定に使う（本文ページは実測512〜2108個、挿絵・扉・白ページは19〜350個と
+    はっきり分かれる）"""
+    cv2, np = _import_cv2()
+    if cv2 is None:
+        return None, 0
+    _, b = cv2.threshold(gray, 0, 255,
+                         cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(b, 8)
+    if n < 20:
+        return None, 0
+    h = stats[1:, cv2.CC_STAT_HEIGHT]
+    w = stats[1:, cv2.CC_STAT_WIDTH]
+    a = stats[1:, cv2.CC_STAT_AREA]
+    # 極小（ノイズ・濁点）と極大（罫線・図版）を落とす
+    keep = (a >= 8) & (h >= 3) & (h <= gray.shape[0] / 8) & (w <= gray.shape[1] / 8)
+    k = int(keep.sum())
+    if k < 20:
+        return None, k
+    return float(np.median(h[keep])) / 0.72, k
+
+
+def estimate_char_px(img):
+    """画像から本文1文字のピクセル高さを推定する（推定不能ならNone）。
+
+    大津法で二値化して連結成分を取り、高さの中央値を返す。かな（小さい）と
+    漢字（大きい）、偏で分離した成分が混ざるため中央値は1文字の約0.72倍に
+    落ち着くので、その係数で補正する。ノンブル・柱・挿絵の成分は中央値なので
+    ほぼ効かない。実測で 150dpi→15〜16px・300dpi→21〜33px・600dpi→57〜58px と
+    解像度に比例する"""
+    cv2, _np = _import_cv2()
+    if cv2 is None:
+        return None
+    g = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return _char_px_and_components(g)[0]
+
+
+def _mid_ratio(gray):
+    """中間調率（40 < 輝度 < 215 の画素の割合）。1bit二値スキャンの判定に使う。
+    実測で二値の本は必ず0.00%、濃淡の本は必ず4%以上と完全に分離する"""
+    return float(((gray > 40) & (gray < 215)).mean())
+
+
+# 書籍ごとの代表的な本文1文字サイズ。ページ標本から二値・濃淡それぞれについて
+# 中央値を取る。_PREPROC_PLAN = {"binary": px or None, "tone": px or None}
+_PREPROC_PLAN = {"binary": None, "tone": None, "ready": False}
+
+
+def prepare_preprocess(doc, start_page, end_page, sample=24):
+    """処理対象ページを標本抽出して、本文1文字サイズの代表値を決める。
+
+    **ページごとの推定値をそのまま判定に使ってはならない。** 同じ本でも
+    ページによって推定が揺れ（実測: ソフロニア嬢は中央値27.8pxに対し
+    5〜95%点が23.4〜31.9pxで、しきい値26pxをまたぐ）、挿絵ページでは
+    本文が無いため極端に小さく出る（実測: 地下室からのふしぎな旅の挿絵頁で
+    6.9〜12.5px。600dpiの本なのに4倍拡大される）。どちらも「そのページの
+    走査品質が違う」わけではないので、判定も拡縮率も書籍代表値で行う。
+
+    一方、**二値/濃淡の別はページごとに見る必要がある**。ScanSnapの両面
+    スキャンは表裏でセンサが別なので、1ページおきに300dpi濃淡と600dpi二値が
+    入れ替わる本が実在する（白銀の墟玄の月1。しかも奇偶の位相が途中で反転
+    する）。中間調率はページ単位で安定して求まるので、二値・濃淡それぞれに
+    代表値を持たせ、ページはその中間調率で振り分ける。
+    """
+    _PREPROC_PLAN.update({"binary": None, "tone": None, "ready": True})
+    if PREPROCESS_MODE == "off":
+        return
+    cv2, np = _import_cv2()
+    if cv2 is None:
+        return
+    n = max(1, end_page - start_page + 1)
+    step = max(1, n // max(1, sample))
+    groups = {"binary": [], "tone": []}
+    for p1 in range(start_page, end_page + 1, step):
+        idx = p1 - 1
+        if idx >= len(doc):
+            break
+        found = largest_embedded_image(doc, doc[idx])
+        if found is None:
+            continue
+        img = cv2.imdecode(np.frombuffer(found[0], dtype=np.uint8),
+                           cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        est, ncomp = _char_px_and_components(g)
+        # 挿絵・扉・白ページは本文1文字サイズの標本にならない。連結成分が
+        # 少ないページを除かないと、600dpiの本でも挿絵ページだけで「濃淡」
+        # グループができ、その中央値（実測9〜12px）で本文ページ以外が
+        # 4倍拡大されてしまう（地下室からのふしぎな旅・霧のむこうで実測）
+        if est is None or est <= 0 or ncomp < PREPROC_MIN_COMPONENTS:
+            continue
+        key = "binary" if _mid_ratio(g) < PREPROC_BINARY_MID else "tone"
+        groups[key].append(est)
+    # 少数派の種別は信用しない。細密な挿絵ページは連結成分が多く本文ページの
+    # ふるいを抜けてしまうため、成分数だけでは「600dpi二値の本の挿絵ページ
+    # （300dpi濃淡で保存されている）」を排除できない（グリックの冒険で
+    # 22%のページが誤って適用された）。表裏で画質が入れ替わる本（白銀の墟）は
+    # 両種別がほぼ半々なので、割合で見れば両立する
+    total = sum(len(v) for v in groups.values())
+    for key, vals in groups.items():
+        if vals and len(vals) >= max(2, total * PREPROC_MIN_GROUP_SHARE):
+            _PREPROC_PLAN[key] = float(np.median(vals))
+    parts = [f"{k}={v:.0f}px" for k, v in
+             (("二値", _PREPROC_PLAN["binary"]), ("濃淡", _PREPROC_PLAN["tone"]))
+             if v]
+    if parts:
+        print("画像前処理: 本文1文字サイズの代表値 " + " / ".join(parts))
+
+
+def _should_preprocess(gray, engine):
+    """前処理を適用すべきか判定し、(採用する1文字px, 適用するか, 理由) を返す。
+
+    実測の根拠（DESIGN_画像前処理.md §5.2）:
+      - 1文字40px以上（600dpi級）: YomiToku -0.09〜+0.09 で効果なし → 触らない
+      - 1bit二値スキャン: YomiToku +0.13〜+0.42 / Vision +0.43 / DocAI +0.18
+        → 全エンジンで適用
+      - 濃淡スキャンで1文字26px未満: YomiToku +0.11〜+0.37 だが
+        Vision -0.17〜-0.05・DocAI +0.10〜-0.20（符号が揃わない＝誤差内）
+        → YomiTokuのみ適用
+      - 濃淡スキャンで1文字26px以上: YomiTokuでも -0.12〜-0.21 → 触らない
+    """
+    key = "binary" if _mid_ratio(gray) < PREPROC_BINARY_MID else "tone"
+    est = _PREPROC_PLAN.get(key)
+    if est is None or est <= 0:
+        # この種別の本文ページが標本に無かった＝挿絵だけの種別。安全側で触らない
+        return None, False, f"{key}の本文ページが無い"
+    if est >= PREPROC_SKIP_CHAR_PX:
+        return est, False, f"1文字{est:.0f}px（高解像度）"
+    if key == "binary":
+        return est, True, f"1文字{est:.0f}px・二値"
+    if engine == "yomitoku" and est < PREPROC_TONE_CHAR_PX:
+        return est, True, f"1文字{est:.0f}px・濃淡"
+    return est, False, f"1文字{est:.0f}px・濃淡（{engine}では改善しない）"
+
+
+def preprocess_array(img, engine):
+    """BGR配列に前処理を適用し、(配列, 適用したか) を返す。
+
+    mode="on" は除外条件を無視して常に適用する（検証用）。
+    """
+    if PREPROCESS_MODE == "off":
+        return img, False
+    cv2, np = _import_cv2()
+    if cv2 is None:
+        return img, False
+    g = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if PREPROCESS_MODE == "on":
+        key = "binary" if _mid_ratio(g) < PREPROC_BINARY_MID else "tone"
+        est = (_PREPROC_PLAN.get(key) or _PREPROC_PLAN.get("binary")
+               or _PREPROC_PLAN.get("tone") or estimate_char_px(g))
+        ok = bool(est and est > 0)
+    else:
+        est, ok, _reason = _should_preprocess(g, engine)
+    if not ok:
+        PREPROCESS_STATS["skipped"] += 1
+        return img, False
+
+    scale = float(np.clip(PREPROC_TARGET_PX / est,
+                          1.0 / PREPROC_MAX_SCALE, PREPROC_MAX_SCALE))
+    out = cv2.resize(g, None, fx=scale, fy=scale,
+                     interpolation=cv2.INTER_CUBIC if scale >= 1
+                     else cv2.INTER_AREA)
+    out = cv2.GaussianBlur(out, (0, 0), PREPROC_SIGMA)
+    PREPROCESS_STATS["applied"] += 1
+    return cv2.cvtColor(out, cv2.COLOR_GRAY2BGR), True
+
+
+def preprocess_image_bytes(image_bytes, engine):
+    """埋め込み画像のバイト列に前処理を適用し、(バイト列, (w, h) or None) を返す。
+
+    適用しなかった場合は元のバイト列をそのまま返す（(…, None)）。
+    **適用しないときに再エンコードしないことが重要**で、これにより
+    --preprocess off の出力は従来と完全に一致する。
+    """
+    if PREPROCESS_MODE == "off":
+        return image_bytes, None
+    cv2, np = _import_cv2()
+    if cv2 is None:
+        return image_bytes, None
+    img = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8),
+                       cv2.IMREAD_COLOR)
+    if img is None:
+        return image_bytes, None
+    out, applied = preprocess_array(img, engine)
+    if not applied:
+        return image_bytes, None
+    ok, buf = cv2.imencode(".png", out)
+    if not ok:
+        return image_bytes, None
+    return buf.tobytes(), (out.shape[1], out.shape[0])
+
+
+def preprocess_report():
+    """処理ログ用の1行サマリ（適用ページが無ければ None）"""
+    a, s = PREPROCESS_STATS["applied"], PREPROCESS_STATS["skipped"]
+    if PREPROCESS_MODE == "off" or a + s == 0:
+        return None
+    return (f"画像前処理: {a}ページに適用 / {s}ページは対象外"
+            f"（1文字{PREPROC_TARGET_PX:.0f}px化＋σ{PREPROC_SIGMA}平滑化）")
+
+
 def ocr_page_with_vision(client, doc, page_index):
     from google.cloud import vision
 
@@ -220,6 +474,12 @@ def ocr_page_with_vision(client, doc, page_index):
     if found is None:
         return None, None
     image_bytes, img_w, img_h = found
+    # 前処理を適用したら、返す img_size も処理後の寸法にする。呼び出し側は
+    # sx = page.rect.width / img_w で座標変換するため、これだけで拡縮が
+    # 自動的に追随する（jisui2epub.py 本体は無改修）
+    image_bytes, new_size = preprocess_image_bytes(image_bytes, "vision")
+    if new_size:
+        img_w, img_h = new_size
 
     response = call_vision_with_retry(client, vision.Image(content=image_bytes))
     return response.full_text_annotation, (img_w, img_h)
@@ -1209,6 +1469,9 @@ def reocr_pdf(input_path, output_path, start_page, end_page, ruby_rescue=True,
     client = vision.ImageAnnotatorClient()
     doc = _open_source_pdf(input_path, output_path)
     end_page = min(end_page, len(doc))
+    # 画像前処理の書籍代表値を先に決める（DESIGN_画像前処理.md）。
+    # ページごとの推定値は挿絵頁やしきい値付近で揺れるため判定に使えない
+    prepare_preprocess(doc, start_page, end_page)
     API_UNITS["page"] = API_UNITS["rescue"] = 0
     for k in GAP_STATS:
         GAP_STATS[k] = 0
@@ -1350,6 +1613,9 @@ def reocr_pdf(input_path, output_path, start_page, end_page, ruby_rescue=True,
                 _atomic_save(doc, output_path)
                 print(f"  [チェックポイント保存: {output_path}"
                       f"（APIユニット累計 {API_UNITS['page'] + API_UNITS['rescue']}）]")
+                rep = preprocess_report()
+                if rep:
+                    print(f"  [{rep}]")
         _flush_rescue()
     finally:
         # 例外時も直近のチェックポイント以降の分をできる限り保存する。
@@ -1381,6 +1647,9 @@ def reocr_pdf(input_path, output_path, start_page, end_page, ruby_rescue=True,
     if GAP_STATS["docai_pages"]:
         print(f"Document AI課金ページ数: {GAP_STATS['docai_pages']}"
               f"（$1.50/1000ページ・無料枠なし）")
+    rep = preprocess_report()
+    if rep:
+        print(rep)
     print(f"保存しました: {output_path}")
 
 
@@ -1410,7 +1679,14 @@ def main():
              "再OCRして回収（$1.50/1000ページ）、使えなければ旧OCR文字で補完 / "
              "old=常に旧OCR文字で補完（無料） / off=回収しない（既定: auto）",
     )
+    parser.add_argument(
+        "--preprocess", choices=["auto", "on", "off"], default="auto",
+        help="OCR前の画像前処理（本文1文字を32px相当に拡縮＋σ1.2平滑化）。"
+             "auto=劣化したスキャンのページだけ自動で適用 / on=常に適用 / "
+             "off=無効（従来と完全に同じ出力）（既定: auto）",
+    )
     args = parser.parse_args()
+    set_preprocess_mode(args.preprocess)
 
     if args.output:
         output_path = args.output

@@ -58,6 +58,10 @@ from vision_reocr import (
     _snap_column_x,
     insert_invisible_text,
     largest_embedded_image,
+    preprocess_image_bytes,
+    prepare_preprocess,
+    preprocess_report,
+    set_preprocess_mode,
 )
 
 # プロセッサ自動作成時の表示名
@@ -139,6 +143,14 @@ def ocr_page_with_docai(client, processor_name, doc, page_index):
     best = max(imgs, key=lambda im: (im[2] or 0) * (im[3] or 0))
     ext = doc.extract_image(best[0])["ext"]
     mime = _MIME.get(ext, "image/png")
+
+    # 画像前処理（DESIGN_画像前処理.md）。適用したら img_size と mime も
+    # 処理後（PNG）のものに差し替える。呼び出し側の座標変換は img_size 基準
+    # なので、これだけで拡縮が追随する
+    image_bytes, new_size = preprocess_image_bytes(image_bytes, "docai")
+    if new_size:
+        img_w, img_h = new_size
+        mime = "image/png"
 
     request = documentai.ProcessRequest(
         name=processor_name,
@@ -239,6 +251,9 @@ def reocr_pdf(client, processor_name, input_path, output_path, start_page, end_p
     # 詳細は vision_reocr._open_source_pdf）
     doc = _open_source_pdf(input_path, output_path)
     end_page = min(end_page, len(doc))
+    # 画像前処理の書籍代表値を先に決める（DESIGN_画像前処理.md）。
+    # ページごとの推定値は挿絵頁やしきい値付近で揺れるため判定に使えない
+    prepare_preprocess(doc, start_page, end_page)
 
     # 書き戻す本文フォントサイズの基準値: DocAI実測列幅と旧OCR申告の大きい方
     # （旧OCRページと混在しても本文がルビ誤判定されない安全側。CLAUDE.md参照）
@@ -321,6 +336,9 @@ def reocr_pdf(client, processor_name, input_path, output_path, start_page, end_p
             if i % CHECKPOINT_EVERY == 0:
                 _atomic_save(doc, output_path)
                 print(f"  [チェックポイント保存: {output_path}]")
+                rep = preprocess_report()
+                if rep:
+                    print(f"  [{rep}]")
     finally:
         _atomic_save(doc, output_path, final=True)
         doc.close()
@@ -330,6 +348,9 @@ def reocr_pdf(client, processor_name, input_path, output_path, start_page, end_p
         f"完了: {processed}ページ処理 / "
         f"文字数{total_chars}（うちルビ{total_ruby}） / {elapsed:.0f}秒"
     )
+    rep = preprocess_report()
+    if rep:
+        print(rep)
     print(f"保存しました: {output_path}")
 
 
@@ -359,7 +380,14 @@ def main():
         "--create-processor", action="store_true",
         help="OCRプロセッサを新規作成して終了（初回セットアップ用）",
     )
+    parser.add_argument(
+        "--preprocess", choices=["auto", "on", "off"], default="auto",
+        help="OCR前の画像前処理（本文1文字を32px相当に拡縮＋σ1.2平滑化）。"
+             "auto=劣化したスキャンのページだけ自動で適用 / on=常に適用 / "
+             "off=無効（従来と完全に同じ出力）（既定: auto）",
+    )
     args = parser.parse_args()
+    set_preprocess_mode(args.preprocess)
 
     client = make_client(args.location)
 
