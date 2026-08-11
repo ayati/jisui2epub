@@ -43,7 +43,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -703,6 +703,378 @@ def classify_marginals(pages, body_size, horizontal=False):
     return drop, headings, body_top, body_bottom, hashira_keys
 
 
+# ── 章頭マーカー（章番号・第N章）の検出 ───────────────────────
+#
+# 「本文と同サイズで、柱とも無関係な章頭マーカー」を拾う経路が無いために
+# 章前の改ページ・目次項目・ジャンプ先がまとめて落ちる本がある
+# （DESIGN_章頭改ページ.md §1）。emit_heading は見出しの前に必ず
+# emit_pagebreak を呼ぶので、マーカーさえ拾えれば改ページも自動で付く。
+#
+# 実測（伯爵夫人は超能力・全14章）: サイズ比 12.9/12.3=1.05 で is_big の
+# 1.18 に届かず、柱は書名なので is_hashira_head も不発。
+# 実測（風の万里黎明の空上・全27節）: 節番号「1」は1文字なので HLine 化し、
+# NOMBRE_RE の無条件 drop・norm_hashira("1")="" による柱 drop・3字未満の
+# 断片 drop の3重に落ちる。
+
+CHAPTER_MARK_MIN_INDENT = 2.0    # 本文天からこの字数以上下がっていること
+CHAPTER_MARK_CLUSTER = 0.6       # 同一クラスタとみなす y0 差（本文サイズ比）
+CHAPTER_MARK_MIN_CLUSTER = 3     # 番号型の採用に必要なクラスタ件数
+# 番号型は算用数字のみ。漢数字の「一」は罫線・線画のOCR化けの定番で、
+# 章番号と原理的に区別できない（グリックで候補50件・最大クラスタ11件を実測）
+_ARABIC_MARK_RE = re.compile(r'^[0-9０-９]{1,2}$')
+
+
+TOBIRA_SIZE_RATIO = 1.35     # 章題の活字が本文の何倍以上か
+TOBIRA_GAP_PITCH = 2.5       # 章題列と本文列の間に空く列数（行送り単位）
+TOBIRA_MIN_COUNT = 3         # 書籍内でこれだけ揃って初めて採用する
+TOBIRA_MAX_LEN = 8           # 章題の長さ上限（十章（承前）＝6字を通す）
+# 章題なら必ず含む文字（漢数字・算用数字・章話部節編幕・序終）。
+# 全文字をホワイトリストにすると OCR 破損で落ちる（「十＝」＝十二章・
+# 「十垂」＝十六章を実測で取りこぼした）。逆に無条件にすると巻末広告の
+# 大活字（「脅噴噴」「観鶴蝋」）が入るので、1文字でも含むことを要求する
+_TOBIRA_CORE_RE = re.compile(r'[0-9０-９一二三四五六七八九十百千章話部節編幕序終]')
+
+
+def _detect_tobira_heads(pages, drop, body_size, body_top, body_bottom):
+    """章扉型の章題（ページ天右の大活字＋そのあと数列ぶんの空き）を拾う。
+
+    風の万里黎明の空 下（講談社X文庫）の章題は「十章」「二十一章」のように
+    ページ最右列に本文の1.44〜1.64倍の活字で**天付き**に置かれ、次の本文列
+    との間が **行送り6.0本分**（実測 76〜78pt／pitch 12.7）空く。既存の
+    is_big は `indented`（本文天から0.6字以上下がる）を要求するため天付きの
+    章題を拾えず、`len(cells) >= 4` にも2〜3字の章題は届かない。字下げの
+    代わりに**横方向の空き**を見るのがこの型の決め手（ユーザーの言う
+    「空行があってから本文」）。
+
+    テキスト条件は緩くする（`valid_heading_item` は通さない）。実測で
+    「十＝」（十二章）「十垂」（十六章）「十章（承前）」のようにOCRが崩れる
+    章題が13章中3つあり、厳しくすると章の3割を落とす。誤検出は
+    「書籍内で3件以上」の一致条件と、後続の目次照合が抑える。
+    """
+    pitch_src, cand = [], []
+    for pg in pages:
+        vs = [v for v in pg.vlines
+              if (pg.num, id(v)) not in drop and v.text.strip()]
+        xs = [v.xc for v in vs]
+        pitch_src += [a - b for a, b in zip(xs, xs[1:])
+                      if 0 < a - b < body_size * 4]
+        if len(vs) < 2:
+            continue
+        v = vs[0]                       # ページ最右列（紙面の読み始め）
+        if v.size < body_size * TOBIRA_SIZE_RATIO:
+            continue
+        if (v.y1 - v.y0) > (body_bottom - body_top) * 0.5:
+            continue                    # 長い列＝本文
+        if v.y0 > body_top + body_size * CHAPTER_MARK_MIN_INDENT:
+            continue                    # 深い字下げは detect_chapter_marks 側
+        text = re.sub(r'[\s　]+', "", v.text.strip())
+        if not text or len(text) > TOBIRA_MAX_LEN:
+            continue
+        if not _TOBIRA_CORE_RE.search(text):
+            continue
+        cand.append((pg.num, v, text, v.xc - vs[1].xc))
+    if len(cand) < TOBIRA_MIN_COUNT:
+        return []
+    pitch = statistics.median(pitch_src) if pitch_src else body_size * 1.75
+    hits = [(num, v, text) for num, v, text, gap in cand
+            if gap >= pitch * TOBIRA_GAP_PITCH]
+    if len(hits) < TOBIRA_MIN_COUNT:
+        return []
+    return [((num, id(v)), text) for num, v, text in hits]
+
+
+def detect_chapter_marks(pages, drop, body_size, body_top, body_bottom,
+                         horizontal=False, toc_pages=None):
+    """章頭マーカー行を書籍全体から特定する。
+
+    戻り値: {(page_num, id(line)): text}
+    条件は「本文帯の中・深い字下げ・短い行」で、テキスト種別ごとに採否が違う:
+      章題型（第N章・序章・終章…）／番号型（算用数字1〜2桁）とも、
+    **y0 が揃う候補が書籍全体で3件以上あるクラスタ**に属するときだけ採用する。
+    章頭マーカーは同じ字下げ位置に繰り返し現れるのが本質で、これが最も強い
+    分離条件になる（伯爵夫人の14章は y0=84〜86、風の万里の27節は y0≈90）。
+    章題型を単独採用にすると印刷目次ページの見出し行を拾う（グリックの
+    目次 p6 の「第１部」を実測。目次が本文に流れ込み実章5個が失われた）。
+    加えて同一ページに2件以上あるものは目次ページとみなしページごと捨てる。
+    横書きモードは対象外（転置後の幾何が別物で実測サンプルも無い）。
+    """
+    if horizontal:
+        return {}
+    toc_pages = toc_pages or {}
+    body_h = max(body_bottom - body_top, body_size)
+    chap, nums = [], []
+    per_page_chap = Counter()
+    for pg in pages:
+        for ln in list(pg.vlines) + list(pg.hlines):
+            text = re.sub(r'[\s　]+', "", ln.text.strip())
+            if not text or len(text) > HEADING_MAX_LEN:
+                continue
+            if (ln.y1 - ln.y0) > body_h * 0.5:
+                continue                      # 長い行＝本文
+            lyc = (ln.y0 + ln.y1) / 2
+            if lyc < body_top or lyc > body_bottom:
+                continue                      # 柱・ノンブル
+            if ln.y0 - body_top < body_size * CHAPTER_MARK_MIN_INDENT:
+                continue                      # 字下げが浅い＝本文の続き
+            if is_junk_line(text):
+                continue                      # 挿絵・罫線ノイズ
+            if _single_chapter_heading(text):
+                chap.append((pg.num, ln, text))
+                per_page_chap[pg.num] += 1
+            elif _ARABIC_MARK_RE.match(text):
+                nums.append((pg.num, ln, text))
+
+    tobira = dict(_detect_tobira_heads(pages, drop, body_size, body_top,
+                                       body_bottom))
+    marks = dict(tobira)
+    # 章扉のラベルを印刷目次の表記で置き換える。OCRが崩れた章題は difflib では
+    # 直せない（`十＝`対`十二章`＝比0.40、照合の門は0.75/0.85）が、ページ数から
+    # 求めた位置との一致なら確実に直せる。実測（下巻）: p40 は OCR が「一」を
+    # 落として `十章` になっていたが正しくは十一章、p73 の `十＝`＝十二章、
+    # p212 の `十垂`＝十六章。DESIGN_章頭改ページ.md §4.8
+    n_fix = 0
+    for (num, ident), text in list(tobira.items()):
+        title = toc_pages.get(num) or toc_pages.get(num - 1) \
+            or toc_pages.get(num + 1)
+        if title and title != text:
+            marks[(num, ident)] = title
+            n_fix += 1
+    if n_fix:
+        print(f"章題を印刷目次で修復: {n_fix} 件")
+
+    for cands in (chap, nums):
+        # y0 昇順の逐次併合でクラスタリングする。固定ビンだと境界で割れる
+        # （伯爵夫人の14章は y0=84.2 と 85.7 に分かれ 9件/5件になる）
+        groups = []
+        for item in sorted(cands, key=lambda t: t[1].y0):
+            if groups and item[1].y0 - groups[-1][-1][1].y0 <= \
+                    body_size * CHAPTER_MARK_CLUSTER:
+                groups[-1].append(item)
+            else:
+                groups.append([item])
+        for g in groups:
+            if len(g) < CHAPTER_MARK_MIN_CLUSTER:
+                continue
+            for num, ln, text in g:
+                if per_page_chap[num] < 2:
+                    marks[(num, id(ln))] = text
+    return marks
+
+
+# ── 印刷目次のページ数から章の物理ページを求める ────────────────────
+#
+# DESIGN_目次生成 §0 は「ページ数の列は漢数字ジャンク化して使えない」として
+# 印刷目次からの直接生成を断念しているが、**ページ数の列は復元できる**。
+# OCRは桁の切れ目なくページ数を1本で返すが（風の万里 下 p5 の
+# '369361343318296273239210'）、章のページ数は単調なので1〜3桁で分割して
+# 単調列になる解を探せば一意に戻る。ノンブルのオフセットを足せば物理ページに
+# なる。実測（下巻）: 予測 13 件のうち **12 件が誤差0** で章頭と一致。
+# 詳細は DESIGN_章頭改ページ.md §4.8。
+
+TOC_SCAN_HEAD = 0.25          # 印刷目次を探す範囲（先頭のこの割合）
+NOMBRE_OFFSET_MIN_RATIO = 0.5  # ノンブルのオフセットがこの割合で一致しないと使わない
+
+
+def _split_monotone_pages(s, n):
+    """数字列 s を n 個の1〜3桁に分け、単調になる解を返す（無ければ None）。"""
+    found = []
+
+    def rec(i, acc):
+        if found:
+            return
+        if len(acc) == n:
+            if i == len(s):
+                found.append(list(acc))
+            return
+        rest = len(s) - i
+        if rest < n - len(acc) or rest > (n - len(acc)) * 3:
+            return
+        for k in (1, 2, 3):
+            if i + k > len(s):
+                break
+            v = int(s[i:i + k])
+            if v == 0:
+                continue
+            if len(acc) >= 2:
+                up = acc[1] > acc[0]
+                if (up and v <= acc[-1]) or (not up and v >= acc[-1]):
+                    continue
+            rec(i + k, acc + [v])
+            if found:
+                return
+
+    rec(0, [])
+    return found[0] if found else None
+
+
+def estimate_nombre_offset(pages, drop):
+    """「物理ページ番号 − ノンブル値」の最頻オフセット。信用できなければ None。
+
+    一致が全ページの NOMBRE_OFFSET_MIN_RATIO 未満なら諦める。実測で
+    下巻は +2 が 319/387（82%）と圧倒的だが、上巻（素のScanSnap OCR）は
+    -7 が 40 / -11 が 29 / -13 が 28 と割れて 11% しかない。決まらない本で
+    無理に使うと章位置を丸ごと外すので、使わない方に倒す。
+    """
+    off = Counter()
+    for pg in pages:
+        for ln in list(pg.vlines) + list(pg.hlines):
+            if (pg.num, id(ln)) not in drop:
+                continue
+            t = re.sub(r'\s+', "", ln.text.strip())
+            if re.fullmatch(r'[0-9０-９]{1,4}', t):
+                off[pg.num - int(unicodedata.normalize("NFKC", t))] += 1
+    if not off:
+        return None
+    best, hits = off.most_common(1)[0]
+    return best if hits >= len(pages) * NOMBRE_OFFSET_MIN_RATIO else None
+
+
+def _toc_entries_and_numbers(pg):
+    """印刷目次ページから (章題エントリ, 数字の塊) を x 位置つきで取り出す。"""
+    entries, blobs, label = [], [], False
+    for ln in list(pg.vlines) + list(pg.hlines) + list(pg.rubies):
+        t = re.sub(r'[\s　]+', "", ln.text.strip())
+        if not t:
+            continue
+        if _TOC_LABEL_RE.match(t):
+            label = True
+            continue
+        if re.fullmatch(r'[0-9０-９]{1,40}', t):
+            blobs.append((ln.x0, ln.x1,
+                          unicodedata.normalize("NFKC", t)))
+        elif len(t) <= HEADING_MAX_LEN and (
+                _NUMONLY_CHAPTER_RE.fullmatch(t)
+                or _CHAPTER_HEAD_RE.match(t)
+                or _BACKMATTER_KEEP_RE.search(t)):
+            entries.append(((ln.x0 + ln.x1) / 2, t))
+    return entries, blobs, label
+
+
+def detect_toc_chapter_pages(pages, drop, body_size, horizontal=False):
+    """印刷目次のページ数から {物理ページ(0基点): 章題} を得る。使えなければ {}。
+
+    章題とページ数の対応は**x 位置**でとる（読み順では復元できない）。
+    実測（下巻 p4）: ルビ '172132103' は x=34〜81 に印字され、その範囲にある
+    章題列は 十三章(76.5)・十四章(58)・十五章(39.5) の3本。3分割した
+    [103,132,172] を右→左（＝章の順）に配れば正しく対応する。
+    数の少ない塊（'71'・'38'）は覆う章題1本にそのまま付く。
+    """
+    if horizontal:
+        return {}
+    offset = estimate_nombre_offset(pages, drop)
+    if offset is None:
+        return {}
+    limit = len(pages) * TOC_SCAN_HEAD
+    out = {}
+    for pg in pages:
+        if pg.num > limit:
+            break
+        entries, blobs, label = _toc_entries_and_numbers(pg)
+        if len(entries) < 3 or not blobs:
+            continue
+        if not label and len(entries) < 4:
+            continue              # 目次ラベルが無いなら章題4本以上を要求
+        entries.sort(key=lambda e: -e[0])          # 右→左＝章の順
+        for x0, x1, s in blobs:
+            cov = [e for e in entries
+                   if x0 - body_size <= e[0] <= x1 + body_size]
+            if not cov:
+                continue
+            if len(cov) == 1 and len(s) <= 3:
+                vals = [int(s)]
+            else:
+                vals = _split_monotone_pages(s, len(cov))
+            if not vals:
+                continue
+            for (_, title), v in zip(cov, sorted(vals)):
+                p = v + offset
+                if 0 <= p < len(pages):
+                    out[p] = title
+    return out
+
+
+# ── 後付け（巻末広告・奥付）の始まりの検出 ───────────────────────
+
+BACKMATTER_TAIL = 0.15        # 後付けの探索範囲（末尾のこの割合）
+BACKMATTER_DEEP = 3.0         # 本文天からこの字数以上下がった列を「深い」とする
+BACKMATTER_DEEP_FRAC = 0.35   # 深い列がこの割合以上なら別組みページ＝広告
+BACKMATTER_MIN_COLS = 5       # 列がこれ未満のページ（扉・奥付）は判定しない
+BACKMATTER_MIN_RUN = 3        # 別組みページがこれだけ連続して初めて後付けとする
+
+
+# 【試行して撤回】ノンブルの連番から本文終端を求める案
+# （「ノンブル値 − ページ番号」の最頻オフセットに一致するページ群を本文とする）。
+# 伯爵夫人では 330/355 ページが一致して正しく p347 を出すが、
+#   - Vision 再OCR本ではノンブルが本文列に吸着して単独行にならない
+#     （風の万里は 368 ページ中 23 しか取れず判定不能）
+#   - ノンブルを持たない後付け章を本文から切り落とす
+#     （ほんものの魔法使で p294 と誤判定し、公式 nav にある巻末解説
+#      「「ほんもの」の魔法／井辻朱美」を目次から落とすのを実測）
+# の2点で信用できない。列の天揃い（_body_end_by_layout）だけで両書とも
+# 正しく出るため、この信号は採用しない。
+
+
+def _body_end_by_layout(pages, drop, body_size, body_top, lo):
+    """列の天が揃わなくなる最初のページの手前（0基点）。無ければ None。
+
+    縦組み本文の列はページ天から始まる（段落頭の字下げでも1字）。巻末広告は
+    1ページに書名ブロックと紹介文ブロックを段違いに積むため、天から大きく
+    下がった列が半数近くを占める。実測の分離は明確:
+
+        伯爵夫人  本文 0.00〜0.06 / 広告 0.58〜0.64（p348〜352）
+        風の万里  本文 0.00〜0.15 / 広告 0.67〜1.00（p352〜366）
+
+    列数そのものは判定に使えない（伯爵夫人は本文18列に対し広告21〜25列で
+    中央値の1.5倍に届かない）。
+
+    単発ページでは発火させず BACKMATTER_MIN_RUN ページ連続を要求する。
+    挿絵が天半分を占めるページも「深い列」を量産するため、単発を許すと
+    本文の途中で切ってしまう（グリックで p315 を後付けと誤判定し、
+    実章「18 ねむりの恐怖」〜「21 旅の終わり」等5個を失うのを実測）。
+    巻末広告は必ず複数ページ続く（伯爵夫人5・風の万里15・グリック8）。
+    列の少ないページ（扉・白ページ）は連続を切らない中立扱いにする。
+    """
+    run_start = None
+    run_len = 0
+    for pg in sorted((p for p in pages if p.num >= lo), key=lambda p: p.num):
+        vs = [v for v in pg.vlines
+              if (pg.num, id(v)) not in drop and v.text.strip()
+              and not is_junk_line(v.text.strip())]
+        if len(vs) < BACKMATTER_MIN_COLS:
+            continue                   # 扉・奥付・白ページは判定しない
+        deep = sum(1 for v in vs if v.y0 > body_top + body_size * BACKMATTER_DEEP)
+        if deep / len(vs) >= BACKMATTER_DEEP_FRAC:
+            if run_start is None:
+                run_start = pg.num
+            run_len += 1
+            if run_len >= BACKMATTER_MIN_RUN:
+                return run_start - 1
+        else:
+            run_start, run_len = None, 0
+    return None
+
+
+def detect_body_end(pages, drop, body_size, body_top, horizontal=False):
+    """本文の最終ページ（0基点）を返す。判定できなければ None。
+
+    印刷目次の検出に依存しないので、目次のOCRが崩れた本（風の万里の
+    「序1章章章章章二14393633311四三」）でも巻末広告を見出しから外せる
+    （DESIGN_章頭改ページ.md §3-D）。
+
+    切り取りは末尾 BACKMATTER_TAIL の範囲に限る。誤って本文を切ると実章の
+    見出しが消えるので、少しでも手前に出た判定は捨てる。
+    """
+    if horizontal:
+        return None                    # 段組の帯分割で列の意味が変わる
+    n = len(pages)
+    if n < 20:
+        return None
+    nums = sorted(pg.num for pg in pages)
+    lo = nums[int(n * (1 - BACKMATTER_TAIL))]
+    end = _body_end_by_layout(pages, drop, body_size, body_top, lo)
+    return end if end is not None and lo <= end < nums[-1] else None
+
+
 # ── 画像ページ（挿絵・口絵・画像主体の章頭）の検出と抽出 ──────────────
 
 def _page_ink_ratio(doc_page):
@@ -1073,14 +1445,20 @@ def split_columns(pages):
 
 def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                   hashira_keys=None, indent=True, verbose=False,
-                  image_pages=None, horizontal=False):
+                  image_pages=None, horizontal=False,
+                  chapter_marks=None, body_end=None):
     """全ページから青空文庫形式の本文を組み立てる。
     image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
     horizontal: 横書きモード。見出しの飾り囲み剥がしと見出し条件の強化
         （2〜3文字の大活字をテキスト僅少ページで見出し化しない）を行う
+    chapter_marks: {(page_num, id(line)): text} — detect_chapter_marks の結果。
+        drop より優先し、本文行と同じ読み順で見出しとして発行する
+    body_end: 本文の最終ページ番号（detect_body_end）。これより後ろのページでは
+        後付け章語（解説・あとがき等）以外の見出しを発行しない
     """
     hashira_keys = hashira_keys or {}
     image_pages = image_pages or {}
+    chapter_marks = chapter_marks or {}
     out = []             # 段落のリスト（文字列）
     cur = ""             # 組み立て中の段落
     prev_line_short = True   # 直前の行が途中で終わった（段落末尾）か
@@ -1158,9 +1536,32 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
     left_edge = sorted(page_min_x)[len(page_min_x) // 4] if page_min_x else 0.0
     prev_page_short = False   # 直前の本文ページが左端まで達せず終わったか
 
+    n_marks = [0]
+    n_backdrop = [0]
+
     for pg in pages:
-        vlines = [v for v in pg.vlines if (pg.num, id(v)) not in drop]
-        hls = [h for h in pg.hlines if (pg.num, id(h)) not in drop]
+        # 章頭マーカーは drop より優先して抜き出す（ノンブル・短い断片として
+        # 落とされているのが常態）。発行位置に使うソートキーは本文行と同じ
+        # 「紙面の右→左」＝ -xc
+        page_marks = []
+        vlines, hls = [], []
+        kept_v = []          # マーカーを含む「残った縦行」＝紙面上の列の並び
+        for v in pg.vlines:
+            key = (pg.num, id(v))
+            if key in chapter_marks:
+                page_marks.append((-v.xc, chapter_marks[key]))
+                kept_v.append(v)
+            elif key not in drop:
+                vlines.append(v)
+                kept_v.append(v)
+        for h in pg.hlines:
+            key = (pg.num, id(h))
+            if key in chapter_marks:
+                page_marks.append((-(h.x0 + h.x1) / 2, chapter_marks[key]))
+            elif key not in drop:
+                hls.append(h)
+        page_marks.sort()
+        n_marks[0] += len(page_marks)
 
         # 帯分割された仮想ページ（横書き段組）は帯ローカルの本文範囲を使う。
         # 特に段落末尾判定（ends_short）はグローバル右端との比較のままだと
@@ -1218,9 +1619,13 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                       text[-1] not in "。」！？、）』…")
             # 章見出しは通常の段落字下げ（1字）より深く下がっている
             deep_indented = v.y0 > loc_top + body_size * 1.5
+            # ページ右端の行のみ。判定には章頭マーカーを含む列の並び
+            # （kept_v）を使う。vlines[0] だとマーカーを抜いた分だけ
+            # 2列目が「右端」に繰り上がり、柱と同文の書名列が偽の章見出しに
+            # 昇格する（グリックで「グリックの冒険」を実測）
             is_hashira_head = (not toc_like and v in hashira_match and
                                deep_indented and
-                               v is vlines[0])  # ページ右端の行のみ
+                               v is kept_v[0])
             if is_big or is_hashira_head:
                 heading_lines.append((-v.xc, v.text))
             else:
@@ -1260,6 +1665,15 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         long_items = [t for t in page_headings if len(t) > HEADING_MAX_LEN]
         page_headings = [t for t in page_headings if len(t) <= HEADING_MAX_LEN]
 
+        # 後付け（巻末広告・奥付）の見出し化を止める。印刷目次の検出に
+        # 依存する DESIGN_目次生成 §3-E の巻末降格は、目次のOCRが崩れた本
+        # （風の万里の「序1章章章章章二14393633311四三」）では発火しない
+        if body_end is not None and pg.num > body_end:
+            keep = [t for t in page_headings if _BACKMATTER_KEEP_RE.search(t)]
+            n_backdrop[0] += len(page_headings) - len(keep)
+            page_headings = keep
+            page_marks = []
+
         # ── 画像ページ（挿絵・口絵・章頭）: 図タグを改ページに挟んで挿入 ──
         # 章頭ページの見出しテキストは目次のため先に発行する
         # （改ページ → 見出し → 画像 → 本文 の順）。
@@ -1269,7 +1683,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         # （章扉の飾り書体はOCRが崩れやすく、見出し判定から漏れることがある）
         if pg.num in image_pages:
             emit_pagebreak()
-            kept = [t for t in page_headings
+            kept = [t for _, t in page_marks] + \
+                   [t for t in page_headings
                     if matches_hashira(t) or _single_chapter_heading(t)]
             if not kept:
                 for v in vlines:
@@ -1292,7 +1707,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         # ただし最終行がページ下端まで達していた場合（prev_line_short=False）は
         # 段落が継続中＝挿絵などでページ左側が空いただけなので改ページしない。
         # （見出しページ自身の改ページは emit_heading 側で重複なく処理される）
-        if page_headings or long_items or body_lines:
+        if page_headings or long_items or body_lines or page_marks:
             if prev_page_short and prev_line_short:
                 emit_pagebreak()
             prev_page_short = False
@@ -1304,7 +1719,9 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
             out.append(("　" if indent else "") + t)
 
         if not body_lines:
-            if page_headings or long_items:
+            for _, t in page_marks:
+                emit_heading(t)
+            if page_headings or long_items or page_marks:
                 # 章扉など本文のないページ → 次の本文の前で改ページする
                 # （帯分割の非最終帯は同一紙面内なので改ページしない）
                 prev_page_short = not pg.no_break
@@ -1319,7 +1736,18 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         eff_top = max(loc_top, page_top) if page_top < loc_top + body_size * 3 \
             else page_top
 
-        for v in body_lines:
+        # 章頭マーカーは本文行と同じ読み順（紙面の右→左）で発行する。
+        # ページ先頭にまとめて出すと、ページ途中の列から始まる節
+        # （風の万里 p23 の「3」＝ xc 70.5、その右 96 までが前節の末尾）が
+        # 前節より前に出て本文の順序が壊れる。同キーではマーカーを先に出す
+        items = sorted([(-v.xc, 0, v) for v in body_lines] +
+                       [(k, 1, t) for k, t in page_marks],
+                       key=lambda it: (it[0], -it[1]))
+        for _, kind, obj in items:
+            if kind:
+                emit_heading(obj)
+                continue
+            v = obj
             cell = v.cell_height() or body_size
             indent_depth = v.y0 - eff_top
             starts_indented = indent_depth > cell * 0.55
@@ -1341,6 +1769,10 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
     _demote_image_only_headings(out)
     if junk_count[0]:
         print(f"挿絵ノイズ除去: {junk_count[0]} 行")
+    if n_marks[0]:
+        print(f"章頭マーカー: {n_marks[0]} 個")
+    if n_backdrop[0]:
+        print(f"後付け見出し抑止: {n_backdrop[0]} 個")
     return "\n".join(out)
 
 
@@ -1463,6 +1895,8 @@ _BACKMATTER_DROP_RE = re.compile(
     r'参考文献|初出|謝辞|付録|年表|索引|奥付|発刊|定価|本体[0-9０-９]|'
     r'[0-9０-９]円|ISBN|株式会社|印刷|製本|カバー|装[丁幀画]')
 _LEADNUM_RE = re.compile(r'^(第?)([0-9０-９]{1,3})([章話部]|[　\s])?')
+# 題を持たない裸の番号見出し＝章内の節番号（detect_chapter_marks の番号型）
+_SECTION_NUM_RE = re.compile(r'[0-9０-９]{1,2}')
 _ZEN2HAN = str.maketrans("０１２３４５６７８９", "0123456789")
 
 # 章番号（章の序数）抽出。第N章・その N（危機その二）・行頭裸番号に対応。
@@ -1542,6 +1976,11 @@ def _heading_fuzzy_score(a, b):
     return r
 
 
+# 題を持たない番号だけの章題（十章・二十一章・第3話・序章・終章）
+_NUMONLY_CHAPTER_RE = re.compile(
+    r'第?[0-9０-９一二三四五六七八九十百千]+[章話部節編幕]|[序終][章話]')
+
+
 def _toc_entry_of_line(line):
     """目次セグメントの1行を章題エントリに正規化する。エントリでない行は
     None。ルビ（ページ数の巻き込み等ジャンクが多い）と末尾に付いた
@@ -1550,6 +1989,12 @@ def _toc_entry_of_line(line):
     if (not s or s.startswith("［＃") or _TOC_LABEL_RE.match(s)
             or is_junk_line(s)):
         return None
+    # 題を持たない番号だけの章題（風の万里 下の「十章」「二十一章」・「終章」）は
+    # そのまま返す。以降のページ番号除去・core 判定にかけると、数字を落とした
+    # 残りが「章」1文字になって棄却され、完全に読めている印刷目次が丸ごと
+    # 使えなくなる（下巻は全14エントリがこの形）
+    if _NUMONLY_CHAPTER_RE.fullmatch(s):
+        return s
     # 末尾のページ番号（漢数字・数字の連なり）を除去。
     # 「一にお芝居」のような先頭の漢数字は残る
     s = re.sub(r'[0-9０-９一二三四五六七八九十百千〇=＝・．\s　]+$', '', s)
@@ -1567,8 +2012,16 @@ def refine_headings_with_toc(body, book_title, hashira_keys=None,
     hashira_keys = hashira_keys or {}
     out = body.split("\n")
 
+    # 裸の番号見出し（章内の節番号「１」「２」…）は章ではないので、目次照合の
+    # 機構から丸ごと外す。章として扱うと:
+    #   - 章番号の連番再構成に巻き込まれて別の数字に化ける
+    #     （風の万里の「２」が巻末の数字ジャンクから外挿されて「216」に）
+    #   - 柱重複の畳み込み（DESIGN_目次生成 §3-D）が誤発火して本文を消す
+    #     （黒牢城で畳み込み17→66に膨れ、各章の書き出し「冬の北摂に戦雲が
+    #      たなびく。」「夏は死の季節である。」等が丸ごと欠落するのを実測）
     heads = [i for i, ln in enumerate(out)
-             if (m := _MIDASHI_LINE_RE.match(ln)) and not m.group(2)]
+             if (m := _MIDASHI_LINE_RE.match(ln)) and not m.group(2)
+             and not _SECTION_NUM_RE.fullmatch(_norm_t(m.group(1)))]
     if not heads:
         return body, {}
 
@@ -2011,9 +2464,14 @@ def _renumber_headings(out, head_idx, info, breaks=()):
         else:
             rest = title[mnum.end():].strip("　 ") if mnum else title
             evidence, toc_ok = num is not None, False
-        # 「第一章」等の漢数字番号付き・あとがき類・回収予定行は番号対象外
+        # 「第一章」等の漢数字番号付き・あとがき類・回収予定行は番号対象外。
+        # 題を持たない裸の番号見出し（章内の節番号「１」「２」…）も対象外に
+        # する。章ごとに 1,2,3 と振り直されるのが普通で通し番号ではなく、
+        # アンカーにすると巻末の数字ジャンクから外挿されて壊れる
+        # （風の万里で「２」が「216」に化けるのを実測）
         no_num = bool(virtual or _UNNUMBERED_RE.search(rest[:10])
-                      or _CHAPTER_HEAD_RE.match(rest))
+                      or _CHAPTER_HEAD_RE.match(rest)
+                      or (num is not None and not rest))
         chapters.append([i, rest, num, fmt, evidence, toc_ok, no_num, virtual])
 
     anchors = []    # (chapters内位置, 番号)
@@ -2542,35 +3000,52 @@ def parse_pages_arg(arg, npages):
 
 
 # OCR 方式タグ（ファイル名末尾に付けた運用で、著者名へ混入するのを防ぐ）
-_METHOD_TAGS = ("vision", "docai", "ocr")
+_METHOD_TAGS = ("vision", "docai", "yomitoku", "ocr", "scansnap")
+
+
+def _is_method_tag(name: str) -> bool:
+    return name.strip().lower() in _METHOD_TAGS
 
 
 def _strip_method_tag(name: str) -> str:
-    """著者名末尾の OCR 方式タグ（例 「_vision」「-docai」）とスキャン日を除去する。
+    """著者名末尾の OCR 方式タグ（例 「_vision」「-yomitoku」）とスキャン日を除去する。
     既知タグのみを対象とし、未知の末尾は著者名の一部として残す（安全側）。
-    スキャン日は「堀内永人20241221」のような6桁以上の連続数字（人名には出ない）。"""
-    low = name.lower()
-    for sep in ("_", "-"):
-        for tag in _METHOD_TAGS:
-            suf = sep + tag
-            if low.endswith(suf):
-                name = name[:-len(suf)].strip()
-                low = name.lower()
+    スキャン日は「堀内永人20241221」のような6桁以上の連続数字（人名には出ない）。
+    タグが複数付いた名前（「_vision_docai」）にも対応するため、
+    剥がせなくなるまで繰り返す。"""
+    changed = True
+    while changed:
+        changed = False
+        low = name.lower()
+        for sep in ("_", "-"):
+            for tag in _METHOD_TAGS:
+                suf = sep + tag
+                if low.endswith(suf):
+                    name = name[:-len(suf)].strip()
+                    changed = True
+                    break
+            if changed:
                 break
     return re.sub(r"[\s_-]*\d{6,}$", "", name).strip() or name
 
 
 def parse_meta_from_filename(path):
     """「タイトル_作者名.pdf」形式のファイル名から (title, author) を推定する。
-    「タイトル_作者名_方式.pdf」のように末尾へ OCR 方式タグ（vision/docai/ocr）を
-    付けた運用にも対応し、著者名からは方式タグを取り除く。
+    「タイトル_作者名_方式.pdf」のように末尾へ OCR 方式タグ
+    （vision/docai/yomitoku/ocr/scansnap）を付けた運用にも対応し、
+    著者名からは方式タグを取り除く。
+    「タイトル_方式.pdf」（著者名を書かずに気軽に試す形）では**著者名なし**を返す。
+    タグをそのまま著者にすると dc:creator が「docai」になり、yomikake の
+    bookKey（title＋全creator 由来）まで汚れる。
     区切りは最初の _ を優先、次いで -（mangaP2ePub と同方式）。
     区切りがなければ (ファイル名, "") を返す。"""
     stem = os.path.splitext(os.path.basename(path))[0]
     for sep in ("_", "-"):
         if sep in stem:
-            title, _, author = stem.partition(sep)
-            title, author = title.strip(), _strip_method_tag(author.strip())
+            title, _, rest = stem.partition(sep)
+            title, author = title.strip(), _strip_method_tag(rest.strip())
+            if title and _is_method_tag(author):
+                return title, ""       # 「タイトル_方式.pdf」＝著者名なし
             if title and author:
                 return title, author
     return stem.strip(), ""
@@ -4139,6 +4614,8 @@ def _make_toc_xhtml(title: str, episodes: list, cover_fmt: str = "",
                 f'<li class="toc-chapter"><a href="ep{num:04d}.xhtml">{_esc(group)}</a></li>'
             )
             prev_group = group
+            if ep["title"] == group:
+                continue      # 章見出し自身。ヘッダー行と重複させない
         ep_items.append(
             f'<li value="{num}"><a href="ep{num:04d}.xhtml">{_esc(ep["title"])}</a></li>'
         )
@@ -4197,6 +4674,8 @@ def _make_nav_xhtml(title: str, episodes: list, cover_fmt: str = "",
         if group is not None and group != prev_group:
             ep_items.append(f'<li class="toc-chapter"><a href="ep{num:04d}.xhtml">{_esc(group)}</a></li>')
             prev_group = group
+            if ep["title"] == group:
+                continue      # 章見出し自身。ヘッダー行と重複させない
         ep_items.append(
             f'<li value="{num}"><a href="ep{num:04d}.xhtml">{_esc(ep["title"])}</a></li>'
         )
@@ -5369,6 +5848,32 @@ def _split_aozora_by_headings(body_text: str) -> list:
     return sections
 
 
+def _group_section_episodes(episodes: list) -> None:
+    """裸の番号エピソード（章内の節番号）を直前の章の下にぶら下げる。
+
+    章名のある本で節番号をフラットに並べると nav が跳ね上がる（黒牢城
+    7→58、タイム・リープ上 6→47。どちらも公式 nav は章だけ）。nav/toc は
+    "group" キーによる2階層描画に対応しているので、節エピソードに章題を
+    group として与え、章エピソード自身にも自分の題を group として与える
+    （_make_nav_xhtml 側は group と同名の項目を重複表示しない）。
+    章名が読めない本（風の万里・地下室＝番号そのものが章）は直前の章が
+    無いので group が付かず、従来どおりのフラットな目次になる。
+    """
+    is_num = [bool(_SECTION_NUM_RE.fullmatch(_norm_t(ep["title"])))
+              for ep in episodes]
+    if not any(is_num):
+        return
+    chapter = None
+    for ep, num in zip(episodes, is_num):
+        if not num:
+            chapter = ep
+            continue
+        if chapter is None:
+            continue                   # 先頭の節＝章題を持たない本
+        chapter["group"] = chapter["title"]
+        ep["group"] = chapter["title"]
+
+
 def parse_aozora_text(content: str) -> tuple:
     """
     青空文庫書式テキスト（このツールが出力する形式）を解析して
@@ -5464,6 +5969,8 @@ def parse_aozora_text(content: str) -> tuple:
                     "title": ep_title or f"第{len(episodes) + 1}話",
                     "body":  body_text,
                 })
+
+    _group_section_episodes(episodes)
 
     # 見出しマーカーがなく1セクションしかない場合はタイトルをそのまま使用
     if len(episodes) == 1 and episodes[0]["title"].startswith("第1話"):
@@ -5613,6 +6120,11 @@ def main():
                          "ルビ内漢字の自動訂正）を行わない")
     ap.add_argument("--no-toc-refine", action="store_true",
                     help="紙の目次ページとの照合による見出し精錬を行わない")
+    ap.add_argument("--no-chapter-marks", action="store_true",
+                    help="章頭マーカー（第N章・章内の節番号）の見出し化を行わない")
+    ap.add_argument("--no-backmatter-cut", action="store_true",
+                    help="ノンブルの連番から本文終端を推定して巻末広告・奥付の"
+                         "見出し化を抑止する処理を行わない")
     ap.add_argument("--no-images", action="store_true",
                     help="挿絵・口絵・章頭ページの画像ページ化を行わない")
     ap.add_argument("--horizontal", action="store_true",
@@ -5688,6 +6200,19 @@ def main():
           f"柱・ノンブル除去 {len(drop)} 行 / 見出し候補 {len(headings)} 個 / "
           f"柱パターン {len(hashira_keys)} 種")
 
+    # 章頭マーカー（第N章・節番号）と後付けの境界。どちらも assemble_text に渡す
+    toc_pages = {} if args.no_chapter_marks else detect_toc_chapter_pages(
+        pages, drop, body_size, horizontal=args.horizontal)
+    if toc_pages:
+        print(f"印刷目次のページ数から章位置 {len(toc_pages)} 件を推定")
+    chapter_marks = {} if args.no_chapter_marks else detect_chapter_marks(
+        pages, drop, body_size, body_top, body_bottom,
+        horizontal=args.horizontal, toc_pages=toc_pages)
+    body_end = None if args.no_backmatter_cut else detect_body_end(
+        pages, drop, body_size, body_top, horizontal=args.horizontal)
+    if body_end is not None:
+        print(f"本文終端: p{body_end + 1}（以降は後付けとして見出し化しない）")
+
     fn_title, fn_author = parse_meta_from_filename(args.pdf)
     title = args.title or fn_title
     author = args.author or fn_author
@@ -5725,7 +6250,8 @@ def main():
                          body_top, body_bottom, hashira_keys,
                          indent=not args.no_indent, verbose=args.verbose,
                          image_pages=image_page_map,
-                         horizontal=args.horizontal)
+                         horizontal=args.horizontal,
+                         chapter_marks=chapter_marks, body_end=body_end)
 
     if not args.no_toc_refine:
         body, toc_stats = refine_headings_with_toc(
