@@ -9,10 +9,10 @@ ndlocr_reocr.py — NDLOCR-Lite による再OCR（前処理）
 透明テキスト層として書き戻す。vision_reocr.py の書き戻し系を import して
 共有する（docai / yomitoku と同じ方針）。jisui2epub.py 本体は無改修で通す。
 
-**現状はフェーズ1（本文のみ）。** ルビは NDLOCR が座標だけ返して認識しない
-ため後段の自作が要るが、実測でまだ再現率が足りていない（DESIGN_NDLOCR.md
-§7.10）。フェーズ1では本文だけを書き戻し、往復（redaction → 書き戻し →
-jisui2epub）が成立することの検証を先に済ませる。
+**現状はフェーズ2（本文＋ルビ）を検証中。** NDLOCR は `block_rubi` を
+座標だけ返して認識しないので、箱を語に切って1語ずつ読む後段を自作している。
+ルビの再現率はまだ Vision に届いていない（DESIGN_NDLOCR.md §7.10）。
+`--no-ruby` で本文だけのフェーズ1相当に戻せる。
 
     # NDLOCR-Lite を任意の場所に clone しておく（モデルは同梱されている）
     git clone https://github.com/ndl-lab/ndlocr-lite
@@ -64,6 +64,31 @@ DET_IOU = 0.2
 BODY_CLASSES = ("line_main", "line_title", "line_caption", "line_ad",
                 "line_note", "line_note_tochu")
 MARGIN_CLASSES = ("block_pillar", "block_folio")
+
+# ── ルビ後段（フェーズ2）────────────────────────────────
+# NDLOCR は block_rubi を**座標だけ返して認識しない**（DESIGN_NDLOCR.md §2）。
+# 箱を語に切り、1語ずつ認識して、細いセルとして本文と同じ symbol 列に足す。
+# ルビか本文かの判定は insert_invisible_text がセル幅で行うので、
+# こちらは「ルビ箱の幅のセルを作る」だけでよい（本文列幅のおよそ半分）。
+RUBY_CLASS = "block_rubi"
+# 縦方向のインクの切れ目がルビ字幅のこの割合以上なら語境界
+RUBY_GAP_RATIO = 1.0
+# ルビ字幅に対してこの割合未満の切片は捨てる（濁点・ノイズ）
+RUBY_MIN_RUN_RATIO = 0.4
+# インクとみなす輝度のしきい値
+RUBY_INK_LEVEL = 160
+# **ルビ箱の幅は実インクより広いので縮めてから渡す。** YomiToku(DBNet) と
+# 同型の問題で、補正しないとルビの書き戻しフォントサイズが過大になり、
+# jisui2epub のルビ列グルーピング（Yギャップが size×1.7 以内なら同一ルビ）が
+# 緩んで**隣接する別語のルビが結合する**（実測: 車《くるま》＋音《おと》→
+# 音《くるまおと》、下《した》＋妹《いもうと》→妹《したいもうと》）。
+# 実測の裏付け: 同じ本で NDLOCR のルビ書き戻しが5.04〜6.6pt、Vision は
+# 3.84〜4.56pt で約1.35倍太い（1/1.35 ≒ 0.74）。
+# **本文側（INK_WIDTH_RATIO）は 1.0 のまま触らない**（本文の往復再現率
+# 98.09% は検証済みで、そちらを動かす理由がない）
+RUBY_INK_RATIO = 0.74
+WITH_RUBY = True    # --no-ruby で False
+_KANA_ONLY = None   # 遅延コンパイル（re は関数内で使う）
 
 # 認識モデルの切替。PARSEQ は入力幅の違う3本があり（24x256=30字級・
 # 24x384=50字級・24x768=100字級）、**行に対して不適切なモデルを使うと
@@ -185,7 +210,54 @@ def _read_cascade(crop):
     return best
 
 
-def ocr_page_with_ndlocr(doc, page_index):
+def _split_ruby_runs(crop):
+    """縦書きルビ列を、行方向（Y）のインクの切れ目で語に分割する。
+
+    ルビは「親語ごとのまとまり」で振られるので、箱をそのまま1語として
+    読ませると隣の語まで繋がる。切れ目の基準はルビ字幅（＝箱の幅）。
+    """
+    cv2, np = _import_cv2()
+    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    on = (g < RUBY_INK_LEVEL).sum(axis=1) > 0
+    w = crop.shape[1]
+    min_gap = max(int(w * RUBY_GAP_RATIO), 3)
+    runs, start, gap = [], None, 0
+    for i, v in enumerate(on):
+        if v:
+            if start is None:
+                start = i
+            gap = 0
+        elif start is not None:
+            gap += 1
+            if gap >= min_gap:
+                runs.append((start, i - gap))
+                start = None
+    if start is not None:
+        runs.append((start, len(on) - 1))
+    return [(a, b) for a, b in runs if b - a >= w * RUBY_MIN_RUN_RATIO]
+
+
+def _read_ruby(sub):
+    """ルビ切片を読み、仮名だけを返す（読みは仮名のみのはず）。
+
+    30字モデルで仮名が出なければ50字モデルで読み直す。実測（地下室6ページ）で
+    仮名が出なかった切片の41%が50字モデルなら仮名になる（'s a'→ちょうめ）。
+    """
+    global _KANA_ONLY
+    import re
+    if _KANA_ONLY is None:
+        _KANA_ONLY = re.compile(r'[^ぁ-んァ-ヶー]')
+    for name in ("rec30", "rec50"):
+        raw = _MODELS[name].read(sub)
+        if not raw.strip():
+            continue
+        txt = _KANA_ONLY.sub('', raw)
+        if txt:
+            return txt
+    return ""
+
+
+def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
     """ページの埋め込み画像を NDLOCR にかけ、(行リスト, (w, h)) を返す。
 
     行リストの要素は dict(cls, box=(x0,y0,x1,y1), text)。座標は画像ピクセル。
@@ -208,13 +280,27 @@ def ocr_page_with_ndlocr(doc, page_index):
     lines = []
     for d in det.detect(img):
         cls = d["class_name"]
-        if cls not in BODY_CLASSES and cls not in MARGIN_CLASSES:
+        is_ruby = with_ruby and cls == RUBY_CLASS
+        if not is_ruby and cls not in BODY_CLASSES and cls not in MARGIN_CLASSES:
             continue
         x0, y0, x1, y1 = [int(v) for v in d["box"]]
         if x1 <= x0 or y1 <= y0:
             continue
         crop = img[y0:y1, x0:x1]
         if crop.size == 0:
+            continue
+        if is_ruby:
+            # 語ごとに切って読み、切片ごとに1行として積む。位置は実測なので
+            # 親文字への対応付けは jisui2epub の attach_rubies に任せられる
+            # 幅は実インク相当に縮める（中心は保つ）。RUBY_INK_RATIO 参照
+            rxc = (x0 + x1) / 2
+            rhalf = (x1 - x0) * RUBY_INK_RATIO / 2
+            for a, b in _split_ruby_runs(crop):
+                txt = _read_ruby(crop[a:b + 1])
+                if txt:
+                    lines.append({"cls": cls, "text": txt,
+                                  "box": (rxc - rhalf, y0 + a,
+                                          rxc + rhalf, y0 + b + 1)})
             continue
         text = _read_cascade(crop)
         if not text.strip():
@@ -304,6 +390,10 @@ def _calibrate_body_fontsize(doc, start_page, end_page, cache):
     書き戻しサイズにすると、ドキュメント全体の基準に対して0.68倍を割り込み
     本文が丸ごとルビ誤判定される事故が起きるため、全体で固定値を使う
     （CLAUDE.md の vision_reocr「原因」節）。
+
+    **ルビのセルは必ず除外する。** ルビ幅は本文のおよそ半分なので、混ぜると
+    中央値が下がって本文の書き戻しサイズが小さくなり、まさに上の事故の方向へ
+    寄る（受け入れ基準1・DESIGN_NDLOCR実装.md フェーズ2）。
     """
     widths = []
     last = min(end_page, start_page + CALIBRATION_MAX_PAGES - 1)
@@ -311,11 +401,14 @@ def _calibrate_body_fontsize(doc, start_page, end_page, cache):
         if len(widths) >= CALIBRATION_TARGET_CHARS:
             break
         idx = p1 - 1
-        lines, img_size = ocr_page_with_ndlocr(doc, idx)
+        lines, img_size = ocr_page_with_ndlocr(doc, idx, with_ruby=WITH_RUBY)
         cache[idx] = (lines, img_size)
         if not lines:
             continue
-        for _, rect in collect_page_symbols_ndlocr(lines, doc[idx], img_size):
+        body = [ln for ln in lines if ln["cls"] != RUBY_CLASS]
+        if not body:
+            continue
+        for _, rect in collect_page_symbols_ndlocr(body, doc[idx], img_size):
             widths.append(rect.width)
     return statistics.median(widths) if widths else None
 
@@ -354,7 +447,8 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
             if idx in cache:
                 lines, img_size = cache.pop(idx)
             else:
-                lines, img_size = ocr_page_with_ndlocr(doc, idx)
+                lines, img_size = ocr_page_with_ndlocr(doc, idx,
+                                                       with_ruby=WITH_RUBY)
             if not lines:
                 print(f"ページ{p1}: 埋め込み画像なし／認識なし、スキップ")
                 continue
@@ -396,10 +490,10 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
 
 
 def main():
-    global INK_WIDTH_RATIO
+    global INK_WIDTH_RATIO, WITH_RUBY, RUBY_INK_RATIO
     ap = argparse.ArgumentParser(
         description="NDLOCR-Lite で自炊PDFを再OCRし透明テキスト層を書き戻す"
-                    "（フェーズ1: 本文のみ。ルビ後段は未実装）")
+                    "（本文＋ルビ。--no-ruby で本文のみ）")
     ap.add_argument("pdf", help="入力PDF")
     ap.add_argument("-o", "--output", help="出力PDF（既定: <入力>_ndlocr.pdf）")
     ap.add_argument("--ndlocr-dir", default=os.environ.get("NDLOCR_DIR", ""),
@@ -411,6 +505,11 @@ def main():
     ap.add_argument("--ink-ratio", type=float, default=INK_WIDTH_RATIO,
                     help="検出ボックスを実インク幅に縮める比（既定1.0＝無補正。"
                          "DEIM のずれは未測定）")
+    ap.add_argument("--ruby-ink-ratio", type=float, default=RUBY_INK_RATIO,
+                    help=f"ルビ箱を実インク幅に縮める比"
+                         f"（既定 {RUBY_INK_RATIO}。過大だと隣語のルビが結合する）")
+    ap.add_argument("--no-ruby", action="store_true",
+                    help="ルビ後段を止めて本文だけ書き戻す")
     ap.add_argument("--preprocess", choices=("auto", "on", "off"),
                     default="auto", help="再OCR前の画像前処理（既定 auto）")
     args = ap.parse_args()
@@ -420,6 +519,8 @@ def main():
                  "  git clone https://github.com/ndl-lab/ndlocr-lite")
 
     INK_WIDTH_RATIO = args.ink_ratio
+    WITH_RUBY = not args.no_ruby
+    RUBY_INK_RATIO = args.ruby_ink_ratio
     set_preprocess_mode(args.preprocess)
 
     out = args.output or (os.path.splitext(args.pdf)[0] + "_ndlocr.pdf")
