@@ -1,13 +1,24 @@
-# vision_reocr.py / docai_reocr.py / yomitoku_reocr.py を Windows で使う
+# 再OCRツールを Windows で使う（Vision / Document AI / YomiToku）
 
 `vision_reocr.py` はGoogle Cloud Vision APIでスキャンPDFを再OCRし、透明テキスト層を
 書き戻す前処理ツール（詳細は `README.md` を参照）。このドキュメントはWindows上で
 Python版のスクリプトを直接動かすための手順をまとめたもの。より高精度な
 Document AI版 `docai_reocr.py` を使う場合は7章も参照。
 
+再OCRのバックエンドは4つあり、**このドキュメントはそのうち3つを扱う**。
+
+| 使いたいもの | 参照先 | クラウド | 商用利用 |
+|---|---|---|---|
+| Vision API（迷ったらこれ） | このドキュメント 2〜4章 | 必要 | 可 |
+| Document AI（最高精度・有料） | このドキュメント 7章 | 必要 | 可 |
+| YomiToku（無料・オフライン） | このドキュメント 8章 | 不要 | **不可（非商用のみ）** |
+| **NDLOCR-Lite（無料・オフライン・商用可）** | **[README_NDLOCR.md](README_NDLOCR.md)** | 不要 | 可 |
+
 **クラウドを使いたくない場合は8章の `yomitoku_reocr.py` を参照**。GCPの
 アカウント作成・課金設定・認証JSONがすべて不要になるため、以下の2章・3章を
 まるごと飛ばせる（そのかわり非商用利用限定）。
+**商用利用も必要なら NDLOCR-Lite（[README_NDLOCR.md](README_NDLOCR.md)）**を
+選ぶ。ただし現時点ではルビが弱い。
 
 必要な準備は3つ:
 
