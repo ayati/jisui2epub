@@ -132,7 +132,16 @@ def load_goal_text(path):
     if opf:
         s = z.read(opf[0]).decode("utf-8", "replace")
         order = re.findall(r'idref="([^"]+)"', s)
-        href = dict(re.findall(r'id="([^"]+)"[^>]*href="([^"]+)"', s))
+        # **manifest の属性順を仮定しないこと**。href が id より前に来る
+        # ePub が実在し（百億の昼と千億の夜）、`id="…"[^>]*href="…"` では
+        # 1件も取れず下のファイル名順フォールバックに落ちる。章順が崩れて
+        # GT が壊れる（実測: 本文再現率が 99%→73% に見えた）
+        href = {}
+        for item in re.findall(r"<item\b[^>]*>", s):
+            i = re.search(r'\bid="([^"]+)"', item)
+            h = re.search(r'\bhref="([^"]+)"', item)
+            if i and h:
+                href[i.group(1)] = h.group(1)
         base = os.path.dirname(opf[0])
         for i in order:
             h = href.get(i)
