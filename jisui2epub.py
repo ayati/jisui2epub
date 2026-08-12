@@ -43,7 +43,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -88,6 +88,10 @@ DIGIT_RE = re.compile(r'[0-9０-９]')
 RUBY_SIZE_RATIO = 0.68      # 本文サイズ×この値以下ならルビ
 HEADING_SIZE_RATIO = 1.18   # 本文サイズ×この値以上なら見出し候補
 HASHIRA_MIN_FREQ = 3        # 同一テキストがこのページ数以上で柱と判定
+HASHIRA_SHORT_MIN_FREQ = 5  # 2文字の柱を章題辞書に入れる最低ページ数
+# 短い章題（2〜3字）を見出しに昇格させるサイズ比。柱一致が必須なので
+# is_big の 1.18 より強めに取る（飾り文字・図版ノイズを避ける）
+HEADING_SHORT_SIZE_RATIO = 1.25
 HEADING_MAX_LEN = 30        # 見出しとして扱う最大文字数
 KANA_RE = re.compile(r'[ぁ-ゖァ-ヺー]')
 
@@ -272,20 +276,32 @@ def span_is_vertical(sp):
 
 
 def count_orientation_chars(doc, page_range):
-    """複数文字スパンの向き票（縦文字数, 横文字数）を数える。
+    """複数文字スパンの向き票（縦文字数, 横文字数, 総文字数）を数える。
 
-    書字方向の自動判別ヒント用。1文字1スパンの旧OCRでは票がほぼ
-    集まらない（両者とも小さい値になる）ため、判定は呼び出し側で
-    最低票数つきで行うこと。"""
-    v = h = 0
+    書字方向の自動判別ヒント用。1文字1スパンのPDF（2013年級の旧OCRと、
+    **再OCR経路の出力すべて**）では縦書きの票が原理的に0になる。
+    insert_text を文字ごとに呼ぶため複数文字スパンが本文に存在せず、
+    票を持つのは柱・ノンブルの横書きスパンだけになるからで、票の比だけを
+    見ると縦書きの本が「横書き」に見える。総文字数を併せて返すので、
+    呼び出し側は**票が本文をどれだけ代表しているか**でゲートすること。"""
+    v = h = total = 0
     for i in page_range:
         for sp in collect_spans(doc[i]):
+            n = len(sp["text"])
+            total += n
             o = span_is_vertical(sp)
             if o is True:
-                v += len(sp["text"])
+                v += n
             elif o is False:
-                h += len(sp["text"])
-    return v, h
+                h += n
+    return v, h, total
+
+
+# 向き票が本文を代表しているとみなす下限（票文字数 / 総文字数）。
+# 実測（各本の先頭40ページ）: 1行1スパンの旧OCRは 96.6〜99.7%、
+# 1文字1スパンのPDF（グリック2013・再OCR済み3冊・黒牢城vision）は
+# 0.9〜3.7% と2桁違う。間は大きく空いているので 0.2 で十分に安全。
+ORIENT_VOTE_MIN_RATIO = 0.2
 
 
 def analyze_page(fpage, num, body_size, horizontal=False):
@@ -697,8 +713,14 @@ def classify_marginals(pages, body_size, horizontal=False):
     # 本文中の章見出し検出用に、柱テキストの一覧も返す。
     # 短い章では柱の出現回数が少ないため閾値は2回。ただしOCRノイズを
     # 除くため、3文字以上でかな・漢字を含むものに限る。
+    # **2文字の柱は頻度を強く要求して受け入れる**（三国志（五）は40章中5章が
+    # 亡流・宝剣・舌戦・狂瀾・針鼠と2字で、3字未満を切ると章題として
+    # 照合できない）。ノイズが偶然2ページ一致することはあるが、章の長さぶん
+    # （実測10ページ前後）繰り返すことはない。
     hashira_keys = {k: c for k, c in freq.items()
-                    if c >= 2 and len(k) >= 3 and not NOMBRE_RE.match(k)
+                    if (c >= 2 and len(k) >= 3 or
+                        c >= HASHIRA_SHORT_MIN_FREQ and len(k) == 2)
+                    and not NOMBRE_RE.match(k)
                     and re.search(r'[ぁ-ゖァ-ヺー㐀-鿿]', k)}
     return drop, headings, body_top, body_bottom, hashira_keys
 
@@ -1572,12 +1594,22 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
 
         # 柱テキストと同文の縦行（章の始まりの見出し）を数える。
         # 見出しと柱でOCR結果が微妙に異なることがあるためあいまい一致。
-        def matches_hashira(text):
+        def matches_hashira(text, exact=False):
+            """柱テキストと同文か。exact=True なら完全一致のみ。
+
+            見出しの「かな必須」規則を緩める根拠に使うときは必ず exact に
+            すること。あいまい一致(0.66)は1字違いを拾うので、書名の柱
+            （角川文庫）に奥付のOCR化け（角川女庫）が当たって偽の見出しに
+            なる（書を捨てよで実測）。
+            """
             key = norm_hashira(text)
-            if len(key) < 3:
+            if len(key) < 2:
                 return False
             if key in hashira_keys:
                 return True
+            # 2文字は完全一致のみ（あいまい一致だと1字違いで何にでも当たる）
+            if exact or len(key) < 3:
+                return False
             return any(difflib.SequenceMatcher(None, key, k).ratio() >= 0.66
                        for k in hashira_keys)
 
@@ -1610,11 +1642,19 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
             # 「テキスト僅少ページの短い大活字」の見出し化免除は縦書きのみ
             # （横書き図解本では図版内の飾り文字ノイズが2〜3文字の偽見出し
             # になりやすい。実測: 識と・一一議）
+            # 2〜3字の章題（母子草・宝剣・朝の月…）は len>=4 に届かない。
+            # 大活字であることに加えて**柱と同文であること**を要求すれば、
+            # 飾り文字・図版ノイズと分けて拾える（三国志（五）は40章の
+            # うち14章が3字以下で、これが無いと全部本文に落ちる）。
+            short_titled = (not horizontal and
+                            v.size >= body_size * HEADING_SHORT_SIZE_RATIO and
+                            2 <= len(v.cells) <= 3 and
+                            matches_hashira(text, exact=True))
             is_big = (v.size >= body_size * HEADING_SIZE_RATIO and
                       len(v.cells) <= HEADING_MAX_LEN and
                       (v.y1 - v.y0) < loc_height * 0.7 and
                       indented and
-                      (len(v.cells) >= 4 or
+                      (len(v.cells) >= 4 or short_titled or
                        (not horizontal and n_textlines <= 3)) and
                       text[-1] not in "。」！？、）』…")
             # 章見出しは通常の段落字下げ（1字）より深く下がっている
@@ -1660,7 +1700,24 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                              (2 <= len(t) <= 8 and
                               re.fullmatch(r'[㐀-鿿々]+', t))]
         else:
-            page_headings = [t for t in page_headings if valid_heading_item(t)]
+            # **柱と同文なら純漢字でも見出しとして認める**（三国志（五）の
+            # 荊州往来・文武競春・一掴三城・酔計二花・南風北春。かな必須の
+            # 規則は挿絵OCRノイズ対策であって、柱と完全一致する行はノイズ
+            # ではありえない）。**完全一致に限る**のは matches_hashira の
+            # docstring 参照。
+            # なお、ここで落ちた項目を本文へ降格させるのは**やってはいけない**。
+            # 落ちるものの大半は口絵・奥付のOCRノイズ（壷海侭率・繊式協会妹・
+            # 慶国北方図・鶏）で、降格させると本文に流れ込む（書を捨てよ・
+            # 風の万里下・ソフロニアで実測）
+            # **緩和はそのページで唯一の見出し候補のときだけ。** 章見出しは
+            # 単独で立つが、扉・奥付の純漢字（斎藤惇夫作・集英社文庫・
+            # 倉本一宏著・中公新書・矢川澄子訳）は書名と並んで出るので、
+            # これで分けられる。頻度では分けられない（南風北春の柱が2回に対し
+            # 斎藤惇夫作・倉本一宏著・中公新書は3回。実測）
+            solo = len(page_headings) == 1
+            page_headings = [t for t in page_headings
+                             if valid_heading_item(t) or
+                             (solo and matches_hashira(t, exact=True))]
         # 長すぎる「見出し」（表紙・帯・奥付などの誤検出）は本文段落に落とす
         long_items = [t for t in page_headings if len(t) > HEADING_MAX_LEN]
         page_headings = [t for t in page_headings if len(t) <= HEADING_MAX_LEN]
@@ -6169,9 +6226,16 @@ def main():
 
     # 書字方向の自動判別ヒント（複数文字スパンの縦横アスペクト票）。
     # 1文字1スパンの旧OCRでは票が集まらず判定不能のため警告のみで、
-    # 自動切替はしない（誤判定は全損につながる）
-    v_ch, h_ch = count_orientation_chars(doc, sample[:40])
-    if not args.horizontal and h_ch > v_ch * 2 and h_ch >= 200:
+    # 自動切替はしない（誤判定は全損につながる）。
+    # **票が本文を代表していなければ黙る**: 1文字1スパンのPDFでは縦書きの
+    # 票が0になり、柱・ノンブルの横書きスパンだけが票を持つので、
+    # 縦書きの本に「横書きの可能性があります」と出てしまう
+    # （再OCR済みPDF3冊・黒牢城vision・グリック2013で実測）。
+    # --horizontal を付けると全損なので、誤警告は実害がある
+    v_ch, h_ch, n_ch = count_orientation_chars(doc, sample[:40])
+    if v_ch + h_ch < n_ch * ORIENT_VOTE_MIN_RATIO:
+        pass                     # 判定不能（1文字1スパン）→ 警告しない
+    elif not args.horizontal and h_ch > v_ch * 2 and h_ch >= 200:
         print(f"警告: 横書きの本の可能性があります（向き票: 横 {h_ch} / "
               f"縦 {v_ch} 文字）。--horizontal の指定を検討してください",
               file=sys.stderr)
