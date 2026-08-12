@@ -39,6 +39,7 @@ import fitz  # PyMuPDF
 from jisui2epub import detect_body_size
 from vision_reocr import (
     CHECKPOINT_EVERY,
+    _FULLWIDTH_PUNCT,
     _atomic_save,
     _dedup_symbols,
     _open_source_pdf,
@@ -71,12 +72,26 @@ MARGIN_CLASSES = ("block_pillar", "block_folio")
 # ルビか本文かの判定は insert_invisible_text がセル幅で行うので、
 # こちらは「ルビ箱の幅のセルを作る」だけでよい（本文列幅のおよそ半分）。
 RUBY_CLASS = "block_rubi"
-# 縦方向のインクの切れ目がルビ字幅のこの割合以上なら語境界
-RUBY_GAP_RATIO = 1.0
+# 縦方向のインクの切れ目がルビ字幅のこの割合以上なら語境界。
+# 1.0 だと語間が埋まって隣語と結合する（下の RUBY_INK_MIN_FRAC 参照）
+RUBY_GAP_RATIO = 1.2
 # ルビ字幅に対してこの割合未満の切片は捨てる（濁点・ノイズ）
 RUBY_MIN_RUN_RATIO = 0.4
 # インクとみなす輝度のしきい値
 RUBY_INK_LEVEL = 160
+# **その行を「インクあり」とみなす暗画素数（箱幅に対する割合）。**
+# 「1画素でも暗ければインク」にすると、語間の余白に散るスキャンノイズで
+# 空白が細切れになり、連続空白が RUBY_GAP_RATIO に届かず**隣の語と結合する**
+# （百億 p135 実測: 自我即空《じがそくくう》＋色即是空《しきそくぜくう》が
+# 1語 `がそくくうしきそくぜ` になる。語間の連続空白は1画素判定で35px、
+# 2画素以上の判定なら79px。min_gap は37px）。
+# 較正は3冊×30ページの「GOAL の読み辞書との一致率」で行った:
+#   ink,gap =0.00,1.0（旧）→ 百億75.6% 三国志94.8% 地下室91.0%
+#   ink,gap =0.08,1.2（現）→ 百億78.7% 三国志94.8% 地下室91.4%
+# ink をさらに上げると地下室は伸びるが三国志が落ちるので、**3冊とも
+# 悪化しない組み合わせ**を選んだ。ink と gap を同時に振ると切り分けられない
+# ので、格子で両方を振って選んでいる
+RUBY_INK_MIN_FRAC = 0.08
 # **ルビ箱の幅は実インクより広いので縮めてから渡す。** YomiToku(DBNet) と
 # 同型の問題で、補正しないとルビの書き戻しフォントサイズが過大になり、
 # jisui2epub のルビ列グルーピング（Yギャップが size×1.7 以内なら同一ルビ）が
@@ -118,6 +133,21 @@ CASCADE_SPLIT_LEN = 98
 # **DEIM のボックスが実インクとどれだけずれるかは未測定**のため既定は無補正。
 # DESIGN_NDLOCR実装.md §6.6(c)。--ink-ratio で振れるようにしてある
 INK_WIDTH_RATIO = 1.0
+
+# 柱・ノンブル（MARGIN_CLASSES）の書き戻しサイズ。本文サイズに対する下限・上限。
+# **本文と同じサイズで書き戻してはならない。** jisui2epub の
+# classify_marginals は「マージン内 かつ 本文の0.95倍未満」を柱の決め手の
+# 1つに使っており（jisui2epub.py の drop 判定）、本文サイズで書き戻すと
+# その経路が空振りして、柱が中見出しに昇格する事故が起きる
+# （百億の昼と千億の夜: 原本の柱9.5pt/本文12.5pt が再OCR後は両方12.5pt）。
+# 実測サイズをそのまま使うと今度はルビしきい値（jisui2epub の
+# RUBY_SIZE_RATIO=0.68「以下」）を割り込んで柱がルビ扱いされうるので、
+# **両端から余裕を取って** 0.75〜0.85 倍に丸める。0.92 まで許すと、
+# 重複検出で横に伸びた箱のセル幅が上限に張り付いて 0.95 の判定境界まで
+# 0.4pt しか残らない（百億 p27 で実測）。原本の柱は 9.5/12.5＝0.76 なので
+# この帯にそのまま収まる。
+MARGIN_FONT_MIN_RATIO = 0.75
+MARGIN_FONT_MAX_RATIO = 0.85
 
 CALIBRATION_MAX_PAGES = 15
 CALIBRATION_TARGET_CHARS = 800
@@ -210,21 +240,39 @@ def _read_cascade(crop):
     return best
 
 
-def _dedup_ruby_boxes(boxes):
-    """重なり合う block_rubi を潰す（確信度の高い・大きいほうを残す）。
+def _dedup_boxes(boxes):
+    """重なり合う検出箱を潰す（確信度の高い・大きいほうを残す）。
 
-    **DEIM の NMS（IOU 0.2）はルビ箱の重複を抑えない。** 実測で
+    **DEIM の NMS（IOU 0.2）は重複を抑えない。** ルビ箱の実測で
     地下室P.4-15は186箱中122組、蘇我氏は33箱中11組が5割以上重なっていた。
     潰さないと**同じ読みが2回書き戻され、Y順で交互に噛み合う**
     （中大兄皇子《なかのおおえのみこ》→《なかのなおかのおおえおのえみのこみのこ》）。
+
+    **同じ重複が本文・柱の箱にもある。** 百億の昼と千億の夜 p27 の実測:
+
+        block_pillar conf=0.83 (355,142,836,204)   ← 本物の柱
+        block_pillar conf=0.17 (242,142,835,203)   ← 柱＋ノンブルを覆う低確信度箱
+        block_folio  conf=0.51 (241,143,303,195)   ┐ 同一座標・別クラス
+        block_pillar conf=0.17 (241,143,303,195)   ┘
+
+    これを全部書き戻すと柱が `29影絵の海第一章影絵の海` と二重化し、
+    `norm_hashira` の頻度照合が外れて**柱が中見出しに昇格する**
+    （百億でジャンク見出し22個・三国志で51個）。マージン行に重複箱を持つ
+    ページは実測で13〜20%あった。
+
+    **クラスをまたいで比較する**のが要点で、上の folio/pillar は座標が
+    完全一致するので同一クラス内の比較では消せない。縦書きの本文列は
+    互いに重ならないので、5割超の重なりは実質「同じものの二重検出」。
     boxes は (conf, x0, y0, x1, y1) のリスト。
     """
     order = sorted(boxes, key=lambda b: (-b[0], -((b[3] - b[1]) * (b[4] - b[2]))))
     kept = []
-    for conf, x0, y0, x1, y1 in order:
+    for b in order:
+        conf, x0, y0, x1, y1 = b[:5]
         area = (x1 - x0) * (y1 - y0)
         drop = False
-        for _, kx0, ky0, kx1, ky1 in kept:
+        for k in kept:
+            _, kx0, ky0, kx1, ky1 = k[:5]
             ox = min(x1, kx1) - max(x0, kx0)
             oy = min(y1, ky1) - max(y0, ky0)
             if ox <= 0 or oy <= 0:
@@ -233,7 +281,7 @@ def _dedup_ruby_boxes(boxes):
                 drop = True
                 break
         if not drop:
-            kept.append((conf, x0, y0, x1, y1))
+            kept.append(b)      # 余分な要素（クラス名等）はそのまま残す
     return kept
 
 
@@ -242,11 +290,15 @@ def _split_ruby_runs(crop):
 
     ルビは「親語ごとのまとまり」で振られるので、箱をそのまま1語として
     読ませると隣の語まで繋がる。切れ目の基準はルビ字幅（＝箱の幅）。
+
+    **「1画素でも暗ければインク」にしてはならない**（RUBY_INK_MIN_FRAC）。
+    語間の余白に散るスキャンノイズで空白が分断され、語が結合する。
     """
     cv2, np = _import_cv2()
     g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-    on = (g < RUBY_INK_LEVEL).sum(axis=1) > 0
     w = crop.shape[1]
+    ink_min = max(1, int(w * RUBY_INK_MIN_FRAC))
+    on = (g < RUBY_INK_LEVEL).sum(axis=1) >= ink_min
     min_gap = max(int(w * RUBY_GAP_RATIO), 3)
     runs, start, gap = [], None, 0
     for i, v in enumerate(on):
@@ -306,6 +358,7 @@ def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
     det = _MODELS["det"]
     lines = []
     ruby_boxes = []
+    text_boxes = []
     for d in det.detect(img):
         cls = d["class_name"]
         x0, y0, x1, y1 = [int(v) for v in d["box"]]
@@ -316,6 +369,11 @@ def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
             continue
         if cls not in BODY_CLASSES and cls not in MARGIN_CLASSES:
             continue
+        text_boxes.append((float(d["confidence"]), x0, y0, x1, y1, cls))
+
+    # 本文・柱の箱も重複を潰してから読む（_dedup_boxes の説明を参照）。
+    # 読む前に潰すので認識の呼び出しも減る
+    for _, x0, y0, x1, y1, cls in _dedup_boxes(text_boxes):
         crop = img[y0:y1, x0:x1]
         if crop.size == 0:
             continue
@@ -324,10 +382,10 @@ def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
             continue
         lines.append({"cls": cls, "box": (x0, y0, x1, y1), "text": text})
 
-    # ルビは重複を潰してから語に切る（_dedup_ruby_boxes の説明を参照）。
+    # ルビは重複を潰してから語に切る（_dedup_boxes の説明を参照）。
     # 語ごとに切って読み、切片ごとに1行として積む。位置は実測なので
     # 親文字への対応付けは jisui2epub の attach_rubies に任せられる
-    for _, x0, y0, x1, y1 in _dedup_ruby_boxes(ruby_boxes):
+    for _, x0, y0, x1, y1 in _dedup_boxes(ruby_boxes):
         crop = img[y0:y1, x0:x1]
         if crop.size == 0:
             continue
@@ -385,8 +443,14 @@ def expand_line_to_cells(text, box, sx, sy):
             for i, c in enumerate(chars)]
 
 
-def collect_page_symbols_ndlocr(lines, page, img_size):
+def collect_page_symbols_ndlocr(lines, page, img_size, split_margin=False):
     """行リストを読み順（縦書きは右の列から）に並べて文字セル列にする。
+
+    split_margin=True なら (本文セル, 柱・ノンブルのセル) に分けて返す。
+    分ける理由は2つある。(1) 柱は本文より小さく書き戻す必要がある
+    （MARGIN_FONT_MIN_RATIO 参照）。(2) `_snap_column_x` にノンブルを
+    混ぜたくない（半角数字を基準に本文列のX座標が潰される事故が
+    vision_reocr で実測されている。CLAUDE.md のソフロニア嬢P.15）。
 
     **【未検証】読み順は単純な x 降順で組んでいる。** NDLOCR の CLI は
     ndl_parser.convert_to_xml_string3 がブロック統合と ORDER を計算するが、
@@ -394,7 +458,7 @@ def collect_page_symbols_ndlocr(lines, page, img_size):
     （DESIGN_NDLOCR実装.md §6.6(d)）。
     """
     if not lines:
-        return []
+        return ([], []) if split_margin else []
     img_w, img_h = img_size
     sx = page.rect.width / img_w
     sy = page.rect.height / img_h
@@ -402,6 +466,13 @@ def collect_page_symbols_ndlocr(lines, page, img_size):
     def is_vertical(ln):
         x0, y0, x1, y1 = ln["box"]
         return (y1 - y0) >= (x1 - x0)
+
+    margin_lines = []
+    if split_margin:
+        margin_lines = [ln for ln in lines if ln["cls"] in MARGIN_CLASSES]
+        lines = [ln for ln in lines if ln["cls"] not in MARGIN_CLASSES]
+        if not lines:
+            return [], _cells_of(margin_lines, sx, sy)
 
     vertical = sum(1 for ln in lines if is_vertical(ln)) >= len(lines) / 2
     if vertical:
@@ -412,7 +483,37 @@ def collect_page_symbols_ndlocr(lines, page, img_size):
     symbols = []
     for ln in lines:
         symbols.extend(expand_line_to_cells(ln["text"], ln["box"], sx, sy))
-    return _dedup_symbols(_snap_column_x(symbols))
+    symbols = _dedup_symbols(_snap_column_x(symbols))
+    if split_margin:
+        return symbols, _cells_of(margin_lines, sx, sy)
+    return symbols
+
+
+def _cells_of(lines, sx, sy):
+    """柱・ノンブル行をセルにする（列スナップは掛けない）。"""
+    cells = []
+    for ln in lines:
+        cells.extend(expand_line_to_cells(ln["text"], ln["box"], sx, sy))
+    return _dedup_symbols(cells)
+
+
+def insert_margin_text(page, symbols, body_fontsize):
+    """柱・ノンブルを本文より小さいサイズで書き戻す。
+
+    NDLOCR は柱・ノンブルを block_pillar / block_folio として分類して
+    返してくるので、その区別を活かして原本に近いサイズを復元する。
+    書き戻しの原点は insert_invisible_text と同じ「bbox上端合わせ」。
+    """
+    lo = body_fontsize * MARGIN_FONT_MIN_RATIO
+    hi = body_fontsize * MARGIN_FONT_MAX_RATIO
+    n = 0
+    for text, rect in symbols:
+        text = _FULLWIDTH_PUNCT.get(text, text)
+        fontsize = min(max(rect.width, lo), hi)
+        page.insert_text(fitz.Point(rect.x0, rect.y0 + fontsize), text,
+                         fontsize=fontsize, fontname="japan", render_mode=3)
+        n += 1
+    return n
 
 
 # ── 書き戻しフォントサイズの基準値 ──────────────────────────────
@@ -439,7 +540,10 @@ def _calibrate_body_fontsize(doc, start_page, end_page, cache):
         cache[idx] = (lines, img_size)
         if not lines:
             continue
-        body = [ln for ln in lines if ln["cls"] != RUBY_CLASS]
+        # ルビに加えて柱・ノンブルも除く。どちらも本文より細いので、
+        # 混ぜると中央値が下がり本文の書き戻しサイズが小さくなる
+        body = [ln for ln in lines
+                if ln["cls"] != RUBY_CLASS and ln["cls"] not in MARGIN_CLASSES]
         if not body:
             continue
         for _, rect in collect_page_symbols_ndlocr(body, doc[idx], img_size):
@@ -487,10 +591,13 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
                 print(f"ページ{p1}: 埋め込み画像なし／認識なし、スキップ")
                 continue
 
-            symbols = collect_page_symbols_ndlocr(lines, page, img_size)
-            if not symbols:
+            symbols, margins = collect_page_symbols_ndlocr(
+                lines, page, img_size, split_margin=True)
+            # 柱・ノンブルしか無いページ（挿絵ページ）は、基準サイズが
+            # まだ決まっていないと書き戻せないので従来どおり素通しにする
+            if not symbols and (not margins or target_body_fontsize is None):
                 continue
-            if target_body_fontsize is None:
+            if target_body_fontsize is None and symbols:
                 target_body_fontsize = statistics.median(
                     r.width for _, r in symbols)
                 print(f"本文フォントサイズ基準値: {target_body_fontsize:.2f}pt")
@@ -502,6 +609,8 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
             nchar, nruby = insert_invisible_text(
                 page, symbols, target_body_fontsize,
                 target_body_fontsize * 0.5)
+            # 柱・ノンブルは本文より小さく書き戻す（MARGIN_FONT_MIN_RATIO）
+            nchar += insert_margin_text(page, margins, target_body_fontsize)
             total_chars += nchar
             total_ruby += nruby
             processed += 1
