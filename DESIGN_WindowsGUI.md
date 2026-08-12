@@ -273,16 +273,43 @@ exe に取り込まれる**（モデル重みは実行時ダウンロードな�
 
 ### UI
 
-- `ENGINE_CHOICES = ("yomitoku", "vision", "docai")` — **YomiTokuが既定**。
+- `ENGINE_CHOICES = ("yomitoku", "ndlocr", "vision", "docai")` — **YomiTokuが既定**。
   Google Cloud はアカウント作成・クレジットカード登録・毎月の請求という敷居が
-  高く、一般ユーザーが最初に試す先としては重い
+  高く、一般ユーザーが最初に試す先としては重い。ローカル2種を先頭に固めている
 - `on_engine_change()` がエンジンに応じて下の行を出し分ける:
   - yomitoku → 「インストール手順」ボタン・「Pythonを選ぶ」ボタン・導入状態の
     表示・**非商用ライセンスの注記**・「時代小説はVision/DocAI推奨」の注記
+  - ndlocr → 「初期設定の手順」「NDLOCR-Liteフォルダを選ぶ」「Pythonを選ぶ」の
+    3ボタン・導入状態の表示・**初期設定が要る旨と README_NDLOCR.md への誘導**・
+    **全角パス不可の注意**・「ルビが弱い／時代小説は不向き」の注記
   - vision / docai → 認証JSONの選択・課金に関する注記
-- `on_reocr_toggle()` は yomitoku 選択時に認証JSONを要求しない
-- 導入確認はワーカースレッドで実行し、結果は `_yomi_result` に置いて
-  `poll()`（メインスレッド）が拾う。**Tkinterを別スレッドから触らない**原則
+- `on_reocr_toggle()` は yomitoku / ndlocr 選択時に認証JSONを要求しない
+- 導入確認はワーカースレッドで実行し、結果は `_yomi_result` / `_ndl_result` に
+  置いて `poll()`（メインスレッド）が拾う。**Tkinterを別スレッドから触らない**原則
+
+### NDLOCR 経路（2026-08-12 追加）
+
+- **exe を探さず「ユーザーのPython＋同梱の.py」で起動する点は yomitoku と同じだが、
+  理由が違う。** yomitoku はライセンス（exe化すると CC BY-NC-SA 素材の再配布物に
+  なる）だが、NDLOCR-Lite は CC BY 4.0 でそもそも同梱しない。exe を探さないのは
+  実務上の理由＝(1) NDLOCR本体は利用者が別途cloneした外部フォルダにあり実行時に
+  `sys.path` へ載せる方式なので exe 化の利点が薄い、(2) onnxruntime と opencv を
+  同梱すると exe が肥大する
+- Python の探索は `_find_python(settings, has_func, manual_key)` に共通化した。
+  yomitoku は `find_spec('yomitoku')`、NDLOCR は
+  `onnxruntime / cv2 / yaml / fitz` の4つを見る（NDLOCR本体は別途cloneするので
+  依存ライブラリだけ確認すればよい）
+- **設定が2つ要る**のが yomitoku との違い: 依存ライブラリの入った Python
+  （`ndlocr_python`）と、NDLOCR-Lite の clone 先（`ndlocr_dir`）。
+  後者は `--ndlocr-dir` で子プロセスに渡す
+- `check_ndlocr_dir()` が「存在する / 直下に src がある / パスが ASCII のみ」を
+  検査する。**フォルダを選んだ時点で検査する**（実行してから落ちるより親切）。
+  ZIP展開で `ndlocr-lite-main/ndlocr-lite-main/` と二重になる事故と、
+  **Windowsユーザー名が日本語だとパスに全角が混ざる**事故の両方を先回りする
+- `build_jobs` でも実行直前に再検査する（設定後にフォルダを移動・削除した場合）
+- 出力ファイル名は `<入力>_ndlocr.pdf` で、`build_jobs` の
+  `f"{pdf.stem}_{engine}.pdf"` とツール側の既定が一致している（engine名 `ndlocr`
+  ＝ツールの既定サフィックス）。**エンジンを増やすときはここを揃えること**
 
 ### 実機確認で判明した点（2026-08-09）
 

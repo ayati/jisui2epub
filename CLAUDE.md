@@ -96,9 +96,22 @@ python3 jisui_gui.py --print-jobs 本.pdf --type horizontal --reocr  # 組み立
   Google Cloudはアカウント作成・クレカ登録・毎月の請求という敷居があり、
   一般ユーザーが最初に試す先としては重いため。エンジン選択に応じて
   `on_engine_change` が下の設定行を出し分ける（yomitoku=インストール手順・
-  Python選択・非商用の注記／vision・docai=認証JSON）
-- 導入確認はワーカースレッドで行い、結果は `_yomi_result` に置いて
-  `poll()`（メインスレッド）が拾う。**Tkinterを別スレッドから触らない**原則
+  Python選択・非商用の注記／ndlocr=初期設定手順・フォルダ選択・Python選択／
+  vision・docai=認証JSON）
+- **`ndlocr` も exe を探さないが、理由は yomitoku と違う**。yomitoku は
+  ライセンス（exe化＝CC BY-NC-SA素材の再配布物）だが、NDLOCR-Lite は CC BY 4.0 で
+  そもそも同梱しない。exe を探さないのは「本体が外部cloneで実行時に sys.path へ
+  載せる方式なので利点が薄い／onnxruntime と opencv で exe が肥大する」ため。
+  Python 探索は `_find_python` に共通化（yomitoku=`yomitoku`、
+  ndlocr=`onnxruntime/cv2/yaml/fitz` を find_spec）
+- **NDLOCR は設定が2つ要る**（依存入りPython `ndlocr_python` と clone先
+  `ndlocr_dir`）。`check_ndlocr_dir` が「存在／直下に src ／パスがASCIIのみ」を
+  **フォルダ選択時に**検査する（ZIP二重展開と、Windowsユーザー名が日本語で
+  全角パスになる事故を先回りする）。`build_jobs` でも実行直前に再検査
+- **再OCR出力名の規約**: `build_jobs` は `f"{pdf.stem}_{engine}.pdf"` を想定し、
+  各ツールの既定出力サフィックスと一致させてある。エンジン追加時は揃えること
+- 導入確認はワーカースレッドで行い、結果は `_yomi_result` / `_ndl_result` に
+  置いて `poll()`（メインスレッド）が拾う。**Tkinterを別スレッドから触らない**原則
 - **YomiToku経路は3つの.pyを同じフォルダに要求する**
   （`YOMITOKU_REQUIRED_SCRIPTS` = yomitoku_reocr / vision_reocr / jisui2epub）。
   実機で1つだけコピーして `ModuleNotFoundError` になったため、

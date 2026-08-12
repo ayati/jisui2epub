@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 """自炊変換GUI — 自炊PDFをePubに変換するWindows向けランチャー。
 
-jisui2epub / vision_reocr / docai_reocr / yomitoku_reocr / manga_p2epub を
-子プロセスとして
-起動する薄いGUI（設計は DESIGN_WindowsGUI.md）。ツール本体には一切手を
-入れず、公開CLIオプションの組み立てだけを行う。
+jisui2epub / vision_reocr / docai_reocr / yomitoku_reocr / ndlocr_reocr /
+manga_p2epub を子プロセスとして起動する薄いGUI（設計は DESIGN_WindowsGUI.md）。
+ツール本体には一切手を入れず、公開CLIオプションの組み立てだけを行う。
 
 依存: 標準ライブラリのみ（Tkinter）。tkinterdnd2 があればドラッグ&ドロップも
 有効になる（無ければクリック選択のみに自動退化）。
@@ -34,7 +33,7 @@ APP_NAME = "jisui2epubGUI"
 IS_WIN = sys.platform.startswith("win")
 
 TOOL_NAMES = ("jisui2epub", "vision_reocr", "docai_reocr",
-              "yomitoku_reocr", "manga_p2epub")
+              "yomitoku_reocr", "ndlocr_reocr", "manga_p2epub")
 
 BOOK_TYPES = (
     ("novel", "小説（縦書き）"),
@@ -61,8 +60,10 @@ DEFAULT_SETTINGS = {
     "font_size": 14,
     "book_type": "novel",
     "reocr": False,
-    "reocr_engine": "yomitoku",   # yomitoku / vision / docai
+    "reocr_engine": "yomitoku",   # yomitoku / ndlocr / vision / docai
     "python_path": "",            # yomitokuを入れたPython（手動指定用）
+    "ndlocr_python": "",          # NDLOCRの依存を入れたPython（手動指定用）
+    "ndlocr_dir": "",             # NDLOCR-Lite の clone 先
     "ruby_drop_horizontal": True,
     "gcp_json": "",
     "tool_paths": {},             # 名前 -> フルパス（手動上書き用）
@@ -109,14 +110,18 @@ def _script_python(script: Path):
     return sys.executable
 
 
-def _has_yomitoku(python_exe):
-    """そのPythonに yomitoku が入っているか。torchのimportは重いので
-    find_spec だけで判定する（数百msで済む）。"""
+def _has_modules(python_exe, modules):
+    """そのPythonに modules が全部入っているか。
+
+    import せず find_spec だけで判定する（yomitoku は torch を読むので
+    import すると数秒、onnxruntime も同様に重い。find_spec なら数百ms）。
+    """
+    code = ("import importlib.util,sys;"
+            "sys.exit(0 if all(importlib.util.find_spec(m) for m in %r) else 1)"
+            % (list(modules),))
     try:
         r = subprocess.run(
-            [python_exe, "-c",
-             "import importlib.util,sys;"
-             "sys.exit(0 if importlib.util.find_spec('yomitoku') else 1)"],
+            [python_exe, "-c", code],
             capture_output=True, timeout=30,
             creationflags=(subprocess.CREATE_NO_WINDOW if IS_WIN else 0),
         )
@@ -125,16 +130,24 @@ def _has_yomitoku(python_exe):
         return False
 
 
-def find_yomitoku_python(settings):
-    """yomitoku が入っている Python を探す。見つからなければ None。
+def _has_yomitoku(python_exe):
+    return _has_modules(python_exe, ("yomitoku",))
 
-    **yomitoku_reocr.py は exe 化してはならない**（PyInstallerがyomitoku本体の
-    コードをexeに取り込み、CC BY-NC-SA素材の再配布物になってしまう。本リポジトリ
-    のリリースzipはMITなので表記が矛盾する）。そのためGUIからは常に
-    「ユーザーのPython＋同梱の.py」という形で起動する。詳細はDESIGN_YomiToku.md §1。
+
+def _has_ndlocr_deps(python_exe):
+    """NDLOCR-Lite を動かせるPythonか。NDLOCR本体は別途cloneするので
+    見るのは依存ライブラリだけ（onnxruntime / opencv / PyYAML / PyMuPDF）。"""
+    return _has_modules(python_exe, ("onnxruntime", "cv2", "yaml", "fitz"))
+
+
+def _find_python(settings, has_func, manual_key):
+    """条件を満たす Python を探す。見つからなければ None。
+
+    設定の手動パス → 同フォルダの .venv → 実行中のPython（開発時）→
+    PATH上の py/python の順に見る。
     """
     cands = []
-    manual = settings.get("python_path", "")
+    manual = settings.get(manual_key, "")
     if manual:
         cands.append(manual)
     here = app_dir()
@@ -146,15 +159,38 @@ def find_yomitoku_python(settings):
     for c in cands:
         if os.path.sep in c and not Path(c).exists():
             continue
-        if _has_yomitoku(c):
+        if has_func(c):
             return c
     return None
+
+
+def find_yomitoku_python(settings):
+    """yomitoku が入っている Python を探す。見つからなければ None。
+
+    **yomitoku_reocr.py は exe 化してはならない**（PyInstallerがyomitoku本体の
+    コードをexeに取り込み、CC BY-NC-SA素材の再配布物になってしまう。本リポジトリ
+    のリリースzipはMITなので表記が矛盾する）。そのためGUIからは常に
+    「ユーザーのPython＋同梱の.py」という形で起動する。詳細はDESIGN_YomiToku.md §1。
+    """
+    return _find_python(settings, _has_yomitoku, "python_path")
+
+
+def find_ndlocr_python(settings):
+    """NDLOCRの依存が入っている Python を探す。見つからなければ None。
+
+    **こちらは yomitoku と違いライセンス上の制約ではない**（NDLOCR-Lite は
+    CC BY 4.0 で、そもそも本ツールに同梱しない）。exe を探さないのは
+    実務上の理由で、(1) NDLOCR本体は利用者が別途cloneした外部フォルダに
+    あり実行時にsys.pathへ載せる方式なので exe 化の利点が薄い、
+    (2) onnxruntime と opencv を同梱すると exe が肥大する、の2点。
+    """
+    return _find_python(settings, _has_ndlocr_deps, "ndlocr_python")
 
 
 # 再OCRエンジンの選択肢。YomiTokuを先頭＝既定にしている。Google Cloudは
 # アカウント作成・クレジットカード登録・毎月の請求という敷居があり、
 # 一般ユーザーが最初に試す先としては重いため
-ENGINE_CHOICES = ("yomitoku", "vision", "docai")
+ENGINE_CHOICES = ("yomitoku", "ndlocr", "vision", "docai")
 
 
 # インストール用のpipコマンド。ダイアログの「コピー」ボタンで
@@ -203,6 +239,99 @@ def missing_yomitoku_scripts():
     return [n for n in YOMITOKU_REQUIRED_SCRIPTS if not (here / n).exists()]
 
 
+# ── NDLOCR-Lite（無料・オフライン・商用可）────────────────────
+
+# ndlocr_reocr.py も yomitoku と同様に同じフォルダの.pyをimportして使う
+NDLOCR_REQUIRED_SCRIPTS = ("ndlocr_reocr.py", "vision_reocr.py", "jisui2epub.py")
+
+NDLOCR_PIP_COMMANDS = "pip install onnxruntime opencv-python-headless numpy PyYAML pymupdf"
+
+# 動作確認済みの版。ここが変わると静かに精度が落ちる経路があるため明示する
+NDLOCR_TESTED_COMMIT = "36d7c4d"
+
+NDLOCR_INSTALL_HELP = (
+    "NDLOCR-Lite（無料・オフライン・商用利用も可の再OCR）を使うには、\n"
+    "**初期設定が2つ**必要です。詳しい手順は同梱の\n"
+    "  README_NDLOCR.md（Windows向け導入ガイド）\n"
+    "に画面つきでまとめてあります。ここでは要点だけ示します。\n"
+    "\n"
+    "──【1】必要なライブラリを入れる ──────────────\n"
+    "\n"
+    "PowerShellを開いて次の1行を実行します\n"
+    "（下の「pipコマンドをコピー」ボタンでコピーできます）\n"
+    "\n"
+    f"{NDLOCR_PIP_COMMANDS}\n"
+    "\n"
+    "※ YomiTokuと違って PyTorch は不要です（約200MBで済みます）。\n"
+    "\n"
+    "──【2】NDLOCR-Lite 本体をダウンロードする ──────\n"
+    "\n"
+    "  https://github.com/ndl-lab/ndlocr-lite\n"
+    "\n"
+    "を開き、緑の「Code」ボタン →「Download ZIP」で取得して展開します\n"
+    "（Gitがあれば git clone でも可）。モデルファイルは同梱されているので\n"
+    "別途ダウンロードは不要です。\n"
+    "\n"
+    "★★ 置き場所に注意 ★★\n"
+    "  NDLOCR-Lite は、フォルダのパスに日本語（全角文字）が入っていると\n"
+    "  起動しません。C:\\ndlocr-lite のような場所に置いてください。\n"
+    "  Windowsのユーザー名が日本語の方は、デスクトップやドキュメントの\n"
+    "  下に置くとパスに日本語が混ざるので特にご注意ください。\n"
+    "\n"
+    "展開したら、この画面の「NDLOCR-Liteフォルダを選ぶ」ボタンで\n"
+    "そのフォルダ（直下に src フォルダがあるもの）を指定してください。\n"
+    "\n"
+    "──【3】このフォルダに置くファイル ─────────────\n"
+    "\n"
+    "     " + " / ".join(NDLOCR_REQUIRED_SCRIPTS) + "\n"
+    "  （3つとも必要で、互いをimportして使います）\n"
+    "\n"
+    "──【できること・できないこと】────────────────\n"
+    "\n"
+    "○ 完全無料・完全オフライン。アカウント登録もカード登録も不要\n"
+    "○ 商用利用もできます（CC BY 4.0）\n"
+    "× ルビ（ふりがな）はまだ苦手です（正解率65〜80%）。ルビの多い本を\n"
+    "  きれいに残したいなら Vision を選んでください\n"
+    "× 時代小説・古典には向きません（難しい漢字を似た字に置き換えます）\n"
+    "\n"
+    f"※ 動作確認しているのは NDLOCR-Lite の commit {NDLOCR_TESTED_COMMIT}"
+    "（2026-08-04）です。\n"
+    "  更新したら数ページ変換して出力を確認してください。\n"
+    "\n"
+    "【ライセンス】NDLOCR-Lite (c) 国立国会図書館（NDLラボ）/ CC BY 4.0\n"
+    "https://github.com/ndl-lab/ndlocr-lite\n"
+    "出典を表示すれば商用利用も可能です。"
+)
+
+
+def missing_ndlocr_scripts():
+    """ndlocr_reocr.py の実行に必要で、同じフォルダに無い.pyを返す。"""
+    here = app_dir()
+    return [n for n in NDLOCR_REQUIRED_SCRIPTS if not (here / n).exists()]
+
+
+def check_ndlocr_dir(path):
+    """NDLOCR-Lite のフォルダとして使えるか。使えれば ""、駄目なら理由。
+
+    ndlocr_reocr.py 側と同じ検査をGUIでも先にやる（実行してから
+    落ちるより、設定した時点で分かるほうが親切なため）。
+    """
+    if not path:
+        return "NDLOCR-Liteのフォルダが未設定です"
+    p = Path(path)
+    if not p.is_dir():
+        return f"フォルダが見つかりません: {path}"
+    if not (p / "src").is_dir():
+        return ("そのフォルダに src がありません。ZIPを展開すると\n"
+                "ndlocr-lite-main の中にもう一段 ndlocr-lite-main が\n"
+                "できることがあります。src が直下にあるフォルダを選んでください")
+    if any(ord(ch) > 0x7F for ch in os.path.abspath(str(p))):
+        return ("パスに日本語（全角文字）が含まれています。NDLOCR-Liteは\n"
+                "この場合起動しません。C:\\ndlocr-lite のような\n"
+                "半角英数字だけのパスに移動してください")
+    return ""
+
+
 def resolve_tool(name, settings):
     """ツール名 → 起動コマンド（リスト）を解決する。見つからなければ None。
 
@@ -226,6 +355,14 @@ def resolve_tool(name, settings):
             return None
         py = find_yomitoku_python(settings)
         return [py, str(here / "yomitoku_reocr.py")] if py else None
+
+    if name == "ndlocr_reocr":
+        # yomitoku と同じく exe を探さず「ユーザーのPython＋同梱の.py」で起動する
+        # （理由は find_ndlocr_python のコメント参照。ライセンス上の制約ではない）
+        if missing_ndlocr_scripts():
+            return None
+        py = find_ndlocr_python(settings)
+        return [py, str(here / "ndlocr_reocr.py")] if py else None
 
     script_name = "manga_p2epub.py" if name == "manga_p2epub" else f"{name}.py"
     exes = [here / f"{name}.exe", here / "forwindows" / f"{name}.exe"]
@@ -304,16 +441,39 @@ def build_jobs(cfg, settings):
                         "　処理を共有しているため、3つとも必要です）"
                     )
                 return [], ("YomiTokuが見つかりません。\n\n" + YOMITOKU_INSTALL_HELP)
+            if engine == "ndlocr":
+                lack = missing_ndlocr_scripts()
+                if lack:
+                    return [], (
+                        "NDLOCRの実行に必要なファイルが足りません。\n"
+                        f"次のファイルを {app_dir()} に置いてください:\n"
+                        "    " + " / ".join(lack) + "\n\n"
+                        "（ndlocr_reocr.py は vision_reocr.py と jisui2epub.py の\n"
+                        "　処理を共有しているため、3つとも必要です）"
+                    )
+                return [], ("NDLOCRを動かすライブラリが見つかりません。\n\n"
+                            + NDLOCR_INSTALL_HELP)
             return [], f"{engine}_reocr が見つかりません（設定でパスを指定してください）"
         env_extra = {}
-        if engine != "yomitoku":
-            # Vision / DocAI はGoogle Cloudの認証が要る。YomiTokuは完全ローカル
+        if engine not in ("yomitoku", "ndlocr"):
+            # Vision / DocAI はGoogle Cloudの認証が要る。ローカル2種は不要
             gcp = settings.get("gcp_json", "")
             if not gcp or not Path(gcp).exists():
                 return [], ("再OCRにはGoogle Cloudの認証JSONが必要です。"
                             "「認証JSONを選ぶ」で設定してください")
             env_extra["GOOGLE_APPLICATION_CREDENTIALS"] = gcp
         argv = tool + [str(pdf)]
+        if engine == "ndlocr":
+            # NDLOCR本体は別途cloneした外部フォルダ。設定した時点で検査済みだが
+            # フォルダが消えている・移動した場合もあるのでここでも見る
+            ndl_dir = settings.get("ndlocr_dir", "")
+            err = check_ndlocr_dir(ndl_dir)
+            if err:
+                return [], ("NDLOCR-Liteのフォルダの設定に問題があります。\n\n"
+                            + err + "\n\n"
+                            "「NDLOCR-Liteフォルダを選ぶ」で指定し直してください。\n"
+                            "手順は README_NDLOCR.md を参照してください。")
+            argv += ["--ndlocr-dir", ndl_dir]
         if cfg.get("reocr_start"):
             argv += ["--start", str(cfg["reocr_start"])]
         if cfg.get("reocr_end"):
@@ -683,6 +843,36 @@ class App:
                  "おすすめします。",
             wraplength=640, foreground="#a05000").pack(anchor="w")
 
+        # NDLOCR用（無料・オフライン・商用可）。**初期設定が要ることを明示する**
+        self.ndl_frame = ttk.Frame(self.reocr_frame)
+        n1 = ttk.Frame(self.ndl_frame)
+        n1.pack(anchor="w", pady=2)
+        self.ndl_var = tk.StringVar()
+        ttk.Button(n1, text="初期設定の手順",
+                   command=self.show_ndlocr_help).pack(side="left")
+        ttk.Button(n1, text="NDLOCR-Liteフォルダを選ぶ",
+                   command=self.pick_ndlocr_dir).pack(side="left", padx=4)
+        ttk.Button(n1, text="Pythonを選ぶ",
+                   command=self.pick_ndlocr_python).pack(side="left")
+        ttk.Label(n1, textvariable=self.ndl_var,
+                  wraplength=380).pack(side="left", padx=6)
+        ttk.Label(
+            self.ndl_frame,
+            text="※ 使う前に初期設定が必要です（ライブラリのインストールと、"
+                 "NDLOCR-Lite本体のダウンロード）。\n"
+                 "　 手順は同梱の README_NDLOCR.md、または上の"
+                 "「初期設定の手順」ボタンをご覧ください。\n"
+                 "　 NDLOCR-Liteを置くフォルダのパスに日本語を含めないでください"
+                 "（含むと起動しません）。",
+            wraplength=640, foreground="#0a5aa0").pack(anchor="w")
+        ttk.Label(
+            self.ndl_frame,
+            text="※ 無料・オフラインで商用利用も可（CC BY 4.0）ですが、"
+                 "ルビはまだ苦手です（正解率65〜80%）。\n"
+                 "　 ルビの多い本は Vision を、時代小説・古典は "
+                 "Vision / Document AI をおすすめします。",
+            wraplength=640, foreground="#a05000").pack(anchor="w")
+
         # Vision / DocAI用（Google Cloud認証）
         self.gcp_frame = ttk.Frame(self.reocr_frame)
         r4 = ttk.Frame(self.gcp_frame)
@@ -731,7 +921,8 @@ class App:
                 self.reocr_frame.pack(anchor="w", fill="x")
 
     def on_reocr_toggle(self):
-        if self.reocr_var.get() and self.engine_var.get() != "yomitoku":
+        if (self.reocr_var.get()
+                and self.engine_var.get() not in ("yomitoku", "ndlocr")):
             gcp = self.settings.get("gcp_json", "")
             if not gcp or not Path(gcp).exists():
                 self.pick_gcp()
@@ -739,12 +930,15 @@ class App:
 
     def on_engine_change(self):
         """エンジンに応じて、下に出す設定行を切り替える。"""
-        yomi = self.engine_var.get() == "yomitoku"
-        self.gcp_frame.pack_forget()
-        self.yomi_frame.pack_forget()
-        if yomi:
+        engine = self.engine_var.get()
+        for fr in (self.gcp_frame, self.yomi_frame, self.ndl_frame):
+            fr.pack_forget()
+        if engine == "yomitoku":
             self.yomi_frame.pack(anchor="w", fill="x")
             self._update_yomi_label()
+        elif engine == "ndlocr":
+            self.ndl_frame.pack(anchor="w", fill="x")
+            self._update_ndl_label()
         else:
             self.gcp_frame.pack(anchor="w", fill="x")
 
@@ -764,6 +958,14 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def show_yomitoku_help(self):
+        self._show_help_dialog("YomiTokuのインストール手順",
+                               YOMITOKU_INSTALL_HELP, YOMITOKU_PIP_COMMANDS)
+
+    def show_ndlocr_help(self):
+        self._show_help_dialog("NDLOCRの初期設定の手順",
+                               NDLOCR_INSTALL_HELP, NDLOCR_PIP_COMMANDS)
+
+    def _show_help_dialog(self, title, help_text, pip_text):
         """インストール手順のダイアログ。
 
         messagebox.showinfo だと本文を選択できず、実機で「全文をコピーして
@@ -774,13 +976,13 @@ class App:
         from tkinter import ttk
 
         win = tk.Toplevel(self.root)
-        win.title("YomiTokuのインストール手順")
+        win.title(title)
         win.transient(self.root)
 
-        body = tk.Text(win, wrap="word", width=78, height=24,
+        body = tk.Text(win, wrap="word", width=78, height=26,
                        font=self.ui_font, borderwidth=8, relief="flat")
         body.pack(fill="both", expand=True, padx=6, pady=6)
-        body.insert("1.0", YOMITOKU_INSTALL_HELP)
+        body.insert("1.0", help_text)
         # 読み取り専用にしつつ選択・コピーは許す（state="disabled" だと
         # 選択もできなくなるので、編集キーだけ無効化する）
         body.bind("<Key>", lambda e: (
@@ -792,7 +994,7 @@ class App:
 
         def copy_pip():
             self.root.clipboard_clear()
-            self.root.clipboard_append(YOMITOKU_PIP_COMMANDS)
+            self.root.clipboard_append(pip_text)
             status.set("コピーしました。PowerShellに貼り付けてください")
 
         ttk.Button(bar, text="pipコマンドをコピー",
@@ -800,6 +1002,68 @@ class App:
         ttk.Button(bar, text="閉じる", command=win.destroy).pack(side="right")
         ttk.Label(bar, textvariable=status,
                   foreground="#0a7").pack(side="left", padx=8)
+
+    def _update_ndl_label(self):
+        """NDLOCRの初期設定が済んでいるかを表示する。
+
+        ライブラリの確認は別プロセス起動を伴って遅いのでワーカースレッドで行い、
+        結果は _ndl_result 経由で poll()（メインスレッド）が拾う。
+        **Tkinterを別スレッドから触らないため。**
+        """
+        self.ndl_var.set("確認中...")
+
+        def work():
+            lack = missing_ndlocr_scripts()
+            if lack:
+                self._ndl_result = "不足: " + " / ".join(lack)
+                return
+            py = find_ndlocr_python(self.settings)
+            if not py:
+                self._ndl_result = "ライブラリ未導入 →「初期設定の手順」へ"
+                return
+            err = check_ndlocr_dir(self.settings.get("ndlocr_dir", ""))
+            if err:
+                self._ndl_result = "NDLOCR-Liteフォルダ未設定"
+                return
+            self._ndl_result = f"準備OK（{os.path.basename(py)}）"
+
+        self._ndl_result = None
+        threading.Thread(target=work, daemon=True).start()
+
+    def pick_ndlocr_dir(self):
+        """NDLOCR-Lite の clone 先を選ぶ。選んだ時点で使えるか検査する。"""
+        from tkinter import filedialog, messagebox
+
+        path = filedialog.askdirectory(title="NDLOCR-Lite のフォルダを選ぶ")
+        if not path:
+            return
+        err = check_ndlocr_dir(path)
+        if err:
+            messagebox.showwarning("このフォルダは使えません", err)
+            return
+        self.settings["ndlocr_dir"] = path
+        save_settings(self.settings)
+        self._update_ndl_label()
+
+    def pick_ndlocr_python(self):
+        """NDLOCRの依存を入れたPythonを手動で指定する（PATHにない場合用）。"""
+        from tkinter import filedialog, messagebox
+
+        ftypes = [("Python", "python.exe")] if IS_WIN else [("すべて", "*")]
+        path = filedialog.askopenfilename(title="python.exe を選ぶ",
+                                          filetypes=ftypes)
+        if not path:
+            return
+        if not _has_ndlocr_deps(path):
+            messagebox.showwarning(
+                "必要なライブラリが入っていません",
+                "選んだPythonには NDLOCR に必要なライブラリ"
+                "（onnxruntime / opencv / PyYAML / PyMuPDF）が入っていません。"
+                f"\n\n{NDLOCR_INSTALL_HELP}")
+            return
+        self.settings["ndlocr_python"] = path
+        save_settings(self.settings)
+        self._update_ndl_label()
 
     def pick_python(self):
         """yomitokuを入れたPythonを手動で指定する（PATHにない場合用）。"""
@@ -1036,6 +1300,9 @@ class App:
         if getattr(self, "_yomi_result", None):
             self.yomi_var.set(self._yomi_result)
             self._yomi_result = None
+        if getattr(self, "_ndl_result", None):
+            self.ndl_var.set(self._ndl_result)
+            self._ndl_result = None
         # Win32 D&D（wnd_proc）からのドロップをTk側スレッド文脈で処理する
         while self._dropped_paths:
             self._on_drop_paths(self._dropped_paths.pop(0))
