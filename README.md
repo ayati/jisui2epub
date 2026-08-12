@@ -405,7 +405,7 @@ Linux/macOS なら次の3行で済む。
 ```bash
 # セットアップ（初回のみ）。NDLOCR-Lite 本体は同梱していないので自分で取得する
 git clone https://github.com/ndl-lab/ndlocr-lite
-.venv/bin/pip install onnxruntime opencv-python-headless numpy PyYAML
+.venv/bin/pip install onnxruntime opencv-python-headless numpy PyYAML pillow
 
 # 実行（既定出力は <入力>_ndlocr.pdf）
 .venv/bin/python ndlocr_reocr.py 本.pdf --ndlocr-dir /path/to/ndlocr-lite
@@ -413,6 +413,15 @@ git clone https://github.com/ndl-lab/ndlocr-lite
 
 `--ndlocr-dir` は環境変数 `NDLOCR_DIR` でも指定できる。`--start` / `--end` /
 `--preprocess` は他のバックエンドと同じ。
+
+**⚠️ NDLOCR-Lite の `requirements.txt` は使わないこと。** 上の1行で足りる。
+本家の requirements は本家GUI用の依存（`flet` 等）まで含むうえ全版がピン留めで、
+**`numpy==2.2.2` に Python 3.14 用の wheel が無いためソースビルドに落ち、
+Windows では `Microsoft Visual C++ 14.0 or greater is required` で止まる**
+（実機で報告あり）。jisui2epub が呼ぶのは `deim.py`（検出）と `parseq.py`
+（認識）だけで、その依存は onnxruntime / opencv / numpy / PyYAML / **Pillow**
+の5つ。PDFの読み書きは jisui2epub 側の PyMuPDF が担当する。
+**Pillow は必須**（`deim.py`・`parseq.py` が `from PIL import Image` する）。
 
 **⚠️ NDLOCR-Lite を置くパスに日本語（全角文字）を含めないこと。** 本家の
 制限で、全角文字を含むと起動しない。`ndlocr_reocr.py` は起動時に検査して
@@ -431,6 +440,16 @@ NDLOCR-Lite は**ルビ（`block_rubi`）の位置は返すが文字を読まな
 ルビの切り出し・認識・書き戻しは jisui2epub 側の自作になる。ここがまだ弱い。
 6冊での実測は 地下室80.1% / 蘇我氏74.4% / グリック74.3% / 霧71.8% /
 黒牢城65.2%（ソフロニアはルビが少なすぎて測定不能）。
+
+> **2026-08 の改善（この6冊は再測していないので上の数値は改善前）**:
+> ルビ列を語に切る処理が「1画素でも暗ければインク」でノイズに弱く、
+> 語間の空白が埋まって**隣の語と結合していた**（自我即空《じがそくくう》＋
+> 色即是空《しきそくぜくう》→ 1語）。インク判定と語間しきい値を較正し直し、
+> 新サンプル3冊で 百億 54.6→**63.8%** / ぼくがぼくであること 85.8→86.8% /
+> 三国志（五）74.2→74.5%（本文再現率・章立ては不変）。
+> **外来語カタカナルビ・梵語・固有名詞が密な本は依然 Vision が確実**
+> （百億は素のスキャナOCRの69.0%にも届かない。原因は稀用漢字を似た字に
+> 置き換える誤りが親文字側にも出るため）。
 
 - **本文だけ再OCRしたい／ルビの無い本なら現時点でも十分**（`--no-ruby` で
   ルビ後段を止められる）
