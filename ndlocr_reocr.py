@@ -210,6 +210,33 @@ def _read_cascade(crop):
     return best
 
 
+def _dedup_ruby_boxes(boxes):
+    """重なり合う block_rubi を潰す（確信度の高い・大きいほうを残す）。
+
+    **DEIM の NMS（IOU 0.2）はルビ箱の重複を抑えない。** 実測で
+    地下室P.4-15は186箱中122組、蘇我氏は33箱中11組が5割以上重なっていた。
+    潰さないと**同じ読みが2回書き戻され、Y順で交互に噛み合う**
+    （中大兄皇子《なかのおおえのみこ》→《なかのなおかのおおえおのえみのこみのこ》）。
+    boxes は (conf, x0, y0, x1, y1) のリスト。
+    """
+    order = sorted(boxes, key=lambda b: (-b[0], -((b[3] - b[1]) * (b[4] - b[2]))))
+    kept = []
+    for conf, x0, y0, x1, y1 in order:
+        area = (x1 - x0) * (y1 - y0)
+        drop = False
+        for _, kx0, ky0, kx1, ky1 in kept:
+            ox = min(x1, kx1) - max(x0, kx0)
+            oy = min(y1, ky1) - max(y0, ky0)
+            if ox <= 0 or oy <= 0:
+                continue
+            if ox * oy > 0.5 * min(area, (kx1 - kx0) * (ky1 - ky0)):
+                drop = True
+                break
+        if not drop:
+            kept.append((conf, x0, y0, x1, y1))
+    return kept
+
+
 def _split_ruby_runs(crop):
     """縦書きルビ列を、行方向（Y）のインクの切れ目で語に分割する。
 
@@ -278,34 +305,41 @@ def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
 
     det = _MODELS["det"]
     lines = []
+    ruby_boxes = []
     for d in det.detect(img):
         cls = d["class_name"]
-        is_ruby = with_ruby and cls == RUBY_CLASS
-        if not is_ruby and cls not in BODY_CLASSES and cls not in MARGIN_CLASSES:
-            continue
         x0, y0, x1, y1 = [int(v) for v in d["box"]]
         if x1 <= x0 or y1 <= y0:
             continue
+        if with_ruby and cls == RUBY_CLASS:
+            ruby_boxes.append((float(d["confidence"]), x0, y0, x1, y1))
+            continue
+        if cls not in BODY_CLASSES and cls not in MARGIN_CLASSES:
+            continue
         crop = img[y0:y1, x0:x1]
         if crop.size == 0:
-            continue
-        if is_ruby:
-            # 語ごとに切って読み、切片ごとに1行として積む。位置は実測なので
-            # 親文字への対応付けは jisui2epub の attach_rubies に任せられる
-            # 幅は実インク相当に縮める（中心は保つ）。RUBY_INK_RATIO 参照
-            rxc = (x0 + x1) / 2
-            rhalf = (x1 - x0) * RUBY_INK_RATIO / 2
-            for a, b in _split_ruby_runs(crop):
-                txt = _read_ruby(crop[a:b + 1])
-                if txt:
-                    lines.append({"cls": cls, "text": txt,
-                                  "box": (rxc - rhalf, y0 + a,
-                                          rxc + rhalf, y0 + b + 1)})
             continue
         text = _read_cascade(crop)
         if not text.strip():
             continue
         lines.append({"cls": cls, "box": (x0, y0, x1, y1), "text": text})
+
+    # ルビは重複を潰してから語に切る（_dedup_ruby_boxes の説明を参照）。
+    # 語ごとに切って読み、切片ごとに1行として積む。位置は実測なので
+    # 親文字への対応付けは jisui2epub の attach_rubies に任せられる
+    for _, x0, y0, x1, y1 in _dedup_ruby_boxes(ruby_boxes):
+        crop = img[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        # 幅は実インク相当に縮める（中心は保つ）。RUBY_INK_RATIO 参照
+        rxc = (x0 + x1) / 2
+        rhalf = (x1 - x0) * RUBY_INK_RATIO / 2
+        for a, b in _split_ruby_runs(crop):
+            txt = _read_ruby(crop[a:b + 1])
+            if txt:
+                lines.append({"cls": RUBY_CLASS, "text": txt,
+                              "box": (rxc - rhalf, y0 + a,
+                                      rxc + rhalf, y0 + b + 1)})
     return lines, (w, h)
 
 
