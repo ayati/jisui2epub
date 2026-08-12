@@ -136,8 +136,14 @@ def _has_yomitoku(python_exe):
 
 def _has_ndlocr_deps(python_exe):
     """NDLOCR-Lite を動かせるPythonか。NDLOCR本体は別途cloneするので
-    見るのは依存ライブラリだけ（onnxruntime / opencv / PyYAML / PyMuPDF）。"""
-    return _has_modules(python_exe, ("onnxruntime", "cv2", "yaml", "fitz"))
+    見るのは依存ライブラリだけ
+    （onnxruntime / opencv / PyYAML / Pillow / PyMuPDF）。
+
+    Pillow は NDLOCR-Lite 側の deim.py・parseq.py が
+    `from PIL import Image` するので必須（入れ忘れると
+    「NDLOCR-Lite の読み込みに失敗しました」で落ちる）。"""
+    return _has_modules(python_exe,
+                        ("onnxruntime", "cv2", "yaml", "PIL", "fitz"))
 
 
 def _find_python(settings, has_func, manual_key):
@@ -244,7 +250,8 @@ def missing_yomitoku_scripts():
 # ndlocr_reocr.py も yomitoku と同様に同じフォルダの.pyをimportして使う
 NDLOCR_REQUIRED_SCRIPTS = ("ndlocr_reocr.py", "vision_reocr.py", "jisui2epub.py")
 
-NDLOCR_PIP_COMMANDS = "pip install onnxruntime opencv-python-headless numpy PyYAML pymupdf"
+NDLOCR_PIP_COMMANDS = ("pip install onnxruntime opencv-python-headless "
+                       "numpy PyYAML pillow pymupdf")
 
 # 動作確認済みの版。ここが変わると静かに精度が落ちる経路があるため明示する
 NDLOCR_TESTED_COMMIT = "36d7c4d"
@@ -263,6 +270,11 @@ NDLOCR_INSTALL_HELP = (
     f"{NDLOCR_PIP_COMMANDS}\n"
     "\n"
     "※ YomiTokuと違って PyTorch は不要です（約200MBで済みます）。\n"
+    "※ NDLOCR-Lite に付いてくる requirements.txt は使わないでください。\n"
+    "  あちらは本家のGUI用の重い依存まで含み、しかも版が固定されている\n"
+    "  ため、新しいPython（3.14等）ではNumPyのビルドが走って\n"
+    "  「Microsoft Visual C++ 14.0 or greater is required」で止まります。\n"
+    "  上の1行だけで動きます（必要なものはこれで全部です）。\n"
     "\n"
     "──【2】NDLOCR-Lite 本体をダウンロードする ──────\n"
     "\n"
@@ -1058,7 +1070,8 @@ class App:
             messagebox.showwarning(
                 "必要なライブラリが入っていません",
                 "選んだPythonには NDLOCR に必要なライブラリ"
-                "（onnxruntime / opencv / PyYAML / PyMuPDF）が入っていません。"
+                "（onnxruntime / opencv / PyYAML / Pillow / PyMuPDF）"
+                "が入っていません。"
                 f"\n\n{NDLOCR_INSTALL_HELP}")
             return
         self.settings["ndlocr_python"] = path

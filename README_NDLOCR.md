@@ -47,7 +47,8 @@
 ### 1.1 Python のインストール
 
 <https://www.python.org/downloads/windows/> から Python 3.10 以降の
-インストーラをダウンロードして実行します。
+インストーラをダウンロードして実行します（**3.12 か 3.13 が無難**です。
+理由は3章の注意書きにあります）。
 
 **インストーラ最初の画面で「Add python.exe to PATH」に必ずチェックを入れてください。**
 これを忘れると後でコマンドが見つからなくなります。
@@ -108,20 +109,45 @@ python -m venv .venv
 
 ## 3. ライブラリを入れる
 
-`(.venv)` が表示されている状態で:
+`(.venv)` が表示されている状態で、**次の1行だけ**実行します。
 
 ```powershell
-# jisui2epub 本体が使うもの
-pip install pymupdf
-
-# NDLOCR-Lite を動かすために必要なもの
-pip install onnxruntime opencv-python-headless numpy PyYAML
+pip install onnxruntime opencv-python-headless numpy PyYAML pillow pymupdf
 ```
 
-合計200MB程度、数分かかります。
+合計200MB程度、数分かかります。これで必要なものは全部そろいます。
 
 > **YomiToku と違って PyTorch は不要です。** NDLOCR-Lite は ONNX Runtime で
 > 動くので、3GB近い CUDA 版を引いてしまう心配がありません。
+
+### ⚠️ NDLOCR-Lite の `requirements.txt` は使わないでください
+
+NDLOCR-Lite 本家の README には
+`pip install -r requirements.txt` と書かれていますが、
+**jisui2epub から使う場合これは実行しないでください。** 上の1行で足ります。
+
+理由は2つあります。
+
+1. **本家の `requirements.txt` は本家のGUI・CLI用**で、jisui2epub が使わない
+   ものまで入っています（`flet`＝GUI framework、`reportlab`、`pypdfium2`、
+   `networkx`、`protobuf` など）。jisui2epub は NDLOCR-Lite の文字検出
+   （`deim.py`）と文字認識（`parseq.py`）だけを直接呼ぶので、PDFの読み書きは
+   jisui2epub 側の PyMuPDF が担当します
+2. **版がすべて固定されている**（`numpy==2.2.2` など）ため、**新しい Python
+   では「その版のインストール済みパッケージ（wheel）が存在しない」状態になり、
+   pip がソースからのビルドを始めます。** その結果
+   `Microsoft Visual C++ 14.0 or greater is required` などのエラーで止まります
+   （`numpy==2.2.2` の Windows 版が用意されているのは Python 3.13 まで。
+   Python 3.14 で `-r requirements.txt` を実行するとこれが起きます）
+
+上の1行は版を固定していないので、**pip が自分の Python に合う出来合いの版を
+選んでくれます。C/C++ コンパイラ（Visual Studio Build Tools）は要りません。**
+
+> **もし既にビルドエラーで詰まっている場合**は、Build Tools を入れる必要は
+> ありません。`.venv` フォルダを丸ごと消して 2章からやり直し、3章の1行だけを
+> 実行してください。それでも直らないときは「6. うまくいかないとき」の
+> [NumPy のインストールでビルドエラーになる](#numpy-のインストールでビルドエラーになる--microsoft-visual-c-140-or-greater-is-required)
+> を見てください。
 
 ---
 
@@ -248,8 +274,60 @@ ZIP を展開すると `ndlocr-lite-main\ndlocr-lite-main\src\...` のように
 3章のライブラリが入っていません。`(.venv)` が表示されているか確認してから:
 
 ```powershell
-pip install onnxruntime opencv-python-headless numpy PyYAML
+pip install onnxruntime opencv-python-headless numpy PyYAML pillow pymupdf
 ```
+
+`No module named 'PIL'` と出た場合も同じです（Pillow は NDLOCR-Lite 側が
+使います。以前の版のこのガイドでは書き漏らしていました）。
+
+### NumPy のインストールでビルドエラーになる / `Microsoft Visual C++ 14.0 or greater is required`
+
+**NDLOCR-Lite の `requirements.txt` を使ったときに起きます。**
+`pip install -r .\ndlocr-lite\requirements.txt` は実行しないでください
+（理由は[3章の注意書き](#-ndlocr-lite-の-requirementstxt-は使わないでください)）。
+
+固定された古い版の NumPy に、お使いの Python 用の出来合いの
+インストール済みパッケージ（wheel）が無いため、pip がソースから
+コンパイルしようとして失敗しています。同種のメッセージは他にも出ます。
+
+```
+error: Microsoft Visual C++ 14.0 or greater is required
+error: metadata-generation-failed
+ninja: build stopped / meson.build:… ERROR
+```
+
+**直し方（おすすめ）**
+
+```powershell
+# 1. 壊れかけの仮想環境を捨てる（PowerShellで .venv のある場所に移動してから）
+deactivate                      # 有効化していれば
+Remove-Item -Recurse -Force .venv
+
+# 2. 作り直す
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+
+# 3. 版を固定しない、この1行だけを実行する
+pip install onnxruntime opencv-python-headless numpy PyYAML pillow pymupdf
+```
+
+pip が自分の Python に合う版を選ぶので、コンパイラは不要です。
+
+**それでも直らないとき**は、Python が新しすぎる可能性があります。
+`python --version` で確認し、3.14 以降なら
+[Python 3.13](https://www.python.org/downloads/windows/) を入れ直して
+（3.14 と共存できます）、`py -3.13 -m venv .venv` で仮想環境を作り直して
+ください。
+
+> **Visual Studio Build Tools を入れる必要はありません。**
+> ネット上には `winget install Microsoft.VisualStudio.2022.BuildTools` で
+> C++ コンパイラを入れて解決する方法も出てきますが、数GBのダウンロードが
+> 必要で、この用途には割に合いません。上のやり方でコンパイル自体を
+> 回避できます。
+>
+> （NDLOCR-Lite 本家のGUI・CLIをそのまま使いたくて `requirements.txt` を
+> 通したい場合は、Build Tools を入れるより **Python 3.13 以下を使う**ほうが
+> 簡単です。）
 
 ### `python` が見つからない / `pip` が見つからない
 
