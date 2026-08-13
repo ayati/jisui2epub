@@ -8,6 +8,11 @@ output/
 # 前処理ラボの計測結果（ページ正解にGOAL本文の抜粋を含む）
 scratchpad/preproc_out/
 
+# 回帰テストの生成物（regress.sh が作り直す）
+scratchpad/reg_baseline/
+scratchpad/reg_new/
+scratchpad/base_jisui2epub.py
+
 # 変換結果
 *.txt
 *.jpg

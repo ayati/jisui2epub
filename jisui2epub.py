@@ -43,7 +43,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -237,6 +237,139 @@ def collect_spans(page):
     return [s for s in spans if s["text"]]
 
 
+# ── 重複スパンの畳み込み ───────────────────────────────
+#
+# 設計書 DESIGN_横書き対応.md §13.1。**同じ文字列が同じ場所に2回入っている
+# テキスト層**があり、jisui2epub は両方を同じ行にまとめるので1字ずつ
+# 交互に噛み合う。実測した2つの形:
+#
+#   (a) 行まるごとの重複（シナリオのためのファンタジー事典・横書き）
+#       「左端が欠けた短い版」と「完全版」が同一y帯に入り、
+#       `騎騎士士道道ととはは何何かか` になる。47ページ・91行
+#
+#   (b) 1文字ずつ書き戻された箱の重なり（赤毛のアン・NDLOCR 旧版・縦書き）
+#       検出箱が2つ出て `第二章` と `二章マシュ…驚き` が別々に書かれ、
+#       y順に並べると `第二二章章マシュ…` になる
+#
+# **元データ由来だが畳まないのはこちらの穴**。OCRエンジンを問わず起きるので
+# analyze_page のクラスタリング前で潰す。
+#
+# 判定は「bbox が大きく重なる」＋「テキストが重複している」の2条件。
+# 重なりのしきい値 0.6 は、**正当に隣り合う文字を巻き込まないため**に要る:
+# 縦組みの連続する文字（「ああ」等）は送り1つぶん離れており、描画bboxが
+# フォントサイズの1.2倍あっても重なりは0.17〜0.40に収まる。重複箱は
+# 実測0.87（赤毛のアン p20 の `二`）で、はっきり分かれる。
+
+DUP_SPAN_OVERLAP = 0.6    # 小さいほうの面積に対する重なりの比
+DUP_SPAN_MIN_LEN = 4      # 部分文字列判定を許す最小文字数（§13.1）
+# 比較を許すフォントサイズ比の上限。**ルビを本文と比較させないため**に要る。
+# 実測: 同一テキストの正当な重複は 1.22（霧の `「わたし、`）〜1.35
+# （ファンタジー事典の見出し 31.43pt 対 23.27pt。**同じ文字列でも
+# サイズがこれだけ違って申告される**）、ルビ対本文は 2.7〜6.7（黒牢城）。
+DUP_SPAN_SIZE_TOL = 2.0
+# 同一テキスト規則(b)を許す字種。**かな・漢字だけ**に限る。
+# 約物（…―・･.•·「）と数字は縦組みで詰めて組まれ、連続すると描画bboxが
+# 正当に0.6〜0.8重なる（黒牢城の実測: `……` 0.63・`･･` 0.82・ノンブル
+# `122` の `22` 0.75）。長音ーと々も繰り返しが正当なので入れない。
+_DUP_SPAN_TEXT_RE = re.compile(r'[ぁ-ゖァ-ヺ㐀-鿿]+')
+
+
+def _area(bb):
+    return (bb[2] - bb[0]) * (bb[3] - bb[1])
+
+
+def _bbox_overlap_ratio(a, b):
+    """2つのbboxの重なり面積 ÷ 小さいほうの面積。"""
+    ox = min(a[2], b[2]) - max(a[0], b[0])
+    oy = min(a[3], b[3]) - max(a[1], b[1])
+    if ox <= 0 or oy <= 0:
+        return 0.0
+    sa = (a[2] - a[0]) * (a[3] - a[1])
+    sb = (b[2] - b[0]) * (b[3] - b[1])
+    small = min(sa, sb)
+    return (ox * oy) / small if small > 0 else 0.0
+
+
+def dedup_overlapping_spans(spans):
+    """同じ場所に重複して入っているスパンを落とす。
+
+    (a) 4文字以上のスパン同士: 片方が他方の部分文字列で bbox が重なるなら
+        短いほうを捨てる。**下限4文字は §13.1 の実測**（8文字にすると
+        見出し `騎士道とは何か`(7字) が漏れて検出が47ページ→14ページに落ちる）。
+        多字スパンはページあたり数十本なので総当たりでよい。
+    (b) 同一テキストのスパン同士: bbox が重なるなら片方を捨てる。
+        1文字スパンで書き戻された箱の重なりがこの形になる。こちらは
+        1ページ千本級になりうるので、テキストで引いてから比較する。
+
+    **どちらもフォントサイズが同程度であることを要求する**（実測で必須）。
+    無条件だとルビが親文字と同じ文字のとき（本文「は」の上のルビ「は」）に
+    bbox が完全に含まれて重なり1.00になり、**本文側が落ちる**
+    （黒牢城 p421。ルビ3.3pt 対 本文12.8pt）。
+    """
+    if len(spans) < 2:
+        return spans
+    drop = set()
+
+    def _same_scale(a, b):
+        sa, sb = a["size"], b["size"]
+        if sa <= 0 or sb <= 0:
+            return False
+        return 1 / DUP_SPAN_SIZE_TOL <= sa / sb <= DUP_SPAN_SIZE_TOL
+
+    # (a) 多字スパンの部分文字列重複
+    longs = [(i, s) for i, s in enumerate(spans)
+             if len(s["text"]) >= DUP_SPAN_MIN_LEN]
+    for a in range(len(longs)):
+        ia, sa = longs[a]
+        if ia in drop:
+            continue
+        for b in range(a + 1, len(longs)):
+            ib, sb = longs[b]
+            if ib in drop or not _same_scale(sa, sb):
+                continue
+            ta, tb = sa["text"], sb["text"]
+            if ta not in tb and tb not in ta:
+                continue
+            if _bbox_overlap_ratio(sa["bbox"], sb["bbox"]) < DUP_SPAN_OVERLAP:
+                continue
+            if len(ta) != len(tb):
+                drop.add(ib if len(tb) < len(ta) else ia)
+            else:
+                drop.add(ib if _area(sb["bbox"]) <= _area(sa["bbox"]) else ia)
+            if ia in drop:
+                break
+
+    # (b) 同一テキストのスパンの重なり（かな・漢字のみ。_DUP_SPAN_TEXT_RE 参照）
+    by_text = {}
+    for i, s in enumerate(spans):
+        if _DUP_SPAN_TEXT_RE.fullmatch(s["text"]):
+            by_text.setdefault(s["text"], []).append(i)
+    for idxs in by_text.values():
+        if len(idxs) < 2:
+            continue
+        for a in range(len(idxs)):
+            ia = idxs[a]
+            if ia in drop:
+                continue
+            for b in range(a + 1, len(idxs)):
+                ib = idxs[b]
+                if ib in drop or not _same_scale(spans[ia], spans[ib]):
+                    continue
+                if _bbox_overlap_ratio(spans[ia]["bbox"],
+                                       spans[ib]["bbox"]) >= DUP_SPAN_OVERLAP:
+                    # **必ず小さいほうを捨てる。** 万一ルビと親文字が同文で
+                    # 比較に乗っても、本文側が消える事故（黒牢城 p421）に
+                    # ならないようにする
+                    if _area(spans[ib]["bbox"]) <= _area(spans[ia]["bbox"]):
+                        drop.add(ib)
+                    else:
+                        drop.add(ia)
+                        break
+    if not drop:
+        return spans
+    return [s for i, s in enumerate(spans) if i not in drop]
+
+
 def transpose_spans(spans, page_h):
     """横書きモード用: スパンbboxを90度転置する（(x,y)→(H−y,x)）。
 
@@ -310,6 +443,7 @@ def analyze_page(fpage, num, body_size, horizontal=False):
     horizontal=True で横書きモード: スパンを転置してから同じ解析を行う。
     以降の「縦行」は紙面の横書き行、座標は転置後（x′=H−y, y′=x）を指す。"""
     spans = collect_spans(fpage)
+    spans = dedup_overlapping_spans(spans)
     if horizontal:
         transpose_spans(spans, fpage.rect.height)
         pg = Page(num, fpage.rect.height, fpage.rect.width)
@@ -1097,6 +1231,369 @@ def detect_body_end(pages, drop, body_size, body_top, horizontal=False):
     return end if end is not None and lo <= end < nums[-1] else None
 
 
+# ── 柱ラン（柱の変化点）による章境界の検出 ──────────────────────
+#
+# 設計書 DESIGN_柱ラン章立て.md。
+#
+# 現行の見出し検出はすべて「章題がページの中に読める形で存在する」ことを
+# 前提にしている（is_big はサイズ、is_hashira_head と detect_chapter_marks は
+# ページ内テキスト、refine_headings_with_toc は本文側の見出し）。章頭が
+# 全面挿絵の中扉で章題が柱にしか無い本（天久鷹央の推理カルテ）はこの前提を
+# 満たさず、章立てが原理的に作れない。
+#
+# 柱の出現ページ集合を連続区間（柱ラン）に割れば、ページ内のテキストを
+# 一切読まずに章地図が復元できる。柱が章題である本では**章区間は互いに素で
+# 本文全体を敷き詰める**ので、これをそのまま発火ゲートにできる（被覆率）。
+#
+# hashira_keys を再利用してはならない。あちらは「3文字以上、2文字なら頻度5
+# 以上」を課すため、推理カルテの章題「泡」（1文字）が落ちる。柱ランは長さを
+# 問わない代わりに**連続性**で信頼する。
+
+PILLAR_RUN_SIM = 0.66         # 柱表記のあいまい一致（matches_hashira と同じ）
+PILLAR_RUN_MIN_PAGES = 3      # ランを構成する最小ページ数
+PILLAR_RUN_MIN_SPAN = 3       # ランの最小ページ幅
+PILLAR_RUN_MIN_DENS = 0.30    # 出現密度。見開き片面だけの柱でも 0.5 前後
+PILLAR_RUN_MAX_SPAN = 0.60    # 幅が全体のこの割合を超えるランは書名の柱
+PILLAR_RUN_MIN_RUNS = 3       # これ未満なら「柱＝章題の本」ではない
+PILLAR_RUN_MIN_COVER = 0.60   # 採用ランが自身の全体レンジを敷き詰める割合
+PILLAR_HEAD_MAX_BACK = 4      # 章頭ページを遡って探す上限
+PILLAR_FRONT_TAIL = 0.03      # この範囲で終わるランは前付け（表紙・扉）
+# 巻末広告の柱（実業之日本社文庫好評既刊 等）。推理カルテでは
+# detect_body_end が効かない（広告ページの列が本文と同じく天から始まり、
+# 深い列比 0.00〜0.07。DESIGN_柱ラン章立て.md §2.5）ため、ここで落とす
+_PILLAR_AD_RE = re.compile(r'(既刊|新刊|好評|目録|近刊)')
+
+
+def _pillar_margin_texts(pages, drop):
+    """ページ番号 -> 柱候補（正規化テキスト, 生テキスト）のリスト。"""
+    out = {}
+    for pg in pages:
+        items = []
+        for ln in list(pg.vlines) + list(pg.hlines):
+            if (pg.num, id(ln)) not in drop:
+                continue
+            text = ln.text.strip()
+            if not text or NOMBRE_RE.match(re.sub(r'\s+', "", text)):
+                continue
+            key = norm_hashira(text)
+            # かな・漢字を含まない断片（'Karte.' 等）は表記が散るので使わない
+            if not key or not re.search(r'[ぁ-ゖァ-ヺー㐀-鿿]', key):
+                continue
+            items.append((key, text))
+        if items:
+            out[pg.num] = items
+    return out
+
+
+def _pillar_margin_bands(pages, drop, body_size):
+    """ページ番号 -> [(y中心, 連結テキスト)] — 同じy帯のマージン行をx昇順で連結。
+
+    1文字1スパンのOCR（三国志（五））では柱が `9 | 亡 | 流` と3行に割れ、
+    行単位のクラスタでは最頻の1文字（`亡`）しか代表にならない。柱は紙面の
+    横一列なので、同じ y 帯を x 順に連ねれば元の章題が復元できる。
+    **ラン検出そのものには使わない**（推理カルテのように `Karte,01` と
+    `泡` が同じ帯にある本では `Karte,泡` のように変種が散る）。ラベルの
+    修復にだけ使い、採否は _pillar_better_label が字種で判断する。
+    """
+    out = {}
+    tol = body_size * 0.8
+    for pg in pages:
+        rows = []
+        for ln in list(pg.vlines) + list(pg.hlines):
+            if (pg.num, id(ln)) not in drop:
+                continue
+            text = ln.text.strip()
+            if not text:
+                continue
+            rows.append(((ln.y0 + ln.y1) / 2, ln.x0, text))
+        if not rows:
+            continue
+        rows.sort()
+        bands = []
+        for yc, x0, text in rows:
+            if bands and yc - bands[-1][0][0] <= tol:
+                bands[-1].append((yc, x0, text))
+            else:
+                bands.append([(yc, x0, text)])
+        out[pg.num] = [
+            (b[0][0], "".join(t for _, _, t in sorted(b, key=lambda r: r[1])))
+            for b in bands]
+    return out
+
+
+# ラベル修復で採用する字種: かな・漢字・中黒だけ。英字や記号が混じる連結
+# （推理カルテの `Karte､泡`）は行単位の代表より悪いので採らない
+_PILLAR_LABEL_RE = re.compile(r'[ぁ-ゖァ-ヺー々〇㐀-鿿・]{2,}')
+
+
+def _pillar_better_label(rep, bands, run_pages):
+    """y帯連結からラベルを復元する。良くならなければ rep を返す。"""
+    votes = Counter()
+    for num in run_pages:
+        for _, text in bands.get(num, ()):
+            key = norm_hashira(text)
+            if rep in key and len(key) > len(rep) and \
+                    _PILLAR_LABEL_RE.fullmatch(key):
+                votes[key] += 1
+    if not votes:
+        return rep
+    best, n = votes.most_common(1)[0]
+    # 章の半分以上のページで同じ連結が得られたときだけ採用する
+    return best if n * 2 >= len(run_pages) else rep
+
+
+def _pillar_clusters(per_page):
+    """柱表記を difflib で寄せ、代表 -> 出現ページ集合 と 代表 -> 表示用表記。"""
+    freq = Counter(k for items in per_page.values() for k, _ in items)
+    reps, mapping = [], {}
+    for key, _ in freq.most_common():
+        hit = None
+        for r in reps:
+            if difflib.SequenceMatcher(None, key, r).ratio() >= PILLAR_RUN_SIM:
+                hit = r
+                break
+        if hit is None:
+            reps.append(key)
+            hit = key
+        mapping[key] = hit
+    pageset = {}
+    raws = {}
+    for num, items in per_page.items():
+        for key, text in items:
+            rep = mapping[key]
+            pageset.setdefault(rep, set()).add(num)
+            if key == rep:
+                raws.setdefault(rep, Counter())[text] += 1
+    return pageset, raws, mapping
+
+
+def _pillar_run_candidates(pageset, npages):
+    """(出現数, 先頭, 末尾, 代表) のラン候補。貪欲に非重複で採用して返す。"""
+    cands = []
+    for rep, ps in pageset.items():
+        ps = sorted(ps)
+        span = ps[-1] - ps[0] + 1
+        if len(ps) < PILLAR_RUN_MIN_PAGES or span < PILLAR_RUN_MIN_SPAN:
+            continue
+        if len(ps) / span < PILLAR_RUN_MIN_DENS:
+            continue
+        if span > npages * PILLAR_RUN_MAX_SPAN:
+            continue
+        cands.append((len(ps), ps[0], ps[-1], rep))
+    # 出現数の多い順に採用し、既採用と1ページでも重なるものは捨てる
+    # （章区間は互いに素であるべき、という構造制約）
+    cands.sort(key=lambda c: (-c[0], c[1]))
+    chosen = []
+    for cnt, lo, hi, rep in cands:
+        if any(not (hi < l or lo > h) for _, l, h, _ in chosen):
+            continue
+        chosen.append((cnt, lo, hi, rep))
+    chosen.sort(key=lambda c: c[1])
+    return chosen
+
+
+# ギャップ回収で受け入れる柱の字種。**記号を1文字も許さない**。
+# 1回しか出ない柱は頻度で裏を取れないので、字種で締める以外にない。
+# 中扉のOCRジャンク（ミヲ』・句弓〆遙／0）はここで落ちる
+_PILLAR_CLEAN_RE = re.compile(r'[ぁ-ゖァ-ヺー々〇㐀-鿿A-Za-z0-9]+')
+
+
+def _pillar_gap_candidates(per_page, pageset, image_pages, wlo, lo, reps,
+                           title, author, body_end):
+    """章頭ページの窓に残った「ラン化しなかった柱」を返す。
+
+    **画像ページは対象外**。中扉のOCRは純ジャンク（影謬・露：・濁）で、
+    これを拾うと章頭ごとに偽の章題が1個ずつ増える（実測: 推理カルテで
+    7章に対し12件になった）。
+    """
+    out = []
+    for num in range(wlo, lo):
+        if num in image_pages:
+            continue
+        for key, text in per_page.get(num, ()):
+            if len(pageset.get(key, ())) >= PILLAR_RUN_MIN_PAGES:
+                continue
+            # ランの代表と、y帯連結で修復したラベルの**両方**と比べる。
+            # 修復後のラベルと比べないと、黒牢城の `第四章`（ギャップ側）が
+            # `落日孤影`（代表）としか照合されず、修復後の
+            # `第四章落日孤影` と二重に並ぶ
+            if any(key == r
+                   or difflib.SequenceMatcher(None, key, r).ratio()
+                   >= PILLAR_RUN_SIM
+                   # あいまい一致では届かない包含（比0.545）を別に見る
+                   or key in r or r in key
+                   for r in reps if r):
+                continue
+            if not (2 <= len(key) <= HEADING_MAX_LEN):
+                continue
+            if not _PILLAR_CLEAN_RE.fullmatch(key):
+                continue
+            if not valid_heading_item(key):
+                continue
+            if _pillar_is_frontback(key, text, title, author, body_end):
+                continue
+            out.append((num, key, text))
+    return out
+
+
+def _pillar_is_frontback(rep, raw, title, author, body_end):
+    """前付け・後付けの柱か（書名・著者名・巻末広告の定型）。"""
+    if _PILLAR_AD_RE.search(rep) or _PILLAR_AD_RE.search(raw):
+        return True
+    for ref in (title, author):
+        if ref and len(_norm_t(ref)) >= 2 and \
+                _heading_fuzzy_score(_norm_t(rep), _norm_t(ref)) >= 0.85:
+            return True
+    return False
+
+
+def detect_backmatter_by_pillar(pages, drop):
+    """巻末広告の柱から本文終端（0基点）を求める。無ければ None。
+
+    `_body_end_by_layout` の「列の天揃い」は、広告ページが本文と同じく
+    ページ天から始まる単一ブロックで組まれた本では空振りする（推理カルテの
+    実測は深い列比 0.00〜0.07 で本文と同じ。DESIGN_柱ラン章立て.md §2.5）。
+    一方この種の広告は柱に「実業之日本社文庫好評既刊」を持つので、
+    柱の側から同じ境界を引ける。誤爆を避けるため
+    detect_body_end と同じく末尾 BACKMATTER_TAIL の範囲に限る。
+    """
+    if len(pages) < 20:
+        return None
+    nums = sorted(pg.num for pg in pages)
+    lo = nums[int(len(pages) * (1 - BACKMATTER_TAIL))]
+    per_page = _pillar_margin_texts(pages, drop)
+    pageset, _, _ = _pillar_clusters(per_page)
+    starts = [min(ps) for rep, ps in pageset.items()
+              if _PILLAR_AD_RE.search(rep)
+              and len(ps) >= PILLAR_RUN_MIN_PAGES and min(ps) >= lo]
+    if not starts:
+        return None
+    end = min(starts) - 1
+    return end if lo <= end < nums[-1] else None
+
+
+def detect_pillar_runs(pages, drop, body_size, image_pages=None,
+                       title=None, author=None, body_end=None,
+                       horizontal=False):
+    """柱の変化点から章境界を求める。戻り値: {章頭ページ番号: 章題}
+
+    横書きモードは対象外（転置後の柱の幾何が別物で実測サンプルも無い）。
+    """
+    if horizontal or len(pages) < 20:
+        return {}
+    image_pages = image_pages or set()
+    npages = len(pages)
+    per_page = _pillar_margin_texts(pages, drop)
+    if not per_page:
+        return {}
+    pageset, raws, _ = _pillar_clusters(per_page)
+    runs = _pillar_run_candidates(pageset, npages)
+    bands = _pillar_margin_bands(pages, drop, body_size)
+
+    # 前付け・後付けのランはゲートの前に落とす（被覆率の分母を汚さない）
+    kept = []
+    for cnt, lo, hi, rep in runs:
+        raw = raws.get(rep, Counter()).most_common(1)
+        raw = raw[0][0] if raw else rep
+        # 1文字1スパンOCRで切り詰められた章題をy帯連結から復元する
+        raw = _pillar_better_label(norm_hashira(raw), bands,
+                                   sorted(pageset[rep]))
+        if _pillar_is_frontback(rep, raw, title, author, body_end):
+            continue
+        if body_end is not None and lo > body_end:
+            continue
+        # 前付け（表紙・扉・レーベル名）のラン。後付けと対称に落とす。
+        # 百億の `ハヤカワ文庫JA`(p1-3) は書名でも著者名でも広告定型でもない
+        # ので字面では落とせないが、位置で落とせる。本文の章がこの範囲で
+        # 終わることはない（百億の序章ランは p7-19 で範囲外）
+        if hi < npages * PILLAR_FRONT_TAIL:
+            continue
+        kept.append((cnt, lo, hi, rep, raw))
+    # 章題が2つのクラスタに割れることがある（黒牢城の `第四章` と
+    # `第四章落日孤影`）。隣り合うランのラベルが一方を含むなら同じ章なので
+    # 畳んで長いほうを採る。1文字ラベルは偶然の包含が起きるので対象外
+    merged = []
+    for item in kept:
+        if merged:
+            a, b = norm_hashira(merged[-1][4]), norm_hashira(item[4])
+            if len(a) >= 2 and len(b) >= 2 and (a in b or b in a):
+                pc, plo, phi, prep, praw = merged[-1]
+                keep_raw = praw if len(a) >= len(b) else item[4]
+                keep_rep = prep if len(a) >= len(b) else item[3]
+                merged[-1] = (pc + item[0], plo, item[2], keep_rep, keep_raw)
+                continue
+        merged.append(item)
+    kept = merged
+    if len(kept) < PILLAR_RUN_MIN_RUNS:
+        return {}
+    total = kept[-1][2] - kept[0][1] + 1
+    cover = sum(hi - lo + 1 for _, lo, hi, _, _ in kept) / max(total, 1)
+    if cover < PILLAR_RUN_MIN_COVER:
+        return {}
+
+    # ── 章頭ページの算出 ──
+    # lo = max(前ランの末尾+1, ラン先頭 - PILLAR_HEAD_MAX_BACK)
+    # 章頭 = 窓の中の最初の画像ページ（中扉）。無ければ窓の先頭
+    result = {}          # 章頭ページ -> (章題, ラン先頭, ラン末尾)
+    prev_end = None
+    used = set()
+    for cnt, lo, hi, rep, raw in kept:
+        wlo = lo - PILLAR_HEAD_MAX_BACK
+        if prev_end is not None:
+            wlo = max(wlo, prev_end + 1)
+        wlo = max(wlo, 0)
+        # ラン確立後のギャップ回収: 窓の中に残った別の柱は独立した章
+        # （推理カルテのプロローグは柱が p9 の1回だけでランにならない）。
+        # **1窓につき1件まで**。窓は最大4ページなので2章は入らない
+        for num, key, text in _pillar_gap_candidates(
+                per_page, pageset, image_pages, wlo, lo,
+                (rep, norm_hashira(raw)), title, author, body_end):
+            gs = max(num - PILLAR_HEAD_MAX_BACK, 0)
+            if prev_end is not None:
+                gs = max(gs, prev_end + 1)
+            cand = [p for p in range(gs, num + 1) if p in image_pages]
+            head = cand[-1] if cand else num
+            if head not in used and (not result or head > max(result)):
+                result[head] = (text, num, num)
+                used.add(head)
+            break
+        cand = [p for p in range(wlo, lo + 1) if p in image_pages]
+        head = cand[0] if cand else wlo
+        while head in used:
+            head += 1
+        if result and head <= max(result):
+            head = max(result) + 1
+        if head <= hi:
+            result[head] = (raw, lo, hi)
+            used.add(head)
+        prev_end = hi
+    return result
+
+
+def filter_pillar_chapters(runs, heading_pages):
+    """既存経路が同じ章境界を拾っている柱ランを落とす。
+
+    戻り値: {章頭ページ: 章題}
+
+    柱ランは**補完**なので、既存の見出し検出が同じ章の頭を別ページで
+    拾っている場合に足すと二重になる。実測（ほんものの魔法使・グリックの
+    冒険＝どちらも既に GOAL の nav と一致している本）で、ページ単位の
+    「そのページに見出しが無ければ発行」では防げず、
+    `14 迫りくる嵐` の隣に `迫りくる嵐` が並ぶ・`６ ドブネズミのガンバ` が
+    2個出る、といった重複が出た。
+
+    判定の窓は **[章頭ページ, ラン先頭]**（章の入口）に限る。章の途中に
+    ある節番号の見出しまで数えると、章題が本当に欠けている章まで
+    落としてしまう（蘇我氏の第一章・第五章・第六章・おわりに）。
+    """
+    out = {}
+    for head, (title, lo, hi) in runs.items():
+        if any(head <= p <= max(lo, head) for p in heading_pages):
+            continue
+        out[head] = title
+    return out
+
+
 # ── 画像ページ（挿絵・口絵・画像主体の章頭）の検出と抽出 ──────────────
 
 def _page_ink_ratio(doc_page):
@@ -1138,6 +1635,82 @@ def classify_image_pages(doc, pages, drop):
         if _page_ink_ratio(doc[pg.num]) > threshold:
             result.add(pg.num)
     return result
+
+
+# ── 章頭画像の等間隔検出（DESIGN_柱ラン章立て.md §4）─────────────
+#
+# 章頭が全面挿絵で、章番号が画像の中の囲み数字にしかない本
+# （ぼくがぼくであること）は、柱が書名なので柱ランが不発火する。
+# この型は**画像ページの出現間隔の規則性**だけで解ける。
+#
+# 読めた囲み数字は使わない。素の ScanSnap は1つも読まず、NDLOCR も
+# `2)`・`1,,00`・`717` と壊れる。GOAL の nav が裸の番号 1〜15 なので
+# **出現順の連番のほうが正確**（FINDINGS_章立て_柱ラン.md §4）。
+
+# 閾値は挿絵の多い本での実測（scratchpad/probe_imggap.py）で決めた。
+# 鎖＝間隔が中央値の±15%でつながる最長の並び:
+#   ぼく          鎖15 間隔21.0 CV=0.031 覆い0.86  ← 章頭画像（発火させたい）
+#   タイム・リープ上 鎖 4 間隔34.0 CV=0.072 覆い0.45
+#   霧            鎖 8 間隔10.0 CV=0.052 覆い0.30
+#   グリック/タイム・リープ下/地下室/伯爵夫人  鎖<3
+# **CV では分けられない**（0.031〜0.072 で差が出ない）。効くのは
+# 鎖の長さと「鎖が本を覆う割合」の2つで、どちらもぼくと他とで
+# 2倍以上開く。覆いの閾値は 0.45 と 0.86 の間に取る
+IMGCHAP_TOL = 0.15          # 間隔のばらつき許容（中央値比）
+IMGCHAP_MIN_CHAIN = 5       # 鎖の最小要素数（タイム・リープ上の4を弾く）
+IMGCHAP_MIN_SPAN = 0.60     # 鎖が本を覆う割合の下限（霧0.30・タイレ上0.45を弾く）
+IMGCHAP_MIN_GAP = 6         # これ未満の間隔は章でなく連続挿絵
+
+
+def _image_chain(cands, tol=IMGCHAP_TOL):
+    """間隔が中央値の ±tol でつながる最長の鎖を返す。"""
+    if len(cands) < 3:
+        return []
+    gaps = [b - a for a, b in zip(cands, cands[1:])]
+    g = statistics.median(gaps)
+    if g < IMGCHAP_MIN_GAP:
+        return []
+    lo, hi = g * (1 - tol), g * (1 + tol)
+    best, cur = [], [cands[0]]
+    for a, b in zip(cands, cands[1:]):
+        if lo <= b - a <= hi:
+            cur.append(b)
+        else:
+            if len(cur) > len(best):
+                best = cur
+            cur = [b]
+    return cur if len(cur) > len(best) else best
+
+
+def detect_image_chapters(pages, drop, image_pages, body_end=None):
+    """章頭画像ページを等間隔性で選び {page_num: 連番文字列} を返す。
+
+    候補は「直後が本文ページである画像ページ」。表紙・口絵（直後も画像）と
+    奥付（間隔が外れる）はこれで落ちる。実測（ぼく・画像19枚）では
+    章頭15枚が間隔19〜22で揃い、前付け・奥付は 1・2・26・16 で外れた。
+    """
+    if not image_pages or len(pages) < 20:
+        return {}
+    by_num = {pg.num: pg for pg in pages}
+
+    def nbody(num):
+        pg = by_num.get(num)
+        if pg is None:
+            return 0
+        return sum(1 for v in pg.vlines if v.text.strip()
+                   and (pg.num, id(v)) not in drop
+                   and not is_junk_line(v.text.strip()))
+
+    med = statistics.median([nbody(pg.num) for pg in pages]) or 1
+    cands = [p for p in sorted(image_pages)
+             if nbody(p + 1) >= med * 0.6
+             and (body_end is None or p <= body_end)]
+    chain = _image_chain(cands)
+    if len(chain) < IMGCHAP_MIN_CHAIN:
+        return {}
+    if (chain[-1] - chain[0] + 1) / len(pages) < IMGCHAP_MIN_SPAN:
+        return {}
+    return {p: str(i + 1) for i, p in enumerate(chain)}
 
 
 def render_image_page(doc, page_num):
@@ -1468,7 +2041,8 @@ def split_columns(pages):
 def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                   hashira_keys=None, indent=True, verbose=False,
                   image_pages=None, horizontal=False,
-                  chapter_marks=None, body_end=None):
+                  chapter_marks=None, body_end=None, pillar_chapters=None,
+                  heading_pages_out=None):
     """全ページから青空文庫形式の本文を組み立てる。
     image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
     horizontal: 横書きモード。見出しの飾り囲み剥がしと見出し条件の強化
@@ -1477,10 +2051,20 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         drop より優先し、本文行と同じ読み順で見出しとして発行する
     body_end: 本文の最終ページ番号（detect_body_end）。これより後ろのページでは
         後付け章語（解説・あとがき等）以外の見出しを発行しない
+    pillar_chapters: {page_num: 章題} — detect_pillar_runs の結果。
+        **そのページに既存経路の見出しが無いときだけ**発行する補完用
+        （DESIGN_柱ラン章立て.md §1.2）。既存経路が同じ章境界を別ページで
+        拾っている場合の重複除去は呼び出し側（_filter_pillar_chapters）が行う
+    heading_pages_out: set — 見出しを発行したページ番号を書き出す（省略可）。
+        柱ランの重複判定のための1パス目で使う
     """
     hashira_keys = hashira_keys or {}
     image_pages = image_pages or {}
     chapter_marks = chapter_marks or {}
+    pillar_chapters = pillar_chapters or {}
+    # 柱ランが確定した章題。印刷目次ページの抑止に使う（2文字以下は
+    # 本文の短い行に当たるので除く）
+    pillar_titles = {t for t in pillar_chapters.values() if len(t) >= 3}
     out = []             # 段落のリスト（文字列）
     cur = ""             # 組み立て中の段落
     prev_line_short = True   # 直前の行が途中で終わった（段落末尾）か
@@ -1489,6 +2073,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
     last_heading_norm = None
     paras_since_heading = 99
     junk_count = [0]
+    cur_page = [None]    # 見出し発行元のページ番号（heading_pages_out 用）
 
     def flush():
         nonlocal cur, paras_since_heading
@@ -1529,6 +2114,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                 return
         if out or first_heading_done:
             emit_pagebreak()
+        if heading_pages_out is not None and cur_page[0] is not None:
+            heading_pages_out.add(cur_page[0])
         out.append(f"［＃「{title}」は中見出し］")
         out.append(title)
         out.append(f"［＃「{title}」は中見出し終わり］")
@@ -1562,6 +2149,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
     n_backdrop = [0]
 
     for pg in pages:
+        cur_page[0] = pg.num
         # 章頭マーカーは drop より優先して抜き出す（ノンブル・短い断片として
         # 落とされているのが常態）。発行位置に使うソートキーは本文行と同じ
         # 「紙面の右→左」＝ -xc
@@ -1718,6 +2306,19 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
             page_headings = [t for t in page_headings
                              if valid_heading_item(t) or
                              (solo and matches_hashira(t, exact=True))]
+        # 印刷目次ページの抑止（柱ランが章題を確定できた本でのみ）。
+        # 章題が3つ以上並ぶページは目次であって章頭ではない。既存の
+        # toc_like（柱一致3行以上）は is_hashira_head しか止めないため、
+        # 大活字の目次行が is_big で見出しになるのを防げていなかった
+        # （推理カルテ p5 が「人魂の原料　次幻…不可視の胎児　叫一オーダー
+        #  メイドの毒薬　別沸き下ろし蜜柑と真鶴」という1個の見出しになる）
+        if pillar_titles and pg.num not in pillar_chapters:
+            n_pt = sum(1 for t in page_headings
+                       if any(pt in t or t in pt for pt in pillar_titles))
+            if n_pt >= 3:
+                page_headings = []
+                page_marks = []
+
         # 長すぎる「見出し」（表紙・帯・奥付などの誤検出）は本文段落に落とす
         long_items = [t for t in page_headings if len(t) > HEADING_MAX_LEN]
         page_headings = [t for t in page_headings if len(t) <= HEADING_MAX_LEN]
@@ -1730,6 +2331,14 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
             n_backdrop[0] += len(page_headings) - len(keep)
             page_headings = keep
             page_marks = []
+
+        # 柱ランが章頭と決めたページに既存経路の見出しが無ければ補う。
+        # 既存の見出しがあるページでは何もしない＝二重発行しない
+        # （推理カルテのエピローグは is_hashira_head が拾うのでここは不発火）
+        if (pg.num in pillar_chapters and not page_headings
+                and not page_marks
+                and not (body_end is not None and pg.num > body_end)):
+            page_headings = [pillar_chapters[pg.num]]
 
         # ── 画像ページ（挿絵・口絵・章頭）: 図タグを改ページに挟んで挿入 ──
         # 章頭ページの見出しテキストは目次のため先に発行する
@@ -1752,6 +2361,10 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                             and matches_hashira(t)):
                         kept = [t]
                         break
+            # 中扉のOCRが純ジャンクな本（推理カルテ）はページ内に手掛かりが
+            # 無い。柱ランが決めた章題をここで補う（DESIGN_柱ラン章立て.md §2.9）
+            if not kept and pg.num in pillar_chapters:
+                kept = [pillar_chapters[pg.num]]
             if kept:
                 emit_heading("　".join(kept))
             flush()
@@ -3057,7 +3670,7 @@ def parse_pages_arg(arg, npages):
 
 
 # OCR 方式タグ（ファイル名末尾に付けた運用で、著者名へ混入するのを防ぐ）
-_METHOD_TAGS = ("vision", "docai", "yomitoku", "ocr", "scansnap")
+_METHOD_TAGS = ("vision", "docai", "yomitoku", "ndlocr", "ocr", "scansnap")
 
 
 def _is_method_tag(name: str) -> bool:
@@ -3089,7 +3702,7 @@ def _strip_method_tag(name: str) -> str:
 def parse_meta_from_filename(path):
     """「タイトル_作者名.pdf」形式のファイル名から (title, author) を推定する。
     「タイトル_作者名_方式.pdf」のように末尾へ OCR 方式タグ
-    （vision/docai/yomitoku/ocr/scansnap）を付けた運用にも対応し、
+    （vision/docai/yomitoku/ndlocr/ocr/scansnap）を付けた運用にも対応し、
     著者名からは方式タグを取り除く。
     「タイトル_方式.pdf」（著者名を書かずに気軽に試す形）では**著者名なし**を返す。
     タグをそのまま著者にすると dc:creator が「docai」になり、yomikake の
@@ -5931,6 +6544,31 @@ def _group_section_episodes(episodes: list) -> None:
         ep["group"] = chapter["title"]
 
 
+# 自動採番のエピソード名（本文側に見出しが無いときの仮題）
+_AUTO_EP_TITLE_RE = re.compile(r'第\d+話')
+
+
+def _frontmatter_title(body: str) -> str:
+    """最初の見出しより前の無名セクションの目次名を中身から決める。
+
+    このセクションの実体は本文ではなく**前付け**である。実測（14冊）:
+      タイム・リープ上 = 口絵3枚 / グリック = 挿絵2枚＋書名 /
+      ほんもの = 書名＋挿絵＋書名 / 黒牢城・地下室 = 扉画像1枚 /
+      霧・蘇我氏・伯爵夫人 = 空（エントリ自体が出ない）
+
+    そのため「第1話」（話数形式でない本の目次で浮く）も「本文」（本文ではない）
+    も適さない。**図タグしか無ければ「口絵」、テキストがあれば「扉」**とする。
+    """
+    for ln in body.split("\n"):
+        t = ln.strip()
+        if not t or t == "［＃改ページ］":
+            continue
+        if _FIG_CAP_RE.fullmatch(t) or _FIG_PLAIN_RE.fullmatch(t):
+            continue
+        return "扉"
+    return "口絵"
+
+
 def parse_aozora_text(content: str) -> tuple:
     """
     青空文庫書式テキスト（このツールが出力する形式）を解析して
@@ -6032,6 +6670,14 @@ def parse_aozora_text(content: str) -> tuple:
     # 見出しマーカーがなく1セクションしかない場合はタイトルをそのまま使用
     if len(episodes) == 1 and episodes[0]["title"].startswith("第1話"):
         episodes[0]["title"] = title
+    else:
+        # 最初の見出しより前の無名セクションに「第1話」と付けない。
+        # 実体は本文でなく**前付け**（口絵・扉画像・書名の扉）で、
+        # 「第1話」は話数形式でない本の目次で浮く（第1話→第一章→第二章）。
+        # 中身で呼び分ける（_frontmatter_title）。
+        for ep in episodes:
+            if _AUTO_EP_TITLE_RE.fullmatch(ep["title"]):
+                ep["title"] = _frontmatter_title(ep["body"])
 
     # エピソードが空 → ファイル全体を1エピソードとして扱う
     if not episodes and body_content.strip():
@@ -6274,6 +6920,9 @@ def main():
         horizontal=args.horizontal, toc_pages=toc_pages)
     body_end = None if args.no_backmatter_cut else detect_body_end(
         pages, drop, body_size, body_top, horizontal=args.horizontal)
+    if body_end is None and not args.no_backmatter_cut and not args.horizontal:
+        # 列の天揃いでは見えない巻末広告を柱から拾う（推理カルテ）
+        body_end = detect_backmatter_by_pillar(pages, drop)
     if body_end is not None:
         print(f"本文終端: p{body_end + 1}（以降は後付けとして見出し化しない）")
 
@@ -6303,6 +6952,59 @@ def main():
                     f.write(data)
             print(f"画像ページ検出: {len(image_page_map)} 枚 → {img_dir}/")
 
+    # 柱ランによる章境界（DESIGN_柱ラン章立て.md）。章頭ページの算出に
+    # 画像ページ（中扉）を使うので、画像ページ検出の後に行う
+    pillar_runs = {} if args.no_chapter_marks else detect_pillar_runs(
+        pages, drop, body_size, image_pages=set(image_page_map),
+        title=title, author=author, body_end=body_end,
+        horizontal=args.horizontal)
+    # 章頭が全面挿絵で柱が書名の本（ぼくがぼくであること）は柱ランが
+    # 不発火する。画像ページの等間隔性で拾う（DESIGN_柱ラン章立て.md §4）
+    image_chapters = {} if (args.no_chapter_marks or pillar_runs) else \
+        detect_image_chapters(pages, drop, set(image_page_map), body_end)
+
+    pillar_chapters = {}
+    if pillar_runs or image_chapters:
+        # 1パス目は柱ラン無しで組み、既存経路が見出しを出したページを集める。
+        # 同じ章境界を既に拾っている本（ほんもの・グリック）で二重にしない
+        probe_pages = set()
+        assemble_text(pages, drop, headings, body_size,
+                      body_top, body_bottom, hashira_keys,
+                      indent=not args.no_indent,
+                      image_pages=image_page_map,
+                      horizontal=args.horizontal,
+                      chapter_marks=chapter_marks, body_end=body_end,
+                      heading_pages_out=probe_pages)
+    if pillar_runs:
+        # **既存の見出しのほうが柱ランより多い本には手を出さない。**
+        # 章立てが既にできている本（ほんもの22・グリック50・タイム・リープ47・
+        # 黒牢城58 に対し柱ランは19/32/6/8）に柱ランを足すと、残るのは
+        # OCRが崩れた取りこぼしだけ（`ひイ`・`の`・`盾1ワリェム`・
+        # `149 堀４軍金曜から木曜`）で、しかも章番号の再構成を巻き添えにする
+        # （ほんものは 14〜20 の番号が全部落ちた）。逆に柱ランのほうが多い本
+        # （推理カルテ 5対7・三国志 25対39・百億 10対11）は柱ランが正しい
+        if len(probe_pages) >= len(pillar_runs):
+            print(f"柱ラン: 既存見出し {len(probe_pages)} 件がラン "
+                  f"{len(pillar_runs)} 件以上のため見送り")
+        else:
+            pillar_chapters = filter_pillar_chapters(pillar_runs, probe_pages)
+            titles = "/".join(pillar_chapters[k]
+                              for k in sorted(pillar_chapters))
+            print(f"柱ランによる章境界: {len(pillar_chapters)} 件 "
+                  f"（ラン {len(pillar_runs)} / 既存見出しと重複 "
+                  f"{len(pillar_runs) - len(pillar_chapters)}）{titles[:60]}")
+    elif image_chapters:
+        # 連番は通し番号なので**一部だけ採用してはならない**。鎖のどこかに
+        # 既存の見出しがあるなら、その本には既に章立てがあるとみなして
+        # 丸ごと見送る（番号が飛ぶ目次のほうが害が大きい）
+        if any(p in probe_pages or p + 1 in probe_pages
+               for p in image_chapters):
+            print("章頭画像の等間隔: 既存見出しと競合するため見送り")
+        else:
+            pillar_chapters = image_chapters
+            print(f"章頭画像の等間隔で章境界: {len(pillar_chapters)} 件 "
+                  f"(p{min(pillar_chapters) + 1}〜p{max(pillar_chapters) + 1})")
+
     # 横書きモード: 段組ページを帯（段）ごとの仮想ページに分割してから組む。
     # 画像ページ検出の後に行う（検出はページ単位の本文行数を使うため）
     if args.horizontal:
@@ -6315,7 +7017,8 @@ def main():
                          indent=not args.no_indent, verbose=args.verbose,
                          image_pages=image_page_map,
                          horizontal=args.horizontal,
-                         chapter_marks=chapter_marks, body_end=body_end)
+                         chapter_marks=chapter_marks, body_end=body_end,
+                         pillar_chapters=pillar_chapters)
 
     if not args.no_toc_refine:
         body, toc_stats = refine_headings_with_toc(
