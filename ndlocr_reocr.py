@@ -129,6 +129,62 @@ REC_SHORT_RATIO = 0.7
 # 100字級でも飽和した横長行は半分に割って読み、連結する（本家と同じ）
 CASCADE_SPLIT_LEN = 98
 
+# ── 読み過ぎ行の切り詰め ─────────────────────────────────
+# **PARSEQ は1文字だけの箱を「同じ字が2つ」と読む。** parseq.py の
+# preprocess は縦長の切片を90度回してから**縦横比を無視して**入力寸法
+# （24x256 等）へリサイズするので、節番号のような1文字の箱（実測 26x34px）は
+# 横に7倍以上引き伸ばされる。連帯惑星ピザンの危機（節番号が裸の算用数字）の
+# 実測では `2`→`21`・`1`→`11`・`4`→`44` となり、**ePubの目次の章題が
+# 「11 21 44 66」に化けた**（本文再現率は 75%→98% と大きく改善する一方で）。
+#
+# **余白を足して比を整える対処は逆効果**。行方向のうしろに紙の地の色を
+# 足して比を 3〜10 に寄せる実験では `2`→`20`→`200`、`「殺せ」`→
+# `「殺せ」という。` と伸びた（モデルは幅いっぱいに字が並ぶ前提で学習
+# されている）。**読んだあとに幾何で弾く**しかない。
+#
+# 読み過ぎた行は「1文字ピッチ（箱の高さ÷字数）がページ本文ピッチより
+# 極端に小さい」形で必ず現れる。4冊×30ページの実測（縦行1367本）:
+#
+#   読み過ぎ  ピザン `11` 0.44 / `66` 0.46 / `21` `44` 0.47 / 推理カルテ `1.` 0.39
+#   正 常     百億 `た。` 0.60 / 三国志 `て、` 0.61 / ピザン `す。` 0.63 …
+#             以降は 0.7〜1.1 に密集（全体の96%が0.8以上）
+#
+# 0.46 と 0.60 のあいだは空いているので 0.55 で切る。**横行は対象外**＝
+# 柱・ノンブルは半角数字が並ぶので本文ピッチと比較できない（`36` の箱は
+# 31x24px で、縦行と同じ尺で見ると「読み過ぎ」に見える）
+TRIM_PITCH_RATIO = 0.55
+# ページ本文ピッチの標本にする縦行の最小字数（短い行はピッチが揺れる）
+TRIM_BODY_MIN_CHARS = 6
+# 標本がこの本数に満たないページは触らない（挿絵・中扉ページ）
+TRIM_MIN_SAMPLES = 3
+
+# **ピッチ比だけで切ってはならない。** 本文より小さい活字の行は、正しく
+# 読めていてもピッチ比が同じ帯に落ちる。天久鷹央の推理カルテ30ページの
+# 実測では候補5件のうち2件が**ルビ**（`ひざ` 0.47 ・ `にな` 0.47。NDLOCR が
+# ルビ箱でなく line_main / line_note として返したもの）で、ピッチ比だけだと
+# `ひ`・`に` に削れて本文から仮名が消える。
+#
+# 決め手は**行方向のインク塊の数**。1文字を2文字と読んだ箱は塊が1つしか
+# 無く（数字は Y 方向に切れ目のない字形）、本当に2文字ある行は2つある。
+# 実測: 節番号 `2.`→塊1 ・ `30`→塊1（画像を目視して1文字の `3` と確認）、
+# ルビ `ひざ`→塊2 ・ `にな`→塊2。**塊の数を上限にする**ので、字の内部に
+# 切れ目がある字形（三・二）で数え過ぎても切り詰めない側に倒れる。
+#
+# 空白とみなす連続画素数は2で足りる（`ひざ` の字間は3画素。4にすると
+# `ひざ` が1塊に融合して削られる）。輝度と「暗い画素がこの割合以上なら
+# インク」はルビ分割（RUBY_INK_LEVEL / RUBY_INK_MIN_FRAC）と同じ値を使う
+TRIM_INK_GAP = 2
+# **対象は短い行だけにする。** この癖が出るのは1文字の箱に限られ（実測の
+# 誤読は全て2文字: `21` `11` `44` `66` `17` `2.` `30` `1.` `5.` `**`）、
+# 長い行にまで網を広げると**小活字のルビ行**（NDLOCR がルビ箱でなく
+# line_note / line_main で返したもの）が巻き添えになる。黒牢城30ページの
+# 実測では、この上限が無いと `これとうひゆうがのかみ`→`これとうひゆ`・
+# `さかずき`→`さか` のようにルビが削れた（ピッチ比は 0.47〜0.50 で
+# 1文字箱と同じ帯に落ちる。**小さい活字は本文ピッチでは測れない**）
+TRIM_MAX_CHARS = 3
+# 1文字読みを採るかどうかの確信度の比（初段の答えに対して。_pick_single_char）
+REREAD_CONF_RATIO = 0.5
+
 # 検出ボックスを実インク幅に縮める比。YomiToku(DBNet) では 0.68 が必須だったが、
 # **DEIM のボックスが実インクとどれだけずれるかは未測定**のため既定は無補正。
 # DESIGN_NDLOCR実装.md §6.6(c)。--ink-ratio で振れるようにしてある
@@ -153,6 +209,7 @@ CALIBRATION_MAX_PAGES = 15
 CALIBRATION_TARGET_CHARS = 800
 
 _MODELS = {}   # 遅延ロードしたモデルを保持
+TRIM_STATS = [0]   # _trim_overlong_lines が切り詰めた行数（完了時に報告）
 
 
 # ── NDLOCR-Lite の読み込み ────────────────────────────────────
@@ -285,6 +342,133 @@ def _dedup_boxes(boxes):
     return kept
 
 
+def _count_ink_runs(crop):
+    """縦行のインク塊（＝実際に並んでいる字の数の下限）を数える。
+
+    TRIM_INK_GAP 以上の連続空白で区切る。字の内部の切れ目で数え過ぎる
+    ぶんには安全側（切り詰めない側）に倒れる。
+    """
+    cv2, np = _import_cv2()
+    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    ink_min = max(1, int(crop.shape[1] * RUBY_INK_MIN_FRAC))
+    on = (g < RUBY_INK_LEVEL).sum(axis=1) >= ink_min
+    runs, gap, started = 0, TRIM_INK_GAP, False
+    for v in on:
+        if v:
+            if not started or gap >= TRIM_INK_GAP:
+                runs += 1
+            started, gap = True, 0
+        elif started:
+            gap += 1
+    return runs
+
+
+def _read_scored(model, crop):
+    """PARSEQ を「文字ごとの確率つき」で読む。復号は PARSEQ.read と同じ。
+
+    本家の `read()` は argmax した文字列しか返さないので、session を直に
+    叩いて softmax を取る（使うのは `preprocess`・`session`・`charlist`
+    ＝ PARSEQ.__init__ が置く属性だけ）。
+    """
+    _, np = _import_cv2()
+    x = model.preprocess(crop)
+    out = model.session.run(model.output_names, {model.input_names[0]: x})[0][0]
+    e = np.exp(out - out.max(axis=1, keepdims=True))
+    prob = e / e.sum(axis=1, keepdims=True)
+    res = []
+    for i, k in enumerate(out.argmax(axis=1)):
+        if k == 0:                       # EOS
+            break
+        ch = model.charlist[k - 1]
+        if not ch.isspace():
+            res.append((ch, float(prob[i, k])))
+    return res
+
+
+def _pick_single_char(crop, fallback):
+    """1文字に戻すとき、どの文字を残すかを決める。
+
+    **「先頭の1字」で済ませてはならない。** 余計な字は後ろに付くことが
+    多い（`2`→`21`）が、`7`→`17`・`3`→`10` のように**前に付く**ことが
+    あり、先頭を採ると節番号7が1になる（ピザンの第一章・第五章で実測）。
+    一方で**別のモデルなら1文字で読めている**ことが多い（同じ crop で
+    rec50 が `7`・`3` を返す）。
+
+    ただし1文字の読みを無条件に信じてもいけない。`6` の箱で
+    rec30 が `66`、rec50 が `1`、rec100 が `9` と割れる例がある。
+    決め手は2段:
+
+    1. **初段の読みに含まれる字**を優先する。重複読みは同じ字が2つ
+       並ぶのが基本形なので、初段の `66` に対する `6` は片割れとして
+       信用できる（`9` は初段のどこにも無いので捨てる）
+    2. 初段のどこにも無い字は、**初段の先頭字より確信度が大幅に低く
+       なければ**採る。`3` の箱を初段が `10`(0.36) と読み rec50 が
+       `3`(0.35) と読む例（比0.97）は採り、初段が `66`(0.92) で
+       rec50 が `1`(0.30) の例（比0.33）は捨てる
+
+    ピザンの節番号22件の実測でこの規則は22件とも正解。比の実測は
+    採用側 0.57〜1.06 に対し却下側 0.33 で、あいだが空いている。
+    """
+    try:
+        scored = [_read_scored(_MODELS[n], crop) for n, _ in REC_GEOMETRY_MAX]
+    except Exception:                    # 本家の内部が変わった場合の保険
+        return fallback[0]
+    base = next((v for v in scored if v), [])
+    base_text = "".join(c for c, _ in base)
+    singles = [v[0] for v in scored if len(v) == 1]
+    for ch, _ in singles:
+        if ch in base_text:
+            return ch
+    base_p = base[0][1] if base else 0.0
+    for ch, p in singles:
+        if p >= base_p * REREAD_CONF_RATIO:
+            return ch
+    return fallback[0]
+
+
+def _trim_overlong_lines(lines, img):
+    """1文字の箱を2〜3文字と読んだ縦行を1文字に戻す（TRIM_PITCH_RATIO 参照）。
+
+    「1文字ピッチが本文ピッチに対して小さすぎる」＋「行方向のインク塊が
+    1つしかない」の両方が成り立つ行だけを対象にする。残す文字は
+    `_pick_single_char` が選ぶ。戻り値は切り詰めた行数。
+    """
+    verts, pitches = [], []
+    for ln in lines:
+        x0, y0, x1, y1 = ln["box"]
+        if (y1 - y0) < (x1 - x0):
+            continue
+        chars = [c for c in ln["text"] if not c.isspace()]
+        if not chars:
+            continue
+        verts.append((ln, chars, y1 - y0))
+        if len(chars) >= TRIM_BODY_MIN_CHARS:
+            pitches.append((y1 - y0) / len(chars))
+    if len(pitches) < TRIM_MIN_SAMPLES:
+        return 0
+    body = statistics.median(pitches)
+    trimmed = 0
+    for ln, chars, h in verts:
+        if not 2 <= len(chars) <= TRIM_MAX_CHARS:
+            continue
+        if h / len(chars) >= body * TRIM_PITCH_RATIO:
+            continue
+        x0, y0, x1, y1 = ln["box"]
+        crop = img[int(y0):int(y1), int(x0):int(x1)]
+        if crop.size == 0:
+            continue
+        # **インク塊がちょうど1つのときだけ切る。** 塊が2つ以上の行は
+        # 「本当に字が並んでいるが小さい活字」（ルビ）である可能性が高く、
+        # 塊の数え落としで削ると仮名が消える（黒牢城のルビ `うかが` は
+        # 塊2・3文字で、塊の数まで削ると `うか` になった）。直したいのは
+        # 「1文字の箱を2文字と読んだ」場合だけなので、これで過不足ない
+        if _count_ink_runs(crop) != 1:
+            continue
+        ln["text"] = _pick_single_char(crop, "".join(chars))
+        trimmed += 1
+    return trimmed
+
+
 def _split_ruby_runs(crop):
     """縦書きルビ列を、行方向（Y）のインクの切れ目で語に分割する。
 
@@ -381,6 +565,10 @@ def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
         if not text.strip():
             continue
         lines.append({"cls": cls, "box": (x0, y0, x1, y1), "text": text})
+
+    # 1文字の箱を2文字と読む PARSEQ の癖を幾何で弾く（TRIM_PITCH_RATIO）。
+    # ルビを足す前に済ませる（ルビ行はピッチの尺が違う）
+    TRIM_STATS[0] += _trim_overlong_lines(lines, img)
 
     # ルビは重複を潰してから語に切る（_dedup_boxes の説明を参照）。
     # 語ごとに切って読み、切片ごとに1行として積む。位置は実測なので
@@ -629,6 +817,8 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
     _atomic_save(doc, output_path, final=True)
     print(f"\n✅ 完了: {output_path}")
     print(f"   {processed}ページ / 本文{total_chars}字 / ルビ{total_ruby}字")
+    if TRIM_STATS[0]:
+        print(f"   読み過ぎ行の切り詰め: {TRIM_STATS[0]}行")
     preprocess_report()
 
 

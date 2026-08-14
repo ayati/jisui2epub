@@ -43,7 +43,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -4832,6 +4832,29 @@ def _jisage_to_int(s: str) -> int:
     return max(1, n) if n else 1
 
 
+def _drop_paragraph_indent(clean: str, indent_stack: list) -> str:
+    """段落頭の全角空白を1つだけ落とす（`p.body-line` の text-indent と二重になる）。
+
+    **本家 novel_downloader.py との差異。同期時に戻さないこと。** 向こうは
+    段落を `.strip()` して溜めるので行頭に全角空白が無く、字下げは CSS の
+    `text-indent: 1em` だけが作る。こちらは `assemble_text` が**青空文庫書式
+    どおり行頭に「　」を置く**（.txt 自体が校正用の成果物なので外せない）
+    ため、そのまま流すと**全段落が2字下げになる**（連帯惑星ピザンの危機で
+    3765段落。章の最初の1段落だけは `parse_aozora_text` が本文先頭の空白を
+    落とすので1字下げになり、同じ本の中で不揃いにもなっていた）。
+
+    落とすのは1つだけなので、深い字下げの相対関係は保たれる
+    （`　　` で始まる行は 1字ぶん残り＋CSS 1em ＝ 2字下げのまま）。
+
+    **`［＃ここからN字下げ］` ブロックの中では落とさない。** あちらは
+    `div.aozora-indent > p.body-line` が `text-indent: 0` にしているので
+    二重になっておらず、落とすと逆に1字ぶん減る。
+    """
+    if indent_stack or not clean.startswith("　"):
+        return clean
+    return clean[1:]
+
+
 def _body_lines_to_xhtml(text: str, horizontal: bool = False) -> str:
     """
     本文テキスト（改行区切り）をXHTML要素列に変換する。
@@ -5013,7 +5036,10 @@ def _body_lines_to_xhtml(text: str, horizontal: bool = False) -> str:
         if not clean.strip():
             result.append('<p class="body-blank">&#160;</p>')
         else:
-            result.append(f'<p class="body-line">{_apply_ruby_auto(clean)}</p>')
+            result.append(
+                f'<p class="body-line">'
+                f'{_apply_ruby_auto(_drop_paragraph_indent(clean, indent_stack))}'
+                f'</p>')
 
     # 未閉じの字下げブロックを閉じる（不正なテキストへの安全対策）
     for _ in indent_stack:
