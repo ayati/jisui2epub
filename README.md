@@ -82,19 +82,22 @@
 python3 -m venv .venv
 .venv/bin/pip install pymupdf
 
-# PDF → 青空文庫形式テキスト
+# PDF → 青空文庫形式テキスト＋ePub（v2.0.0 から ePub 生成が既定）
 # ファイル名が「タイトル_著者名.pdf」なら --title/--author は省略可（自動取得）
 .venv/bin/python jisui2epub.py タイトル_著者名.pdf
 
-# ePubまで一気に生成（生成機能は内蔵。表紙は既定でPDFの1ページ目）
-.venv/bin/python jisui2epub.py 本.pdf --title "タイトル" --author "著者名" --epub
+# 表紙は既定でPDFの1ページ目
+.venv/bin/python jisui2epub.py 本.pdf --title "タイトル" --author "著者名"
+
+# 青空文庫形式テキストだけが欲しいとき
+.venv/bin/python jisui2epub.py 本.pdf --no-epub
 
 # 横書きの本（実用書など）。ePubも横書きになる
 # ルビのない実用書は --ruby drop を付けると小さな文字の誤検出ルビを防げる
-.venv/bin/python jisui2epub.py 横書きの本.pdf --horizontal --ruby drop --epub
+.venv/bin/python jisui2epub.py 横書きの本.pdf --horizontal --ruby drop
 
 # 出力テキストをエディタで校正したあと、校正済みテキスト＋元PDFからePubを再生成
-# （表紙と挿絵画像はPDFから取得。--epub 指定は不要）
+# （表紙と挿絵画像はPDFから取得）
 .venv/bin/python jisui2epub.py 本.pdf --from-text 校正済み.txt
 
 # 前付け・後付け（表紙・目次・奥付）を除外して本文ページだけ変換
@@ -128,7 +131,9 @@ python3 -m venv .venv
 | `--no-chapter-marks` | 章頭マーカー（`第一章`・章内の節番号）の見出し化を行わない |
 | `--no-backmatter-cut` | 巻末広告・奥付の見出し化を抑止する処理を行わない |
 | `--horizontal` | 横書きの本として解析（既定は縦書き）。段組は左揃え2〜4段まで自動分割。書字方向が違いそうな場合は実行時に警告が出る |
-| `--epub` | リフロー型ePub3まで生成（既定は縦書き、`--horizontal` 指定時は横書き） |
+| `--no-epub` | ePubを生成せず青空文庫形式テキストだけを出力する（v2.0.0 から ePub 生成が既定。既定では書誌照会のため国立国会図書館サーチに接続する。`--no-ndl` で無効化、オフラインなら自動で続行） |
+| `--toc-front` | ePubの目次ページを表紙の直後に置く（既定は本文の後・奥付の前） |
+| `--no-front-image` | 巻頭の扉・口絵・目次・地図・献辞をそのままの画像として残す処理を行わない（v1.11.0 と同じ扱い） |
 | `--cover-page N` | ePub表紙にするPDFページ（既定=1ページ目、`0`で表紙を自動生成） |
 | `--cover-image FILE` | 表紙に任意の画像（JPEG/PNG）を使う |
 | `--inspect N` | ページ解析結果を表示して終了（チューニング用） |
@@ -364,7 +369,7 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"
 .venv/bin/python vision_reocr.py 本.pdf --start 10 --end 20 -o test.pdf
 
 # 再OCR後のPDFをjisui2epub.pyにかける
-.venv/bin/python jisui2epub.py 本_vision.pdf --title "タイトル" --author "著者名" --epub
+.venv/bin/python jisui2epub.py 本_vision.pdf --title "タイトル" --author "著者名"
 ```
 
 本文とルビは異なるフォントサイズ（本文の約半分）で書き戻されるため、

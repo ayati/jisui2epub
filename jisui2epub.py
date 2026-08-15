@@ -43,7 +43,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "1.11.0"
+__version__ = "2.0.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -94,6 +94,23 @@ HASHIRA_SHORT_MIN_FREQ = 5  # 2文字の柱を章題辞書に入れる最低ペ�
 HEADING_SHORT_SIZE_RATIO = 1.25
 HEADING_MAX_LEN = 30        # 見出しとして扱う最大文字数
 KANA_RE = re.compile(r'[ぁ-ゖァ-ヺー]')
+
+# ── 巻頭のページを画像として残す（DESIGN_v2.0.md §3.2）─────────
+# 扉・口絵・目次・地図・献辞・クレジットは「絵」なのにインクが薄く
+# （アン論の地図は 0.005・伯爵夫人の扉は 0.005）、既存の画像ページ判定
+# （本文4行以下 × インク率）を通らない。巻頭の窓の中だけ物差しを変える。
+FRONT_MAX_PAGES = 20        # 巻頭の窓の上限ページ数
+FRONT_MAX_RATIO = 0.10      # 巻頭の窓（全ページのこの割合まで）
+FRONT_BLANK_INK = 0.002     # 文字もインクも無いページは画像にしない
+FRONT_TEXT_MIN = 20         # 句読点密度を見るのに必要な最低字数
+FRONT_PUNCT_MAX = 0.030     # 句読点密度がこれ未満なら地の文でない
+FRONT_KANA_MAX = 0.35       # かな率がこれ未満なら地の文でない
+FRONT_FILL_KANA_MAX = 0.20  # 穴埋め（前後が画像のページ）のかな率上限
+_FRONT_PUNCT_RE = re.compile(r'[。、．，]')
+_FRONT_KANA_RE = re.compile(r'[ぁ-ゖ]')
+TOC_PAGE_MIN_ENTRIES = 3    # 印刷目次ページと認めるエントリ数の下限
+TOC_PAGE_KANA_MAX = 0.46    # 目次ページのかな率の上限（本文ページを弾く）
+IMG_HEADING_MAX_LINES = 2   # 巻頭の画像ページで見出しを出してよい本文行数
 
 
 # ── データ構造 ──────────────────────────────────────
@@ -1106,6 +1123,80 @@ def _toc_entries_and_numbers(pg):
     return entries, blobs, label
 
 
+# 「用語解説26／標本抽出28／相関30／平均回帰32／」のように1行に複数項目が
+# 並ぶ目次の行。章題ではないので辞書に入れてはならない（入れると
+# refine_headings_with_toc の章題修復が正しい見出し「平均回帰」を
+# この行で上書きする。30秒DSで3件実測）
+_TOC_MULTI_ITEM_RE = re.compile(r'[／/].*[／/]')
+
+
+def _toc_page_entries(pg, drop):
+    """ページの本文行から目次エントリ候補を読み順で取り出す。
+
+    vlines は analyze_page が右→左（横書きは転置後の上→下）に整列済みなので、
+    そのまま並べれば読み順になる。
+    """
+    lines = []
+    for ln in list(pg.vlines) + list(pg.hlines):
+        if (pg.num, id(ln)) in drop:
+            continue
+        t = ln.text.strip()
+        if t and not is_junk_line(t):
+            lines.append(t)
+    label = any(_TOC_LABEL_RE.match(t) for t in lines)
+    entries = [e for e in (_toc_entry_of_line(t) for t in lines)
+               if e and not _TOC_MULTI_ITEM_RE.search(e)]
+    joined = "".join(lines)
+    kana = (len(_FRONT_KANA_RE.findall(joined)) / len(joined)
+            if joined else 0.0)
+    return entries, label, kana
+
+
+def detect_toc_pages(pages, drop):
+    """印刷目次のページを {page_num: [エントリ, …]} で返す（DESIGN_v2.0.md §3.5）。
+
+    画像として残すページを決めるのと、章題辞書を
+    refine_headings_with_toc に渡すのに使う。
+
+    採用条件（39ファイル・29ページの実測で決定。誤検出は蘇我氏のカバー袖の
+    内容紹介文1件のみで、それは下の条件で落ちる）:
+      一次: (目次ラベル) または 章序数の+1連番列>=4
+            または (連番列>=3 かつ ページ数の塊>=3)
+      二次: 一次採用ページと隣接し、エントリが3件以上
+    **連番列>=3 だけでは足りない**（内容紹介文が「第二章…では、」と章を
+    順に紹介して連番列を3作る）。**>=4 だけでも足りない**（哲夫の春休みの
+    目次は連番列3で、目次であることはページ数の塊11が示している）。
+    **字数・行長では分けられない**（横書きの図解実用書の目次は本文ページ
+    並みに詰まる）。二次が要るのは複数ページに渡る目次の2枚目で
+    連番列が切れるため（目次は必ず連続ページに組まれるという構造制約）。
+    """
+    limit = len(pages) * TOC_SCAN_HEAD
+    cand = {}
+    for pg in pages:
+        if pg.num > limit:
+            break
+        entries, label, kana = _toc_page_entries(pg, drop)
+        if len(entries) < TOC_PAGE_MIN_ENTRIES:
+            continue
+        # **かな率で本文ページを弾く。** 目次の直後は本文の1ページ目なので、
+        # 隣接規則をそのまま当てると本文が画像になって消える（黒牢城 p5 で
+        # 序章の5段落が消えた）。実測は目次 0.00〜0.37 / 本文 0.44〜0.79 と
+        # 開いていて、句読点密度では分けられない（蘇我氏の目次は「一、」の
+        # 節番号があり密度 0.044 で本文並みになる）
+        if kana > TOC_PAGE_KANA_MAX:
+            continue
+        _, blobs, _ = _toc_entries_and_numbers(pg)
+        seq = _max_increasing_run(entries)
+        primary = label or seq >= 4 or (seq >= 3 and len(blobs) >= 3)
+        cand[pg.num] = (entries, primary)
+    prim = {p for p, (_e, pri) in cand.items() if pri}
+    out = {p: cand[p][0] for p in prim}
+    for p, (entries, pri) in cand.items():
+        if not pri and (p - 1 in prim or p + 1 in prim):
+            out[p] = entries
+    return dict(sorted(out.items()))
+
+
 def detect_toc_chapter_pages(pages, drop, body_size, horizontal=False):
     """印刷目次のページ数から {物理ページ(0基点): 章題} を得る。使えなければ {}。
 
@@ -1474,14 +1565,19 @@ def detect_backmatter_by_pillar(pages, drop):
 
 def detect_pillar_runs(pages, drop, body_size, image_pages=None,
                        title=None, author=None, body_end=None,
-                       horizontal=False):
+                       horizontal=False, no_head_pages=None):
     """柱の変化点から章境界を求める。戻り値: {章頭ページ番号: 章題}
 
     横書きモードは対象外（転置後の柱の幾何が別物で実測サンプルも無い）。
+    no_head_pages: 中扉（章頭）候補にしてはならない画像ページ。v2.0.0 で
+        巻頭の印刷目次・系図も画像ページになったので、これを章頭に選ぶと
+        assemble_text 側が「行の詰まった画像ページでは見出しを出さない」
+        規則で章題を落とす（アン論の第一章が消えた）。
     """
     if horizontal or len(pages) < 20:
         return {}
     image_pages = image_pages or set()
+    head_pages = image_pages - set(no_head_pages or ())
     npages = len(pages)
     per_page = _pillar_margin_texts(pages, drop)
     if not per_page:
@@ -1551,13 +1647,13 @@ def detect_pillar_runs(pages, drop, body_size, image_pages=None,
             gs = max(num - PILLAR_HEAD_MAX_BACK, 0)
             if prev_end is not None:
                 gs = max(gs, prev_end + 1)
-            cand = [p for p in range(gs, num + 1) if p in image_pages]
+            cand = [p for p in range(gs, num + 1) if p in head_pages]
             head = cand[-1] if cand else num
             if head not in used and (not result or head > max(result)):
                 result[head] = (text, num, num)
                 used.add(head)
             break
-        cand = [p for p in range(wlo, lo + 1) if p in image_pages]
+        cand = [p for p in range(wlo, lo + 1) if p in head_pages]
         head = cand[0] if cand else wlo
         while head in used:
             head += 1
@@ -1604,7 +1700,52 @@ def _page_ink_ratio(doc_page):
     return sum(1 for b in s if b < 200) / max(len(s), 1)
 
 
-def classify_image_pages(doc, pages, drop):
+def _body_line_count(pg, drop):
+    """柱・ノンブル・挿絵ノイズを除いた本文行数（画像ページ判定の1軸）。"""
+    return sum(1 for v in pg.vlines
+               if v.text.strip() and (pg.num, id(v)) not in drop
+               and not is_junk_line(v.text.strip()))
+
+
+def _page_nombres(pages, drop):
+    """マージンに単独で出ている数字（ノンブル）を {page_num: 値} で返す。"""
+    out = {}
+    for pg in pages:
+        for ln in list(pg.vlines) + list(pg.hlines):
+            if (pg.num, id(ln)) not in drop:
+                continue
+            t = re.sub(r'\s+', "", ln.text.strip())
+            if re.fullmatch(r'[0-9０-９]{1,4}', t):
+                out.setdefault(pg.num,
+                               int(unicodedata.normalize("NFKC", t)))
+    return out
+
+
+def _nombre_in_sequence(nombres, num):
+    """ノンブルが前後2ページ以内の値と連番になっているか（＝本文ページ）。
+
+    **書籍全体の最頻オフセットではなく局所連番で見る**。グリックは全体の
+    最頻オフセットが −2 なのに巻頭近辺は −1 で、最頻値で照合すると
+    本文ページを本文と認識できない（DESIGN_v2.0.md §3.3）。
+    """
+    v = nombres.get(num)
+    if v is None:
+        return False
+    return any(nombres.get(q) is not None and nombres[q] - v == q - num
+               for q in range(num - 2, num + 3) if q != num)
+
+
+def _front_page_stats(doc, num):
+    """ページ全体のテキストから (句読点密度, かな率, 字数) を返す。"""
+    t = re.sub(r'\s', "", doc[num].get_text())
+    if not t:
+        return 0.0, 0.0, 0
+    return (len(_FRONT_PUNCT_RE.findall(t)) / len(t),
+            len(_FRONT_KANA_RE.findall(t)) / len(t), len(t))
+
+
+def classify_image_pages(doc, pages, drop, front_image=True,
+                         front_out=None):
     """
     挿絵・口絵・画像主体の章頭ページを検出して page_num の集合を返す。
 
@@ -1612,15 +1753,27 @@ def classify_image_pages(doc, pages, drop):
       1. 本文行がほぼ無い（柱・ノンブル・挿絵ノイズ除去後 2 行以下）
       2. インク率が本文ページの中央値の1.6倍超（白ページ・「上巻完」の
          ような余白ページを除外。紙色の影響は本ごとの較正で吸収する）
+
+    front_out: set — 巻頭の窓で新たに拾ったページをここに書き出す（省略可）。
+        assemble_text 側で「このページでは見出しを出さない」判定に使う。
+
+    front_image=True のときは**巻頭の窓の中だけ物差しを変える**
+    （DESIGN_v2.0.md §3.2）。扉・地図・献辞・クレジットは絵なのに
+    インクが薄いので 2 のしきい値を外し、行が詰まった目次・系図・
+    登場人物一覧は句読点の密度で地の文と分ける。
     """
     def n_body_lines(pg):
-        return sum(1 for v in pg.vlines
-                   if v.text.strip() and (pg.num, id(v)) not in drop
-                   and not is_junk_line(v.text.strip()))
+        return _body_line_count(pg, drop)
+
+    def _front(already):
+        got = _front_image_pages(doc, pages, drop, n_body_lines, already)
+        if front_out is not None:
+            front_out.update(got)
+        return got
 
     candidates = [pg for pg in pages if n_body_lines(pg) <= 4]
     if not candidates:
-        return set()
+        return _front(set()) if front_image else set()
     # 本文ページのインク率ベースライン（サンプル30ページで較正）。
     # 本文行が4行以下しかないページのインクはその1割程度のはずなので、
     # ベースラインの0.7倍を超えるインクがあれば画像とみなせる
@@ -1634,7 +1787,52 @@ def classify_image_pages(doc, pages, drop):
     for pg in candidates:
         if _page_ink_ratio(doc[pg.num]) > threshold:
             result.add(pg.num)
+    if front_image:
+        result |= _front(result)
     return result
+
+
+def _front_image_pages(doc, pages, drop, n_body_lines, already):
+    """巻頭の窓の中で画像ページにするページ（DESIGN_v2.0.md §3.2）。
+
+    `already` は既存の判定で画像ページになったページ（穴埋めの隣接判定に使う）。
+    **既存の判定で拾えているページはノンブル保護の対象外**にする
+    （章頭の全面挿絵はノンブルを持つ本があり、外すと章頭画像が消える）。
+    """
+    limit = min(FRONT_MAX_PAGES, int(len(doc) * FRONT_MAX_RATIO))
+    window = [pg for pg in pages if pg.num < limit]
+    if not window:
+        return set()
+    nombres = _page_nombres(pages, drop)
+    picked = set()
+    for pg in window:
+        if pg.num in already or _nombre_in_sequence(nombres, pg.num):
+            continue
+        n = n_body_lines(pg)
+        if n <= 4:
+            # (a) インク率のしきい値を外す。白紙だけは出さない
+            if n > 0 or _page_ink_ratio(doc[pg.num]) > FRONT_BLANK_INK:
+                picked.add(pg.num)
+            continue
+        # (b) 行が詰まったページは句読点の密度で地の文と分ける。
+        # 地の文は 0.034〜0.09、目次・系図・一覧は 0.000〜0.031。
+        # かな率も併せて見る（漢字の多い「はじめに」が密度だけでは残らない）
+        punct, kana, length = _front_page_stats(doc, pg.num)
+        if (length >= FRONT_TEXT_MIN and punct < FRONT_PUNCT_MAX
+                and kana < FRONT_KANA_MAX):
+            picked.add(pg.num)
+    # (c) 穴埋め: 前後が画像のページ。目次の途中1ページだけテキストで
+    # 残ると見た目が壊れる（アン論 p11 は密度 0.031 で 0.001 外れる）。
+    # かな率で本文を守る（30秒DS p16 の用語解説はかな率 0.27）
+    imaged = already | picked
+    for pg in window:
+        if pg.num in imaged or _nombre_in_sequence(nombres, pg.num):
+            continue
+        if pg.num - 1 in imaged and pg.num + 1 in imaged:
+            _, kana, length = _front_page_stats(doc, pg.num)
+            if length and kana < FRONT_FILL_KANA_MAX:
+                picked.add(pg.num)
+    return picked
 
 
 # ── 章頭画像の等間隔検出（DESIGN_柱ラン章立て.md §4）─────────────
@@ -2042,9 +2240,16 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                   hashira_keys=None, indent=True, verbose=False,
                   image_pages=None, horizontal=False,
                   chapter_marks=None, body_end=None, pillar_chapters=None,
-                  heading_pages_out=None):
+                  heading_pages_out=None, toc_pages=None,
+                  front_pages=None):
     """全ページから青空文庫形式の本文を組み立てる。
     image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
+    toc_pages: set — 印刷目次のページ（detect_toc_pages）。図タグのキャプションを
+        「目次」にし、**見出しを一切発行しない**（目次の章題は柱と一致するので、
+        放っておくと目次の1章目が偽の章見出しになる）
+    front_pages: set — 巻頭の窓で新たに画像ページにしたページ
+        （classify_image_pages の front_out）。本文行が3行以上あるものは
+        目次・系図・一覧なので、こちらでも見出しを発行しない
     horizontal: 横書きモード。見出しの飾り囲み剥がしと見出し条件の強化
         （2〜3文字の大活字をテキスト僅少ページで見出し化しない）を行う
     chapter_marks: {(page_num, id(line)): text} — detect_chapter_marks の結果。
@@ -2062,6 +2267,9 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
     image_pages = image_pages or {}
     chapter_marks = chapter_marks or {}
     pillar_chapters = pillar_chapters or {}
+    toc_pages = set(toc_pages or ())
+    front_pages = set(front_pages or ())
+    emitted_images = set()   # 図タグを出したページ（横書きの帯分割対策）
     # 柱ランが確定した章題。印刷目次ページの抑止に使う（2文字以下は
     # 本文の短い行に当たるので除く）
     pillar_titles = {t for t in pillar_chapters.values() if len(t) >= 3}
@@ -2348,11 +2556,26 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         # 限定する。どちらも無ければページ内の縦行から柱一致テキストを探す
         # （章扉の飾り書体はOCRが崩れやすく、見出し判定から漏れることがある）
         if pg.num in image_pages:
+            # 横書きの帯分割（split_columns）は同じ pg.num を持つ仮想ページを
+            # 複数作るので、図タグが帯の数だけ出る。1ページ1回に抑える
+            if pg.num in emitted_images:
+                continue
+            emitted_images.add(pg.num)
             emit_pagebreak()
-            kept = [t for _, t in page_marks] + \
-                   [t for t in page_headings
-                    if matches_hashira(t) or _single_chapter_heading(t)]
-            if not kept:
+            # **行が詰まった画像ページでは見出しを一切出さない。**
+            # 印刷目次・系図・登場人物一覧の行は当然のように柱と一致するので、
+            # 下の柱一致フォールバックがそのまま偽の章見出しを作る
+            # （赤毛のアン論で「一の扉エピグラフと献辞14」「二の扉英文学S」の
+            #  ようにページ数を巻き込んだ見出しが5個立ち、章扉由来の正しい
+            #  見出しを押しのけた）。章扉は本文行がほぼ無いので害はない
+            dense = (pg.num in toc_pages
+                     or (pg.num in front_pages
+                         and len(body_lines) > IMG_HEADING_MAX_LINES))
+            kept = [] if dense else (
+                [t for _, t in page_marks]
+                + [t for t in page_headings
+                   if matches_hashira(t) or _single_chapter_heading(t)])
+            if not kept and not dense:
                 for v in vlines:
                     t = v.text.strip()
                     if (t and not is_junk_line(t)
@@ -2363,12 +2586,13 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                         break
             # 中扉のOCRが純ジャンクな本（推理カルテ）はページ内に手掛かりが
             # 無い。柱ランが決めた章題をここで補う（DESIGN_柱ラン章立て.md §2.9）
-            if not kept and pg.num in pillar_chapters:
+            if not kept and not dense and pg.num in pillar_chapters:
                 kept = [pillar_chapters[pg.num]]
             if kept:
                 emit_heading("　".join(kept))
             flush()
-            out.append(f"［＃「挿絵」の図（{image_pages[pg.num]}）入る］")
+            caption = "目次" if pg.num in toc_pages else "挿絵"
+            out.append(f"［＃「{caption}」の図（{image_pages[pg.num]}）入る］")
             prev_line_short = True
             prev_page_short = True   # 画像ページの後は必ず改ページ
             continue
@@ -2676,10 +2900,18 @@ def _toc_entry_of_line(line):
 
 
 def refine_headings_with_toc(body, book_title, hashira_keys=None,
-                             author=None, verbose=False):
+                             author=None, verbose=False,
+                             toc_entries=None, toc_page_count=0):
     """紙の目次ページと本文見出しを突き合わせて見出しを精錬した本文と
-    処理統計を返す。目次ページが見つからない本でも章番号の内挿だけは行う。"""
+    処理統計を返す。目次ページが見つからない本でも章番号の内挿だけは行う。
+
+    toc_entries: detect_toc_pages がページから直接読んだ章題エントリ（読み順）。
+        目次ページを画像化するとテキストが本文に残らないので、辞書はこちらから
+        受け取る。指定するとテキスト上の目次セグメント探索と削除は行わない
+        （DESIGN_v2.0.md §3.8）。未指定なら従来と完全に同じ経路。
+    """
     hashira_keys = hashira_keys or {}
+    ext_toc = list(toc_entries or [])
     out = body.split("\n")
 
     # 裸の番号見出し（章内の節番号「１」「２」…）は章ではないので、目次照合の
@@ -2710,6 +2942,31 @@ def refine_headings_with_toc(body, book_title, hashira_keys=None,
     #   - セグメント数の上限3。超えたら判定自体が疑わしいので照合を中止
     titles_norm = [_norm_t(head_title(i)) for i in heads]
     head_set = set(heads)
+    toc_spans = []
+    toc_entries = []
+    if ext_toc:
+        # 目次ページを画像化した本: 辞書はページから直接もらう。
+        # 本文に目次テキストが無いのでセグメント探索も削除も要らない
+        toc_entries = ext_toc
+        stats["目次ページ"] = toc_page_count or 1
+    else:
+        toc_spans, toc_entries = _find_toc_spans(out, heads, head_set,
+                                                 titles_norm)
+        if not toc_spans:
+            n = _renumber_headings(out, heads, {})
+            if n:
+                stats["章番号再構成"] = n
+            return "\n".join(out), stats
+        stats["目次ページ"] = len(toc_spans)
+
+    # ── 2. 見出し⇔エントリの対応付け（スコア降順の貪欲マッチ）──
+    return _refine_with_entries(out, heads, head_set, head_title, stats,
+                                toc_spans, toc_entries, hashira_keys,
+                                book_title, author)
+
+
+def _find_toc_spans(out, heads, head_set, titles_norm):
+    """本文テキストの上で印刷目次のセグメントを特定する（従来経路）。"""
     segments = []
     seg_start = 0
     for i in range(len(out) + 1):
@@ -2757,15 +3014,14 @@ def refine_headings_with_toc(body, book_title, hashira_keys=None,
             toc_spans.append((a, b))
             toc_entries.extend(entries)
     if len(toc_spans) > 3:
-        toc_spans = []
+        return [], []
+    return toc_spans, toc_entries
 
-    if not toc_spans:
-        n = _renumber_headings(out, heads, {})
-        if n:
-            stats["章番号再構成"] = n
-        return "\n".join(out), stats
-    stats["目次ページ"] = len(toc_spans)
 
+def _refine_with_entries(out, heads, head_set, head_title, stats,
+                         toc_spans, toc_entries, hashira_keys,
+                         book_title, author):
+    """目次エントリを辞書に見出しを精錬する（refine_headings_with_toc の後半）。"""
     # ── 2. 見出し⇔エントリの対応付け（スコア降順の貪欲マッチ）──
     cands = []
     for hi, i in enumerate(heads):
@@ -5331,9 +5587,12 @@ def _make_toc_xhtml(title: str, episodes: list, cover_fmt: str = "",
 
 
 def _make_nav_xhtml(title: str, episodes: list, cover_fmt: str = "",
-                    horizontal: bool = False) -> str:
+                    horizontal: bool = False, toc_at_end: bool = False) -> str:
     """ナビゲーションドキュメント（nav.xhtml）を生成する。
     表紙・タイトルページ・奥付はナンバリングなしのリンクのみ。
+    toc_at_end: toc.xhtml を本文の後・奥付の前に置く構成のとき True。
+        **nav の並びは spine の実際の並びと一致させる**（ビューアの目次から
+        飛んだ先の順序が本と食い違うと読者が迷う）。
     本文エピソードは 1 から始まる番号付きリストで表示し、
     episodes 要素に "group" キーがある場合は章/部単位でネストした <ol> にまとめる。
 
@@ -5351,7 +5610,8 @@ def _make_nav_xhtml(title: str, episodes: list, cover_fmt: str = "",
     if cover_fmt:
         prelim_items.append('<li class="toc-prelim"><a href="cover-image.xhtml">表紙</a></li>')
     prelim_items.append('<li class="toc-prelim"><a href="cover.xhtml">タイトルページ</a></li>')
-    prelim_items.append('<li class="toc-prelim"><a href="toc.xhtml">目次</a></li>')
+    if not toc_at_end:
+        prelim_items.append('<li class="toc-prelim"><a href="toc.xhtml">目次</a></li>')
 
     # 本文エピソード
     # group が変わったとき（None→名前付き、または別の名前付き）にフラットな章ヘッダー行を挿入し、
@@ -5376,8 +5636,11 @@ def _make_nav_xhtml(title: str, episodes: list, cover_fmt: str = "",
             f'<li value="{num}"><a href="ep{num:04d}.xhtml">{_esc(ep["title"])}</a></li>'
         )
 
-    # 後付け（ナンバリングなし）
-    back_items = ['<li class="toc-prelim"><a href="colophon.xhtml">奥付</a></li>']
+    # 後付け（ナンバリングなし）。目次を巻末に置く構成では奥付の前に入れる
+    back_items = []
+    if toc_at_end:
+        back_items.append('<li class="toc-prelim"><a href="toc.xhtml">目次</a></li>')
+    back_items.append('<li class="toc-prelim"><a href="colophon.xhtml">奥付</a></li>')
 
     toc_str = "\n    ".join(prelim_items + ep_items + back_items)
 
@@ -5675,7 +5938,7 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
     OPF（package.opf）を生成する。
     cover_fmt: "png" | "svg" | "" (表紙画像なし)
     font_filename: 埋め込みフォントのファイル名（例: "AyatiShowaSerif-Regular.otf"）
-    toc_at_end: True のとき目次を奥付の後に配置（デフォルト: 表紙の後・本文の前）
+    toc_at_end: True のとき目次を本文の後・奥付の前に配置（False: 表紙の後・本文の前）
     inline_images: 本文中のインライン画像ファイル名リスト（青空文庫 ZIP 内の画像等）
     synopsis: あらすじ（dc:description に設定）
     publisher: 原出版社（dc:publisher。yomikake の書誌ブロック「出版社」欄）
@@ -5747,14 +6010,17 @@ def _make_opf(title: str, author: str, book_id: str, ep_titles: list,
             f'<item id="{did}" href="{href}" media-type="application/xhtml+xml"/>'
         )
         spine_items.append(f'<itemref idref="{did}"/>')
+    # 読者向け目次（toc.xhtml）を後配置（toc_at_end）: **本文の後・奥付の前**。
+    # 移植元の novel_downloader.py は奥付の後に置くが、紙の本の巻末目次は
+    # 奥付より前に来るのが通例で、奥付が最終ページであるほうが自然なので
+    # ここだけ順序を入れ替えている（本家との意図的な差異。同期時に戻さないこと）
+    if toc_at_end:
+        spine_items.append('<itemref idref="toc"/>')
+
     manifest_items.append(
         '<item id="colophon" href="colophon.xhtml" media-type="application/xhtml+xml"/>'
     )
     spine_items.append('<itemref idref="colophon"/>')
-
-    # 読者向け目次（toc.xhtml）を後配置（--toc-at-end）: 奥付の後
-    if toc_at_end:
-        spine_items.append('<itemref idref="toc"/>')
 
     # nav.xhtml は spine に含めない（properties="nav" のみで RS が認識、DPFJガイド準拠）
 
@@ -6433,7 +6699,8 @@ def build_epub(
         # nav.xhtml（RS向け機械読み取り専用、spine には linear="no" で含める）
         zf.writestr("OEBPS/nav.xhtml",
                     _make_nav_xhtml(title, episodes, cover_fmt,
-                                    horizontal=horizontal))
+                                    horizontal=horizontal,
+                                    toc_at_end=toc_at_end))
 
         # toc.xhtml（読者向け目次、spine に linear="yes" で含める）
         zf.writestr("OEBPS/toc.xhtml",
@@ -6554,6 +6821,13 @@ def _group_section_episodes(episodes: list) -> None:
     （_make_nav_xhtml 側は group と同名の項目を重複表示しない）。
     章名が読めない本（風の万里・地下室＝番号そのものが章）は直前の章が
     無いので group が付かず、従来どおりのフラットな目次になる。
+
+    **前付け（自動採番の「第N話」）を章として扱ってはならない。** 章頭が
+    全面挿絵で章題が番号だけの本（ぼくがぼくであること＝GOAL の nav も
+    裸の番号 1〜15）は、前付けが唯一の非番号エピソードなので、これを章に
+    すると番号すべてが前付けにぶら下がる。しかも group は題を後から
+    `_frontmatter_title` で「扉」に差し替える前の仮題で確定するため、
+    nav に「第1話」という見出し行が残る（実測: ぼくがぼくであること）。
     """
     is_num = [bool(_SECTION_NUM_RE.fullmatch(_norm_t(ep["title"])))
               for ep in episodes]
@@ -6562,7 +6836,8 @@ def _group_section_episodes(episodes: list) -> None:
     chapter = None
     for ep, num in zip(episodes, is_num):
         if not num:
-            chapter = ep
+            # 仮題（第N話）＝前付け。章ではないので章としても採らない
+            chapter = None if _AUTO_EP_TITLE_RE.fullmatch(ep["title"]) else ep
             continue
         if chapter is None:
             continue                   # 先頭の節＝章題を持たない本
@@ -6575,7 +6850,7 @@ _AUTO_EP_TITLE_RE = re.compile(r'第\d+話')
 
 
 def _frontmatter_title(body: str) -> str:
-    """最初の見出しより前の無名セクションの目次名を中身から決める。
+    """最初の見出しより前の無名セクションの目次名。
 
     このセクションの実体は本文ではなく**前付け**である。実測（14冊）:
       タイム・リープ上 = 口絵3枚 / グリック = 挿絵2枚＋書名 /
@@ -6583,16 +6858,12 @@ def _frontmatter_title(body: str) -> str:
       霧・蘇我氏・伯爵夫人 = 空（エントリ自体が出ない）
 
     そのため「第1話」（話数形式でない本の目次で浮く）も「本文」（本文ではない）
-    も適さない。**図タグしか無ければ「口絵」、テキストがあれば「扉」**とする。
+    も適さない。v2.0.0 で巻頭のページを画像として残すようになり、ここには
+    口絵・扉・目次・地図・献辞・クレジットが混在するので、
+    **「口絵」と「扉」の出し分けはやめて「扉」に一本化する**（本文中の
+    図タグの有無で名前が変わると、同じ位置のものが本ごとに違う名前になる）。
     """
-    for ln in body.split("\n"):
-        t = ln.strip()
-        if not t or t == "［＃改ページ］":
-            continue
-        if _FIG_CAP_RE.fullmatch(t) or _FIG_PLAIN_RE.fullmatch(t):
-            continue
-        return "扉"
-    return "口絵"
+    return "扉"
 
 
 def parse_aozora_text(content: str) -> tuple:
@@ -6761,6 +7032,9 @@ def run_from_text(args, doc, npages):
     if not episodes:
         print("エラー: ePub生成用の本文を抽出できませんでした。", file=sys.stderr)
         sys.exit(1)
+    if args.no_epub:
+        print("警告: --from-text はePub再生成の経路なので --no-epub は無視します",
+              file=sys.stderr)
 
     # 本文が参照する画像を収集
     img_dir = os.path.splitext(txt_path)[0] + "_images"
@@ -6803,7 +7077,8 @@ def run_from_text(args, doc, npages):
                publisher=meta["publisher"], isbn=meta["isbn"],
                pub_date=meta["pub_date"], bib=meta["opf"],
                images=images_data or None,
-               horizontal=args.horizontal)
+               horizontal=args.horizontal,
+               toc_at_end=not args.toc_front)
     print(f"✅ ePub出力完了: {epub_path}")
 
 
@@ -6837,7 +7112,7 @@ def main():
     ap.add_argument("--description", default="", help="あらすじ・内容紹介（dc:description）")
     ap.add_argument("--from-text", metavar="FILE",
                     help="校正済みの青空文庫形式テキストからePubを再生成する"
-                         "（PDFは表紙・画像ページの取得にのみ使用。--epub 不要）")
+                         "（PDFは表紙・画像ページの取得にのみ使用）")
     ap.add_argument("--pages", help="対象ページ範囲（例: 10-360 / 5,8,10-）")
     ap.add_argument("--ruby", choices=["aozora", "drop"], default="aozora",
                     help="ルビ処理: aozora=《》変換（既定） drop=除去")
@@ -6859,9 +7134,17 @@ def main():
     ap.add_argument("--horizontal", action="store_true",
                     help="横書きの本として解析し、ePubも横書きで生成する"
                          "（既定は縦書き。段組は左揃え2〜4段まで自動分割）")
-    ap.add_argument("--epub", action="store_true",
-                    help="リフロー型ePub3も生成する（既定は縦書き、"
-                         "--horizontal 指定時は横書き）")
+    ap.add_argument("--no-epub", action="store_true",
+                    help="ePubを生成せず青空文庫形式テキストだけを出力する")
+    # v1.11.0 まで「ePubも生成する」フラグだった。v2.0.0 で既定になったが、
+    # jisui_gui.py が投げ続けるので受理だけする（更新が前後しても落ちないため）
+    ap.add_argument("--epub", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--toc-front", action="store_true",
+                    help="ePubの目次ページを表紙の直後に置く"
+                         "（既定は本文の後・奥付の前）")
+    ap.add_argument("--no-front-image", action="store_true",
+                    help="巻頭の扉・口絵・目次・地図・献辞をそのままの画像として"
+                         "残す処理を行わない（v1.11.0 と同じ扱いになる）")
     ap.add_argument("--cover-page", type=int, default=1, metavar="N",
                     help="ePub表紙にするPDFページ番号（1始まり、既定=1、"
                          "0で表紙を自動生成）")
@@ -6959,13 +7242,27 @@ def main():
     out_path = args.output or os.path.join(
         os.path.dirname(os.path.abspath(args.pdf)) or ".", out_base + ".txt")
 
-    # 画像ページ（挿絵・口絵・画像主体の章頭）の検出とレンダリング
+    # 画像ページ（挿絵・口絵・画像主体の章頭）の検出とレンダリング。
+    # v2.0.0: 巻頭の扉・地図・献辞・目次もここで画像ページにする
+    # （DESIGN_v2.0.md §3.2・§3.5）
     image_page_map = {}   # page_num -> ファイル名
     images_data = {}      # ファイル名 -> JPEGバイト列
+    toc_page_map = {}     # page_num -> [目次エントリ]
+    front_only = set()    # 巻頭の窓で新たに画像化したページ
     if not args.no_images:
-        img_nums = classify_image_pages(doc, pages, drop)
+        if not args.no_front_image:
+            toc_page_map = detect_toc_pages(pages, drop)
+        img_nums = classify_image_pages(
+            doc, pages, drop, front_image=not args.no_front_image,
+            front_out=front_only)
+        img_nums |= set(toc_page_map)
         if args.cover_page > 0:
             img_nums.discard(args.cover_page - 1)   # 表紙ページは除外
+            toc_page_map.pop(args.cover_page - 1, None)
+        if toc_page_map:
+            print("印刷目次ページ: "
+                  + "/".join(f"p{p + 1}" for p in sorted(toc_page_map))
+                  + f"（章題 {sum(len(v) for v in toc_page_map.values())} 件）")
         for pnum in sorted(img_nums):
             fname = f"p{pnum + 1:04d}.jpg"
             images_data[fname] = render_image_page(doc, pnum)
@@ -6978,12 +7275,18 @@ def main():
                     f.write(data)
             print(f"画像ページ検出: {len(image_page_map)} 枚 → {img_dir}/")
 
+    # 行が詰まった巻頭の画像ページ（印刷目次・系図・一覧）は章頭にできない
+    # ＝ assemble_text がそこで見出しを出さないので、選ぶと章題が消える
+    front_dense = {pg.num for pg in pages if pg.num in front_only
+                   and _body_line_count(pg, drop) > IMG_HEADING_MAX_LINES}
+
     # 柱ランによる章境界（DESIGN_柱ラン章立て.md）。章頭ページの算出に
     # 画像ページ（中扉）を使うので、画像ページ検出の後に行う
     pillar_runs = {} if args.no_chapter_marks else detect_pillar_runs(
         pages, drop, body_size, image_pages=set(image_page_map),
         title=title, author=author, body_end=body_end,
-        horizontal=args.horizontal)
+        horizontal=args.horizontal,
+        no_head_pages=front_dense | set(toc_page_map))
     # 章頭が全面挿絵で柱が書名の本（ぼくがぼくであること）は柱ランが
     # 不発火する。画像ページの等間隔性で拾う（DESIGN_柱ラン章立て.md §4）
     image_chapters = {} if (args.no_chapter_marks or pillar_runs) else \
@@ -7000,7 +7303,8 @@ def main():
                       image_pages=image_page_map,
                       horizontal=args.horizontal,
                       chapter_marks=chapter_marks, body_end=body_end,
-                      heading_pages_out=probe_pages)
+                      heading_pages_out=probe_pages,
+                      toc_pages=set(toc_page_map), front_pages=front_only)
     if pillar_runs:
         # **既存の見出しのほうが柱ランより多い本には手を出さない。**
         # 章立てが既にできている本（ほんもの22・グリック50・タイム・リープ47・
@@ -7044,11 +7348,17 @@ def main():
                          image_pages=image_page_map,
                          horizontal=args.horizontal,
                          chapter_marks=chapter_marks, body_end=body_end,
-                         pillar_chapters=pillar_chapters)
+                         pillar_chapters=pillar_chapters,
+                         toc_pages=set(toc_page_map), front_pages=front_only)
 
     if not args.no_toc_refine:
+        # 目次ページを画像化した本では、章題辞書を本文テキストからでなく
+        # detect_toc_pages の結果から渡す（DESIGN_v2.0.md §3.8）
+        toc_entries = [e for p in sorted(toc_page_map)
+                       for e in toc_page_map[p]]
         body, toc_stats = refine_headings_with_toc(
-            body, title, hashira_keys, author=author, verbose=args.verbose)
+            body, title, hashira_keys, author=author, verbose=args.verbose,
+            toc_entries=toc_entries, toc_page_count=len(toc_page_map))
         if toc_stats:
             detail = " / ".join(f"{k} {v}" for k, v in toc_stats.items())
             print(f"目次照合: {detail}")
@@ -7072,7 +7382,7 @@ def main():
         f.write(f"{title}\n{author}\n\n{body}\n")
     print(f"✅ 青空文庫形式テキスト出力: {out_path}")
 
-    if args.epub:
+    if not args.no_epub:
         epub_path = os.path.splitext(out_path)[0] + ".epub"
         _, _, synopsis, episodes = parse_aozora_text(
             f"{title}\n{author}\n\n{body}\n")
@@ -7092,7 +7402,8 @@ def main():
                    publisher=meta["publisher"], isbn=meta["isbn"],
                    pub_date=meta["pub_date"], bib=meta["opf"],
                    images=images_data or None,
-                   horizontal=args.horizontal)
+                   horizontal=args.horizontal,
+                   toc_at_end=not args.toc_front)
         print(f"✅ ePub出力完了: {epub_path}")
 
 

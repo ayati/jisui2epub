@@ -231,7 +231,7 @@ python ndlocr_reocr.py "C:\books\本.pdf" --ndlocr-dir C:\ndlocr-lite
 再OCRしたPDFを、いつもどおり jisui2epub にかけます。
 
 ```powershell
-python jisui2epub.py "C:\books\本_ndlocr.pdf" --title "タイトル" --author "著者名" --epub
+python jisui2epub.py "C:\books\本_ndlocr.pdf" --title "タイトル" --author "著者名"
 ```
 
 > **ファイル名の `_ndlocr` は著者名に混ざりません。** 「タイトル_著者名_ndlocr.pdf」の
@@ -345,7 +345,7 @@ Python を入れ直すか、インストーラを再実行して **Modify** か�
 ルビを捨ててしまってよければ、変換時に `--ruby drop` を付けられます。
 
 ```powershell
-python jisui2epub.py 本_ndlocr.pdf --ruby drop --epub
+python jisui2epub.py 本_ndlocr.pdf --ruby drop
 ```
 
 ---
