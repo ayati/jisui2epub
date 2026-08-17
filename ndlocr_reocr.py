@@ -185,6 +185,40 @@ TRIM_MAX_CHARS = 3
 # 1文字読みを採るかどうかの確信度の比（初段の答えに対して。_pick_single_char）
 REREAD_CONF_RATIO = 0.5
 
+# ── 2セル以上のダッシュの復元（_expand_dash_runs）────────────────
+#
+# NDLOCR は縦組みのダッシュ「――」（2セル）を**半角ハイフン1文字**として返す。
+# 文字としての誤り（全角化）は jisui2epub の normalize_ocr_text が直せるが、
+# **字数**はテキストからは復元できない（「-」1つが1セルの長音なのか2セルの
+# ダッシュなのかは字面では決まらない）。ここは印刷を実測して決める。
+#
+# 【試して撤回】行の字数と検出箱の高さの照合。「箱の高さ÷本文ピッチ」が
+# 認識字数より1多ければ2セル、という案は使えない。どこよりも60ページの実測で
+# **ハイフンを含まない行**でも同じ量が -1:169 / 0:520 / +1:174 と散る
+# （DEIM の検出箱は unclip で外に膨らみ、膨らみ量が箱ごとに違う）。
+#
+# 採るのは局所の実測。縦組みではダッシュも長音も「細い縦棒」なので、
+# **その棒の長さをページ本文ピッチで割れば印刷上何セルぶんかが決まる**。
+# 行全体でなく塊1つを測るので、箱の膨らみもピッチ推定の誤差も効かない。
+# 実測（NDLOCR再OCR済み5冊・GOAL照合できた544件）:
+#   ダッシュの連続数がGOALと一致 483/498（97.0%）
+#     どこよりも103/108・赤毛のアン341/347・ピザン18/18・
+#     RAIL WARS10/14・赤毛のアン論11/11
+#   長音・その他を1字のまま維持 42/46（不一致4件はGOAL側が `――」` 等で
+#     実際はダッシュ。**長音5件は全て1セルのまま**）
+#
+# **暗画素の下限は1画素**。2にすると赤毛のアンが 341/347 → 154/347 に崩れる
+# （あの本のスキャンは1184px幅と低解像度で、ダッシュの線が1〜2pxしかない）。
+# ルビ分割の RUBY_INK_MIN_FRAC=0.08 とは逆向きの要求で、共有できない
+DASH_INK_MIN_PX = 1
+# **「箱幅に対してこの割合以下の細い行」だけを塊とみなす**のが対の条件。
+# 上限が無いと塊が隣の字と繋がり、2セルのダッシュの90%点が 2.03→2.97 に
+# 伸びて `―――` になる（どこよりも101件で実測）
+DASH_INK_MAX_RATIO = 0.22
+# 伸ばす上限。実測の最長は3セル（どこよりもの独白冒頭「―――」）
+DASH_MAX_CELLS = 3
+# 輝度のしきい値はルビ分割と同じ RUBY_INK_LEVEL を使う
+
 # 検出ボックスを実インク幅に縮める比。YomiToku(DBNet) では 0.68 が必須だったが、
 # **DEIM のボックスが実インクとどれだけずれるかは未測定**のため既定は無補正。
 # DESIGN_NDLOCR実装.md §6.6(c)。--ink-ratio で振れるようにしてある
@@ -210,6 +244,7 @@ CALIBRATION_TARGET_CHARS = 800
 
 _MODELS = {}   # 遅延ロードしたモデルを保持
 TRIM_STATS = [0]   # _trim_overlong_lines が切り詰めた行数（完了時に報告）
+DASH_STATS = [0]   # _expand_dash_runs が伸ばしたダッシュの数（完了時に報告）
 
 
 # ── NDLOCR-Lite の読み込み ────────────────────────────────────
@@ -469,6 +504,93 @@ def _trim_overlong_lines(lines, img):
     return trimmed
 
 
+def _dash_run_length(gray, x0, x1, yc, pitch):
+    """列の帯 [x0,x1) で y=yc を含む「細い」連続インクの長さ(px)を返す。
+
+    帯はページ全体の高さで取る（ダッシュは検出箱からわずかにはみ出す）。
+    yc が空白に落ちたときは pitch 以内の近傍の塊に寄せる（等分割で割り
+    当てたセル位置は、まさに字数が足りないぶんだけずれているため）。
+    """
+    band = gray[:, x0:x1]
+    if band.size == 0:
+        return None
+    dark = (band < RUBY_INK_LEVEL).sum(axis=1)
+    on = (dark >= DASH_INK_MIN_PX) & (dark <= (x1 - x0) * DASH_INK_MAX_RATIO)
+    h = len(on)
+    yc = int(round(yc))
+    if not 0 <= yc < h:
+        return None
+    if not on[yc]:
+        for d in range(1, max(2, int(pitch)) + 1):
+            near = [y for y in (yc - d, yc + d) if 0 <= y < h and on[y]]
+            if near:
+                yc = near[0]
+                break
+        else:
+            return 0
+    a = b = yc
+    while a > 0 and on[a - 1]:
+        a -= 1
+    while b + 1 < h and on[b + 1]:
+        b += 1
+    return b - a + 1
+
+
+def _expand_dash_runs(lines, img):
+    """1文字の「-」と読まれた2セル以上のダッシュを実測セル数に伸ばす。
+
+    ページ本文ピッチは _trim_overlong_lines と同じ「箱の高さ÷字数」だが、
+    **字数で重み付けした中央値**を使う（短い行は検出箱の膨らみの影響が
+    相対的に大きくピッチが上振れする）。戻り値は伸ばしたダッシュの数。
+    """
+    cv2, np = _import_cv2()
+    pitches, targets, samples = [], [], 0
+    for ln in lines:
+        if ln["cls"] not in BODY_CLASSES:
+            continue
+        x0, y0, x1, y1 = ln["box"]
+        if (y1 - y0) < (x1 - x0):          # 横行は本文ピッチで測れない
+            continue
+        chars = [c for c in ln["text"] if not c.isspace()]
+        if not chars:
+            continue
+        pitch = (y1 - y0) / len(chars)
+        if len(chars) >= TRIM_BODY_MIN_CHARS:
+            pitches.extend([pitch] * (len(chars) - 1))
+            samples += 1
+        if "-" in chars:
+            targets.append((ln, chars, pitch))
+    if not targets or samples < TRIM_MIN_SAMPLES:
+        return 0
+    body = statistics.median(pitches)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+
+    fixed = 0
+    for ln, chars, pitch in targets:
+        x0, y0, x1, y1 = [int(v) for v in ln["box"]]
+        out, i = [], 0
+        while i < len(chars):
+            if chars[i] != "-":
+                out.append(chars[i])
+                i += 1
+                continue
+            j = i
+            while j + 1 < len(chars) and chars[j + 1] == "-":
+                j += 1
+            n = j - i + 1
+            yc = y0 + (i + n / 2) * pitch
+            length = _dash_run_length(gray, x0, x1, yc, body)
+            if length:
+                k = max(n, min(DASH_MAX_CELLS, max(1, round(length / body))))
+                if k > n:
+                    fixed += 1
+                n = k
+            out.append("-" * n)
+            i = j + 1
+        ln["text"] = "".join(out)
+    return fixed
+
+
 def _split_ruby_runs(crop):
     """縦書きルビ列を、行方向（Y）のインクの切れ目で語に分割する。
 
@@ -569,6 +691,10 @@ def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
     # 1文字の箱を2文字と読む PARSEQ の癖を幾何で弾く（TRIM_PITCH_RATIO）。
     # ルビを足す前に済ませる（ルビ行はピッチの尺が違う）
     TRIM_STATS[0] += _trim_overlong_lines(lines, img)
+
+    # 2セル以上のダッシュを実測して伸ばす（DASH_INK_MIN_PX の説明を参照）。
+    # 切り詰めのあと・ルビを足す前に行う（ルビ行はピッチの尺が違う）
+    DASH_STATS[0] += _expand_dash_runs(lines, img)
 
     # ルビは重複を潰してから語に切る（_dedup_boxes の説明を参照）。
     # 語ごとに切って読み、切片ごとに1行として積む。位置は実測なので
@@ -819,6 +945,8 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
     print(f"   {processed}ページ / 本文{total_chars}字 / ルビ{total_ruby}字")
     if TRIM_STATS[0]:
         print(f"   読み過ぎ行の切り詰め: {TRIM_STATS[0]}行")
+    if DASH_STATS[0]:
+        print(f"   ダッシュの字数復元: {DASH_STATS[0]}箇所")
     preprocess_report()
 
 
