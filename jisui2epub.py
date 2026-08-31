@@ -25,6 +25,8 @@ import argparse
 import bisect
 import calendar
 import difflib
+import itertools
+import math
 import os
 import re
 import statistics
@@ -43,7 +45,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -117,7 +119,7 @@ IMG_HEADING_MAX_LINES = 2   # 巻頭の画像ページで見出しを出して�
 
 class VLine:
     """縦書きの1行（縦の文字列）。cells は (文字, y0, y1) のリスト。"""
-    __slots__ = ("cells", "x0", "x1", "y0", "y1", "size", "band")
+    __slots__ = ("cells", "x0", "x1", "y0", "y1", "size", "band", "spans")
 
     def __init__(self):
         self.cells = []
@@ -125,6 +127,10 @@ class VLine:
         self.x1 = self.y1 = -1e9
         self.size = 0.0
         self.band = -1   # 横書き段組の帯index（-1=帯なし）
+        # 構成スパンの (x0, y0, x1, y1, size)。部分図検出の被覆マスクに使う
+        # （DESIGN_部分図.md §3.1）。行の bbox は図版OCRノイズが同じ
+        # クラスタに紛れるとページ幅いっぱいまで広がるので被覆には使えない
+        self.spans = []
 
     def add_span(self, sp):
         x0, y0, x1, y1 = sp["bbox"]
@@ -132,6 +138,7 @@ class VLine:
         n = len(text)
         if n == 0:
             return
+        self.spans.append((x0, y0, x1, y1, sp["size"]))
         cell_h = (y1 - y0) / n
         for i, ch in enumerate(text):
             self.cells.append((ch, y0 + i * cell_h, y0 + (i + 1) * cell_h))
@@ -1911,15 +1918,14 @@ def detect_image_chapters(pages, drop, image_pages, body_end=None):
     return {p: str(i + 1) for i, p in enumerate(chain)}
 
 
-def render_image_page(doc, page_num):
+def _page_ink_small_bbox(doc_page, scale=0.3):
+    """縮小グレースケール描画でインクの外接矩形を求める。
+
+    戻り値: (xs_min, ys_min, xs_max, ys_max, w, h) — **縮小画素単位**。
+    インクが無ければ None。render_image_page と見開き判定で共有する。
     """
-    PDFページを画像ページ用JPEGにレンダリングして bytes を返す。
-    外周の白余白はインクのバウンディングボックスで自動トリミングする。
-    """
-    page = doc[page_num]
-    # 縮小グレースケールでインク領域のbboxを求める
-    small = page.get_pixmap(matrix=fitz.Matrix(0.3, 0.3),
-                            colorspace=fitz.csGRAY)
+    small = doc_page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                                colorspace=fitz.csGRAY)
     w, h, s = small.width, small.height, small.samples
     xs, ys = [], []
     for y in range(h):
@@ -1928,15 +1934,718 @@ def render_image_page(doc, page_num):
             if b < 200:
                 xs.append(x)
                 ys.append(y)
-    if xs:
+    if not xs:
+        return None
+    return min(xs), min(ys), max(xs), max(ys), w, h
+
+
+def render_image_page(doc, page_num):
+    """
+    PDFページを画像ページ用JPEGにレンダリングして bytes を返す。
+    外周の白余白はインクのバウンディングボックスで自動トリミングする。
+    """
+    page = doc[page_num]
+    bb = _page_ink_small_bbox(page)
+    if bb:
+        x0, y0, x1, y1, w, h = bb
         pad = max(2, int(min(w, h) * 0.02))
-        clip = fitz.Rect(max(0, min(xs) - pad) / 0.3,
-                         max(0, min(ys) - pad) / 0.3,
-                         min(w, max(xs) + pad) / 0.3,
-                         min(h, max(ys) + pad) / 0.3)
+        clip = fitz.Rect(max(0, x0 - pad) / 0.3,
+                         max(0, y0 - pad) / 0.3,
+                         min(w, x1 + pad) / 0.3,
+                         min(h, y1 + pad) / 0.3)
     else:
         clip = page.rect
     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+    return pix.tobytes("jpeg", jpg_quality=85)
+
+
+# ── 見開き（2ページにまたがる図）の連結 ────────────────────────
+#
+# 設計書 DESIGN_部分図.md §8.3。蘇我氏の GOAL には見開き図が8件
+# （p_12-13・p_36-37・p_46-47・p_86-87・p_118-119・p_194-195 と前付け2件）、
+# 人類の起源にも1件ある。ページ単位で画像にすると左右半分ずつの2枚になる。
+#
+# 判定は**インクが綴じ側の紙端に接しているか**で行う。実測（蘇我氏・
+# 既知の見開き5組、ページ幅289pt）: 内側の余白 0〜5pt に対し外側は 27〜34pt と
+# はっきり分かれる。連続する2枚の画像ページで
+#   縦組み（右綴じ）: 先のページの**左**端と後のページの**右**端にインクが接する
+#   横組み（左綴じ）: 先のページの**右**端と後のページの**左**端
+# を満たすものだけを見開きとみなす。**外側の端に接しているものは除く**
+# （フルブリードの扉・表紙が何とでも組になってしまう。蘇我氏 p3 は
+#  左余白0・右余白-3 で両端に接する）。
+SPREAD_EDGE_RATIO = 0.03   # 紙端に「接する」とみなす余白（ページ幅比）
+SPREAD_Y_OVERLAP = 0.5     # 2枚のインクのy範囲の重なりの下限（小さいほう比）
+
+
+def _spread_ink_margins(doc_page):
+    """(左余白, 右余白, インク上端, インク下端) を pt で返す。"""
+    bb = _page_ink_small_bbox(doc_page)
+    if bb is None:
+        return None
+    x0, y0, x1, y1, w, h = bb
+    r = doc_page.rect
+    return (x0 / 0.3, r.width - (x1 + 1) / 0.3, y0 / 0.3, (y1 + 1) / 0.3)
+
+
+def detect_image_spreads(doc, image_pages, horizontal=False):
+    """見開きの画像ページ対を {先のページ: (左ページ, 右ページ)} で返す。
+
+    連結後の画像は紙面どおり左→右に並べる。縦組み（右綴じ）では
+    **後のページが左半分・先のページが右半分**になる（実測: 蘇我氏の
+    書籍p12＝物理p27 が右、p13＝物理p28 が左で1枚の地図になる）。
+    """
+    pages = sorted(image_pages)
+    if not pages:
+        return {}
+    marg = {}
+    for p in pages:
+        m = _spread_ink_margins(doc[p])
+        if m is not None:
+            marg[p] = m
+    out, used = {}, set()
+    for p in pages:
+        if p in used or p + 1 not in image_pages:
+            continue
+        a, b = marg.get(p), marg.get(p + 1)
+        if a is None or b is None:
+            continue
+        tol = doc[p].rect.width * SPREAD_EDGE_RATIO
+        if horizontal:
+            inner_a, outer_a, inner_b, outer_b = a[1], a[0], b[0], b[1]
+            left, right = p, p + 1
+        else:
+            inner_a, outer_a, inner_b, outer_b = a[0], a[1], b[1], b[0]
+            left, right = p + 1, p
+        if not (inner_a <= tol and inner_b <= tol):
+            continue
+        if outer_a <= tol or outer_b <= tol:
+            continue          # フルブリード＝見開きの判定に使えない
+        lo = max(a[2], b[2])
+        hi = min(a[3], b[3])
+        span = min(a[3] - a[2], b[3] - b[2])
+        if span <= 0 or (hi - lo) < span * SPREAD_Y_OVERLAP:
+            continue          # 上下の位置が合わない＝別々の図
+        out[p] = (left, right)
+        used.add(p)
+        used.add(p + 1)
+    return out
+
+
+def spread_filename(left_num, right_num):
+    """見開き画像のファイル名。**紙面の左→右の順**で持たせる
+    （--from-text で綴じ方向を知らなくても再現できるようにするため）。"""
+    return f"s{left_num + 1:04d}-{right_num + 1:04d}.jpg"
+
+
+_SPREAD_NAME_RE = re.compile(r"s(\d+)-(\d+)\.jpe?g", re.IGNORECASE)
+
+
+def render_image_spread(doc, left_num, right_num):
+    """見開きの2ページを1枚のJPEGに連結する（左ページ・右ページの順）。"""
+    lp, rp = doc[left_num], doc[right_num]
+    lm, rm = _spread_ink_margins(lp), _spread_ink_margins(rp)
+    if lm is None or rm is None:
+        return render_image_page(doc, left_num)
+    pad = max(2.0, min(lp.rect.width, lp.rect.height) * 0.02)
+    y0 = max(0.0, min(lm[2], rm[2]) - pad)
+    y1 = min(lp.rect.height, max(lm[3], rm[3]) + pad)
+    # 綴じ側（左ページの右端・右ページの左端）は切らずに突き合わせる
+    lclip = fitz.Rect(max(0.0, lm[0] - pad), y0, lp.rect.width, y1)
+    rclip = fitz.Rect(0.0, y0, min(rp.rect.width, rp.rect.width - rm[1] + pad), y1)
+    m = fitz.Matrix(2, 2)
+    p1 = lp.get_pixmap(matrix=m, clip=lclip)
+    p2 = rp.get_pixmap(matrix=m, clip=rclip)
+    w, h = p1.width + p2.width, max(p1.height, p2.height)
+    out = fitz.Pixmap(p1.colorspace, fitz.IRect(0, 0, w, h), p1.alpha)
+    out.clear_with(255)
+    p1.set_origin(0, 0)
+    out.copy(p1, p1.irect)
+    p2.set_origin(p1.width, 0)
+    out.copy(p2, p2.irect)
+    return out.tobytes("jpeg", jpg_quality=85)
+
+
+# ── 部分図（本文と同居する図・写真）の検出 ──────────────────────
+#
+# 設計書 DESIGN_部分図.md。
+#
+# classify_image_pages は「本文行4行以下」のページしか候補にしないので、
+# 図が本文と同居するページ（本文行15〜19行）は原理的に拾えない。しかも
+# 図のキャプション・図中ラベルは縦組みの本の中で横組みなので
+# classify_marginals が drop する。結果、図もキャプションも丸ごと消える
+# （実測: 人類の起源 43枚・星空をつくる機械 81枚が出力ゼロ）。
+#
+# 図は「本文の縦行に覆われていない矩形」を占める。キャプションは横組みなので
+# 縦行の被覆に入らず、自動的にこの矩形の中に入る。
+
+# 被覆から外す巨大スパンのサイズ比。ScanSnap は写真を1文字の巨大スパンとして
+# 返すことがある（星空 p155 の '灘' は本文比 20.6、p147 '轟' 11.1、
+# p64 '蕊' 12.7）。正当な大見出しの実測最大は 2.06 なので 4.0 で分けられる
+FIG_BIG_SPAN_RATIO = 4.0
+# 被覆から外す極小スパンのサイズ比（ルビ未満＝図版内の微細ノイズ）。
+# ルビは 0.68 なので 0.45 なら巻き込まない
+FIG_MIN_SPAN_RATIO = 0.45
+FIG_MIN_CH = 3.0          # 図矩形の最小の幅・高さ（本文字数）
+# 図矩形の最小面積（本文帯比）。**幅・高さの下限だけでは足りない**＝
+# 章番号（大活字の「12」）と隣の列のはみ出しが 40x54pt の小片として残る
+# （タイム・リープ p200 で実測 0.029）。本物の図の最小は 0.066
+# （人類 p229 の 64x96）なので、あいだの 0.04 で切る
+FIG_MIN_AREA = 0.04
+FIG_INK_GATE = 0.035      # 図とみなす暗画素率（既定）
+FIG_INK_GATE_STRICT = 0.05   # --inline-figure strict
+FIG_INK_INSET = 2.0       # インク率を測るときに矩形を内側に詰める量(pt)
+FIG_GRID = 4.0            # 連結成分・インク外接矩形のグリッド(pt)
+FIG_MERGE = 25.0          # 連結成分を1つの図にまとめる距離(pt)。
+                          # 星空 p30 の正多面体5個（間隔20pt）は1枚、
+                          # ファンタジー事典 p107 の盾3個（間隔40pt＋罫線）は
+                          # 別々にしたい（DESIGN_部分図.md §8.4）
+FIG_FULLPAGE_RATIO = 0.70  # 本文帯のこの割合を覆ったら「全面図」扱い
+FIG_RENDER_DPI = 144
+# 「テキスト層に本文らしい行がある」判定（DESIGN_部分図.md §5.3(b)）。
+# is_junk_line がかな無しの本文列を挿絵ノイズと誤判定して落とすことがあり
+# （蘇我氏 p215 の官人の官歴の列挙）、そのままだと本文4列が画像になる
+FIG_TEXTLIKE_MIN_LEN = 8
+FIG_TEXTLIKE_MIN_CJK = 3
+FIG_TEXTLIKE_COVER = 0.50
+_FIG_CJK_RE = re.compile(r'[぀-ゖ゠-ヿ㐀-鿿]')
+
+_FIG_DARK = bytes(1 if i < 200 else 0 for i in range(256))
+
+
+class _PageInk:
+    """1ページのインクマスク。2.0倍のグレースケール描画を1回だけ行い、
+    矩形のインク率と粗いグリッドの暗画素数を高速に引けるようにする。
+
+    横書きモード（horizontal=True）では解析側の座標が転置されている
+    （transpose_spans: (x,y)→(H−y,x)）ので、**ページを回転させるのではなく
+    矩形を画素座標へ写す**。ページの rotation を書き換えると
+    render_image_page や表紙のレンダリングまで巻き添えになる。
+    """
+
+    __slots__ = ("w", "h", "scale", "dark", "nx", "ny", "grid", "cell_px",
+                 "horiz", "page_h")
+
+    def __init__(self, doc_page, horizontal=False, scale=2.0):
+        pix = doc_page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                                  colorspace=fitz.csGRAY)
+        self.w, self.h, self.scale = pix.width, pix.height, scale
+        self.dark = pix.samples.translate(_FIG_DARK)
+        self.cell_px = max(1, int(FIG_GRID * scale))
+        self.nx = (self.w + self.cell_px - 1) // self.cell_px
+        self.ny = (self.h + self.cell_px - 1) // self.cell_px
+        self.grid = None
+        self.horiz = horizontal
+        self.page_h = doc_page.rect.height
+
+    def to_px(self, rect):
+        """解析座標の矩形 → 画素座標 (a, c, b, d)。"""
+        x0, y0, x1, y1 = rect
+        if self.horiz:
+            px0, px1 = y0, y1
+            py0, py1 = self.page_h - x1, self.page_h - x0
+        else:
+            px0, px1, py0, py1 = x0, x1, y0, y1
+        s = self.scale
+        return (max(0, int(px0 * s)), max(0, int(py0 * s)),
+                min(self.w, int(px1 * s)), min(self.h, int(py1 * s)))
+
+    def from_px(self, a, c, b, d):
+        """画素座標 (a, c, b, d) → 解析座標の矩形。"""
+        s = self.scale
+        px0, py0, px1, py1 = a / s, c / s, b / s, d / s
+        if self.horiz:
+            return (self.page_h - py1, px0, self.page_h - py0, px1)
+        return (px0, py0, px1, py1)
+
+    def ink(self, rect):
+        """矩形（解析座標）の暗画素率。"""
+        a, c, b, d = self.to_px(rect)
+        if a >= b or c >= d:
+            return 0.0
+        n = 0
+        for y in range(c, d):
+            n += self.dark[y * self.w + a:y * self.w + b].count(1)
+        return n / ((b - a) * (d - c))
+
+    def _build_grid(self):
+        if self.grid is not None:
+            return
+        cp, w = self.cell_px, self.w
+        g = [[0] * self.nx for _ in range(self.ny)]
+        for y in range(self.h):
+            row = self.dark[y * w:(y + 1) * w]
+            if not row.count(1):
+                continue
+            gr = g[y // cp]
+            for gx in range(self.nx):
+                c = row[gx * cp:(gx + 1) * cp].count(1)
+                if c:
+                    gr[gx] += c
+        self.grid = g
+
+    def cells_on(self, rect, min_frac):
+        """矩形（解析座標）内で「絵」とみなせるグリッドセルの集合。"""
+        self._build_grid()
+        cp = self.cell_px
+        need = max(1, int(cp * cp * min_frac))
+        a, c, b, d = self.to_px(rect)
+        gx0, gx1 = a // cp, min(self.nx - 1, (b - 1) // cp)
+        gy0, gy1 = c // cp, min(self.ny - 1, (d - 1) // cp)
+        return {(gy, gx)
+                for gy in range(gy0, gy1 + 1)
+                for gx in range(gx0, gx1 + 1)
+                if self.grid[gy][gx] >= need}
+
+
+def _fig_components(cells, merge_cells):
+    """グリッドセル集合を連結成分に分け、近い成分を統合して bbox を返す。"""
+    if not cells:
+        return []
+    seen, comps = set(), []
+    for c in cells:
+        if c in seen:
+            continue
+        seen.add(c)
+        stack, part = [c], []
+        while stack:
+            gy, gx = stack.pop()
+            part.append((gy, gx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    q = (gy + dy, gx + dx)
+                    if q in cells and q not in seen:
+                        seen.add(q)
+                        stack.append(q)
+        ys = [p[0] for p in part]
+        xs = [p[1] for p in part]
+        comps.append([min(xs), min(ys), max(xs) + 1, max(ys) + 1, len(part)])
+    # 近い成分の統合（マージ距離はグリッド単位）
+    changed = True
+    while changed and len(comps) > 1:
+        changed = False
+        for i in range(len(comps)):
+            for j in range(i + 1, len(comps)):
+                a, b = comps[i], comps[j]
+                if (a[0] - merge_cells < b[2] and b[0] - merge_cells < a[2]
+                        and a[1] - merge_cells < b[3]
+                        and b[1] - merge_cells < a[3]):
+                    comps[i] = [min(a[0], b[0]), min(a[1], b[1]),
+                                max(a[2], b[2]), max(a[3], b[3]), a[4] + b[4]]
+                    comps.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+    return comps
+
+
+def _fig_coverage(pg, drop, headings, body_size):
+    """本文として出力される行の構成スパンの bbox を返す（被覆マスクの材料）。
+
+    **行の bbox でなくスパンの bbox を使う**（DESIGN_部分図.md §3.1）。
+    巨大スパン（図版OCRノイズ）と極小スパン（図版内の微細ノイズ）は外す。
+    横行（キャプション・図中ラベル）は入れない＝縦組みの本文帯にある横行は
+    図に属するものなので、被覆に入れると図が分断される。柱位置の見出しは
+    _fig_walls が壁として扱う。
+    """
+    hi, lo = body_size * FIG_BIG_SPAN_RATIO, body_size * FIG_MIN_SPAN_RATIO
+    out = []
+    for v in pg.vlines:
+        if not v.text.strip():
+            continue
+        key = (pg.num, id(v))
+        if key in drop and key not in headings:
+            continue
+        if is_junk_line(v.text.strip()):
+            continue
+        for x0, y0, x1, y1, size in (v.spans or
+                                     [(v.x0, v.y0, v.x1, v.y1, v.size)]):
+            if lo <= size <= hi:
+                out.append((x0, y0, x1, y1))
+    # **ルビは被覆に入れてはならない。** analyze_page は本文の 0.68 倍以下の
+    # スパンを全部ルビ扱いにするので、図中の小さなラベル（人類 p55 の地図の
+    # 「スクラチナ」等）もルビになる。被覆に入れると図が分断される
+    # （実測: p55 の地図が y[49,211] → y[50,101] に縮んだ）。
+    # ルビ帯が「テキストの無い領域」になる問題（タイム・リープ p20 の
+    # 章番号＋ルビ断片）は FIG_MIN_AREA が落とす
+    return out
+
+
+def _fig_walls(pg, drop, headings, bl, br, bt, bb):
+    """切り抜きの拡張を止める余白側の壁（柱・ノンブル・柱位置の見出し）。
+
+    **本文帯の外に出ている行だけ**を壁にする。本文帯の中の drop 行は
+    挿絵のOCRノイズ、本文帯の中の headings は図中ラベルの誤検出なので、
+    壁にすると図が切れる（人類 p55 の地図の注記で実測）。
+    """
+    out = []
+    for ln in itertools.chain(pg.vlines, pg.hlines):
+        key = (pg.num, id(ln))
+        if key not in drop and key not in headings:
+            continue
+        if (ln.y1 <= bt + 1 or ln.y0 >= bb - 1
+                or ln.x1 <= bl + 1 or ln.x0 >= br - 1):
+            out.append((ln.x0, ln.y0, ln.x1, ln.y1))
+    return out
+
+
+def _fig_textlike_boxes(pg, drop, headings):
+    """テキスト層にあるのに本文として出力されない「本文らしい行」の bbox。
+
+    is_junk_line がかな無しの本文列を挿絵ノイズと誤判定して捨てることがある
+    （蘇我氏 p215 の `八年〔七四六〕、従五位下）、牛養（…`）。この領域を
+    画像にすると読み順の途中に本文4列ぶんの画像が挟まるので発行を止める。
+    """
+    out = []
+    for v in pg.vlines:
+        t = v.text.strip()
+        if len(t) < FIG_TEXTLIKE_MIN_LEN:
+            continue
+        key = (pg.num, id(v))
+        if key in drop and key not in headings:
+            continue      # 柱・ノンブルは対象外
+        if not is_junk_line(t):
+            continue      # 出力される行は被覆側で扱う
+        if len(_FIG_CJK_RE.findall(t)) >= FIG_TEXTLIKE_MIN_CJK:
+            out.append((v.x0, v.y0, v.x1, v.y1))
+    return out
+
+
+def _fig_body_box(pages, drop, headings, kept_counts):
+    """書籍レベルの本文帯 (left, right)。
+
+    **本文として出力される行だけで測る。** 全 vline で測ると、横書きモード
+    （転置座標）では柱・ノンブルが縦行になって帯を紙面の天地いっぱいまで
+    広げてしまい、切り抜きが柱を巻き込む（30秒DS p28 で
+    `14 第1章 基本` が図に入るのを実測）。縦書きでは柱は横行なので
+    この違いは出ない。
+    """
+    lefts, rights = [], []
+    for pg in pages:
+        if kept_counts.get(pg.num, 0) < 8:
+            continue
+        vs = [v for v in pg.vlines if v.text.strip()
+              and ((pg.num, id(v)) not in drop or (pg.num, id(v)) in headings)
+              and not is_junk_line(v.text.strip())]
+        if vs:
+            lefts.append(min(v.x0 for v in vs))
+            rights.append(max(v.x1 for v in vs))
+    if not lefts:
+        return None
+    return statistics.median(lefts), statistics.median(rights)
+
+
+def _fig_free_rects(cov, bl, br, bt, bb, body_size):
+    """本文テキストに覆われていない矩形（＝図の許容範囲）を返す。"""
+    step = 1.0
+    w = int((br - bl) / step) + 1
+    top = [bb] * w
+    bot = [bt] * w
+    for x0, y0, x1, y1 in cov:
+        if y1 <= bt or y0 >= bb or x1 <= bl or x0 >= br:
+            continue
+        a = max(0, int((x0 - bl) / step))
+        b = min(w - 1, int((x1 - bl) / step))
+        yy0, yy1 = max(y0, bt), min(y1, bb)
+        for i in range(a, b + 1):
+            if yy0 < top[i]:
+                top[i] = yy0
+            if yy1 > bot[i]:
+                bot[i] = yy1
+    minh = body_size * FIG_MIN_CH
+
+    def runs(pred):
+        res, s = [], None
+        for i in range(w):
+            if pred(i):
+                if s is None:
+                    s = i
+            elif s is not None:
+                res.append((s, i - 1))
+                s = None
+        if s is not None:
+            res.append((s, w - 1))
+        return res
+
+    out = []
+    for a, b in runs(lambda i: top[i] - bt >= minh):
+        out.append((bl + a * step, bt, bl + (b + 1) * step, min(top[a:b + 1])))
+    for a, b in runs(lambda i: bb - bot[i] >= minh):
+        out.append((bl + a * step, max(bot[a:b + 1]), bl + (b + 1) * step, bb))
+    return [r for r in out
+            if r[2] - r[0] >= minh and r[3] - r[1] >= minh]
+
+
+def _fig_allowance(rect, cov, marg, page_rect):
+    """許容範囲を紙面いっぱいまで広げる。隣の本文列・柱・ノンブルで止める。
+
+    **本文帯の天で切ってはならない。** 人類の起源 p55 の地図は枠が本文天
+    （52.8pt）より上に出ており、body_top で切ると上辺が欠ける。テキストが
+    無い方向へは紙面の内側（左右3%・上下2%）まで伸ばす。
+    """
+    x0, y0, x1, y1 = rect
+    lo_x, lo_y = page_rect.width * 0.03, page_rect.height * 0.02
+    nx0, ny0 = lo_x, lo_y
+    nx1, ny1 = page_rect.width - lo_x, page_rect.height - lo_y
+    for bx0, by0, bx1, by1 in itertools.chain(cov, marg):
+        if by0 < y1 and by1 > y0:          # 縦に重なる → 左右の壁
+            if bx1 <= x0:
+                nx0 = max(nx0, bx1)
+            elif bx0 >= x1:
+                nx1 = min(nx1, bx0)
+        if bx0 < x1 and bx1 > x0:          # 横に重なる → 上下の壁
+            if by1 <= y0:
+                ny0 = max(ny0, by1)
+            elif by0 >= y1:
+                ny1 = min(ny1, by0)
+    return (min(nx0, x0), min(ny0, y0), max(nx1, x1), max(ny1, y1))
+
+
+def detect_inline_figures(doc, pages, drop, headings, body_size,
+                          body_top, body_bottom, image_pages=None,
+                          body_end=None, ink_gate=FIG_INK_GATE,
+                          horizontal=False, verbose=False):
+    """本文と同居する図・写真の矩形を {page_num: [(x0,y0,x1,y1), ...]} で返す。
+
+    矩形は紙面の読み順（縦組みは右→左）に並ぶ。座標は analyze_page と
+    同じ座標系（横書きモードでは転置後）で返す。
+    """
+    image_pages = set(image_pages or ())
+    # **インク計測は別のドキュメントハンドルで行う。** MuPDF はページの
+    # レンダリング結果をキャッシュするので、同じハンドルでグレースケール
+    # 描画を先に行うと、そのあとの render_image_page / render_figure_rect の
+    # JPEG バイト列が変わる（実測: 人類 p209 が b042be… → 938b07…）。
+    # --from-text の「画像をPDFから再取得するとバイト一致する」性質が
+    # 壊れるので、計測用のハンドルを分けて元の doc に触れないようにする
+    ink_doc = doc
+    try:
+        if getattr(doc, "name", None):
+            ink_doc = fitz.open(doc.name)
+    except Exception:
+        ink_doc = doc
+    kept_counts = {}
+    for pg in pages:
+        kept_counts[pg.num] = sum(
+            1 for v in pg.vlines if v.text.strip()
+            and ((pg.num, id(v)) not in drop or (pg.num, id(v)) in headings)
+            and not is_junk_line(v.text.strip()))
+    box = _fig_body_box(pages, drop, headings, kept_counts)
+    if box is None:
+        return {}, {}
+    bl, br = box
+    if br - bl < body_size * 6:
+        return {}, {}
+    minh = body_size * FIG_MIN_CH
+    area_body = (br - bl) * (body_bottom - body_top)
+    merge_cells = max(1, int(FIG_MERGE / FIG_GRID))
+    result, fullpage = {}, set()
+    seen_nums = set()
+    for pg in pages:
+        if pg.num in seen_nums:
+            continue          # 横書きの帯分割は同じ pg.num を複数持つ
+        seen_nums.add(pg.num)
+        if pg.num in image_pages:
+            continue          # 既に全面画像ページ
+        if body_end is not None and pg.num > body_end:
+            continue          # 後付け（巻末広告・奥付）
+        cov = _fig_coverage(pg, drop, headings, body_size)
+        free = _fig_free_rects(cov, bl, br, body_top, body_bottom, body_size)
+        if not free:
+            continue
+        marg = _fig_walls(pg, drop, headings, bl, br,
+                          body_top, body_bottom)
+        page_rect = doc[pg.num].rect
+        if horizontal:
+            page_rect = fitz.Rect(0, 0, page_rect.height, page_rect.width)
+        ink = None
+        textlike = None
+        boxes = []
+        for rect in free:
+            if ink is None:
+                ink = _PageInk(ink_doc[pg.num], horizontal=horizontal)
+            allow = _fig_allowance(rect, cov, marg, page_rect)
+            cells = ink.cells_on(allow, 0.06)
+            if not cells:
+                continue
+            cp = ink.cell_px
+            for gx0, gy0, gx1, gy1, n in _fig_components(cells, merge_cells):
+                raw = ink.from_px(gx0 * cp, gy0 * cp, gx1 * cp, gy1 * cp)
+                bx = (max(allow[0], min(raw[0], raw[2])),
+                      max(allow[1], min(raw[1], raw[3])),
+                      min(allow[2], max(raw[0], raw[2])),
+                      min(allow[3], max(raw[1], raw[3])))
+                if bx[2] - bx[0] < minh or bx[3] - bx[1] < minh:
+                    continue
+                if ((bx[2] - bx[0]) * (bx[3] - bx[1])
+                        < area_body * FIG_MIN_AREA):
+                    continue
+                # 外周に余白を付ける（render_image_page と同じ 2%・最低2pt）。
+                # 罫線で囲まれた図は枠が1pt しかなく、外接矩形ちょうどで切ると
+                # 枠が欠けて見える
+                pad = max(2.0, min(bx[2] - bx[0], bx[3] - bx[1]) * 0.02)
+                bx = (max(allow[0], bx[0] - pad), max(allow[1], bx[1] - pad),
+                      min(allow[2], bx[2] + pad), min(allow[3], bx[3] + pad))
+                if ink.ink((bx[0] + FIG_INK_INSET, bx[1] + FIG_INK_INSET,
+                            bx[2] - FIG_INK_INSET,
+                            bx[3] - FIG_INK_INSET)) < ink_gate:
+                    continue
+                if textlike is None:
+                    textlike = _fig_textlike_boxes(pg, drop, headings)
+                if _fig_textlike_cover(bx, textlike) >= FIG_TEXTLIKE_COVER:
+                    if verbose:
+                        print(f"  p{pg.num + 1}: 図候補を却下"
+                              f"（テキスト層に本文らしい行がある）")
+                    continue
+                boxes.append(bx)
+        if not boxes:
+            continue
+        # 矩形は整数ptに正規化する。**ファイル名に載る値と描画に使う値を
+        # 一致させる**ため（figure_filename が丸めた名前から --from-text が
+        # 再現するので、丸め前の値で描くと再取得がバイト一致しない）
+        boxes = [(math.floor(b[0]), math.floor(b[1]),
+                  math.ceil(b[2]), math.ceil(b[3])) for b in boxes]
+        boxes = _fig_dedup(boxes)
+        if (len(boxes) == 1 and kept_counts.get(pg.num, 0) <= 2
+                and (boxes[0][2] - boxes[0][0]) * (boxes[0][3] - boxes[0][1])
+                >= area_body * FIG_FULLPAGE_RATIO):
+            fullpage.add(pg.num)
+            continue
+        # 紙面の読み順（縦組みは右→左、横書きモードは転置後の同じ規則）
+        boxes.sort(key=lambda b: (-(b[0] + b[2]) / 2, b[1]))
+        result[pg.num] = boxes
+    if ink_doc is not doc:
+        ink_doc.close()
+    return result, fullpage
+
+
+def _fig_textlike_cover(bx, boxes):
+    """矩形のうち「本文らしいのに落ちている行」に覆われた面積の比。"""
+    area = max(1e-6, (bx[2] - bx[0]) * (bx[3] - bx[1]))
+    cov = 0.0
+    for x0, y0, x1, y1 in boxes:
+        w = min(bx[2], x1) - max(bx[0], x0)
+        h = min(bx[3], y1) - max(bx[1], y0)
+        if w > 0 and h > 0:
+            cov += w * h
+    return cov / area
+
+
+def _fig_dedup(boxes):
+    """同じ図を上帯・下帯の両方から拾った重複を畳む。"""
+    boxes = sorted(boxes, key=lambda b: -(b[2] - b[0]) * (b[3] - b[1]))
+    out = []
+    for b in boxes:
+        dup = False
+        for o in out:
+            w = min(o[2], b[2]) - max(o[0], b[0])
+            h = min(o[3], b[3]) - max(o[1], b[1])
+            if w > 0 and h > 0:
+                inter = w * h
+                small = min((o[2] - o[0]) * (o[3] - o[1]),
+                            (b[2] - b[0]) * (b[3] - b[1]))
+                if inter >= small * 0.5:
+                    dup = True
+                    break
+        if not dup:
+            out.append(b)
+    return out
+
+
+# ── 図のキャプション（DESIGN_部分図.md フェーズ3）──────────────
+#
+# 縦組みの本ではキャプションは横組みなので、切り抜いた矩形の中に必ず入る
+# （だから画像としては欠けない）。ここでテキストとしても拾い、
+# ［＃「…」はキャプション］でePubの <figcaption> に出す。**画像の中に
+# 焼き込まれた文字は拡大できない**ので、リフローで読める形が別に要る。
+#
+# **「図N-N」で始まる、という規則は使えない。** 人類の起源は図番号が
+# キャプション行の先頭に入る（`図2－5現時点でわかっている…`）が、
+# 星空をつくる機械は図番号が別要素で、テキスト層のキャプションは
+# `宇宙の基本要素に対応すると考えられた5つの正多面体` のように番号が無い。
+#
+# 使えるのは幾何。実測（人類・星空）:
+#   - キャプションは矩形の**下端に接する**（下端まで 6〜18pt＝1〜1.5字）。
+#     図中のラベルは下端から 33pt 以上離れる（星空 p30 の `正十二面体…`）
+#   - 複数行のキャプションは**1行送りで連なる**（人類 p76 は3行で送り11pt）。
+#     図中ラベルとの間は 16pt 以上あく
+#   - 図中ラベルはOCRのサイズ申告が壊れている（人類 p55 の
+#     `メズマイスカヤXrvn` は size 40.3、キャプションは 10.5）
+CAP_BOTTOM_MAX = 3.0      # 下端からこの字数以内にある行だけキャプション
+CAP_LINE_GAP = 1.6        # 連続行とみなす送り（行の高さ比）
+CAP_SIZE_LO, CAP_SIZE_HI = 0.65, 1.55   # 連続行として許すサイズ比
+CAP_MIN_CHARS = 3         # これ未満はキャプションにしない
+CAP_MAX_CHARS = 200
+CAP_WORD_RATIO = 0.7      # かな・漢字・英数字の比率の下限（記号だらけのノイズを落とす）
+_CAP_WORD_RE = re.compile(r'[぀-ゖ゠-ヿ㐀-鿿0-9０-９A-Za-zＡ-Ｚａ-ｚ]')
+
+
+def _figure_caption(pg, rect, body_size):
+    """図の矩形の下端に接する横組み行をキャプションとして返す（無ければ None）。
+
+    横書きモードでは呼ばない（転置座標ではキャプションが縦行になり、
+    幾何が別物になる。DESIGN_部分図.md フェーズ4）。
+    """
+    lines = [h for h in pg.hlines
+             if h.x0 >= rect[0] - 2 and h.x1 <= rect[2] + 2
+             and h.y0 >= rect[1] - 2 and h.y1 <= rect[3] + 2
+             and h.text.strip()]
+    if not lines:
+        return None
+    lines.sort(key=lambda h: -h.yc)
+    bottom = lines[0]
+    if rect[3] - bottom.y1 > body_size * CAP_BOTTOM_MAX:
+        return None
+    picked = [bottom]
+    for h in lines[1:]:
+        prev = picked[-1]
+        unit = max(prev.y1 - prev.y0, prev.size * 0.8)
+        d = prev.yc - h.yc
+        if not (0 < d <= unit * CAP_LINE_GAP):
+            break
+        if prev.size and not (CAP_SIZE_LO <= h.size / prev.size <= CAP_SIZE_HI):
+            break
+        picked.append(h)
+    picked.reverse()
+    text = "".join(re.sub(r'\s+', "", h.text) for h in picked)
+    # **is_junk_line を使ってはならない。** かな無しの漢字列をノイズ扱いする
+    # ので、写真キャプションの地名（蘇我氏の `葛城一言主神社`・`小墾田宮故地`）が
+    # 丸ごと落ちる。図中のOCRジャンク（`~垂一〆`・`=_ri--L竺竺`）は
+    # **記号の比率**で分かれる（ジャンクは語字率 0.5 以下）
+    n_word = len(_CAP_WORD_RE.findall(text))
+    if (len(text) < CAP_MIN_CHARS or len(text) > CAP_MAX_CHARS
+            or n_word < CAP_MIN_CHARS
+            or n_word / len(text) < CAP_WORD_RATIO):
+        return None
+    # 図タグの構文（［＃「…」の図（…）入る］）を壊す文字を落とす
+    return text.replace("」", "").replace("［", "").replace("］", "")
+
+
+def figure_filename(page_num, rect):
+    """部分図のファイル名。**矩形をファイル名に持たせる**（--from-text で
+    `〜_images/` を失っても PDF から再現できるようにするため。
+    サイドカーJSONにするとディレクトリごと失われる）。
+    detect_inline_figures が矩形を整数ptに正規化してあるので、名前から
+    復元した矩形で描き直すとバイト一致する。"""
+    x0, y0, x1, y1 = (int(v) for v in rect)
+    return f"p{page_num + 1:04d}_r{x0:04d}-{y0:04d}-{x1:04d}-{y1:04d}.jpg"
+
+
+_FIG_NAME_RE = re.compile(
+    r"p(\d+)(?:_r(\d+)-(\d+)-(\d+)-(\d+))?\.jpe?g", re.IGNORECASE)
+
+
+def render_figure_rect(doc, page_num, rect, dpi=FIG_RENDER_DPI,
+                       horizontal=False):
+    """部分図の矩形（解析座標）を JPEG バイト列にする。"""
+    page = doc[page_num]
+    x0, y0, x1, y1 = rect
+    if horizontal:
+        h = page.rect.height
+        clip = fitz.Rect(y0, h - x1, y1, h - x0)
+    else:
+        clip = fitz.Rect(x0, y0, x1, y1)
+    s = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(s, s), clip=clip)
     return pix.tobytes("jpeg", jpg_quality=85)
 
 
@@ -2241,7 +2950,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                   image_pages=None, horizontal=False,
                   chapter_marks=None, body_end=None, pillar_chapters=None,
                   heading_pages_out=None, toc_pages=None,
-                  front_pages=None):
+                  front_pages=None, inline_figures=None):
     """全ページから青空文庫形式の本文を組み立てる。
     image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
     toc_pages: set — 印刷目次のページ（detect_toc_pages）。図タグのキャプションを
@@ -2262,14 +2971,21 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         拾っている場合の重複除去は呼び出し側（_filter_pillar_chapters）が行う
     heading_pages_out: set — 見出しを発行したページ番号を書き出す（省略可）。
         柱ランの重複判定のための1パス目で使う
+    inline_figures: {page_num: [(矩形, ファイル名)]} — 本文と同居する図
+        （detect_inline_figures）。**改ページで挟まずに**本文の読み順の
+        途中へ図タグを出す。_split_episode_images はインライン図タグを
+        本文に残すので、ePub側は figure 要素として描画される
     """
     hashira_keys = hashira_keys or {}
     image_pages = image_pages or {}
+    inline_figures = inline_figures or {}
     chapter_marks = chapter_marks or {}
     pillar_chapters = pillar_chapters or {}
     toc_pages = set(toc_pages or ())
     front_pages = set(front_pages or ())
     emitted_images = set()   # 図タグを出したページ（横書きの帯分割対策）
+    emitted_figs = set()     # 発行済みの部分図（同上）
+    pending_figs = []        # 段落の切れ目待ちの部分図タグ
     # 柱ランが確定した章題。印刷目次ページの抑止に使う（2文字以下は
     # 本文の短い行に当たるので除く）
     pillar_titles = {t for t in pillar_chapters.values() if len(t) >= 3}
@@ -2591,8 +3307,10 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
             if kept:
                 emit_heading("　".join(kept))
             flush()
-            caption = "目次" if pg.num in toc_pages else "挿絵"
-            out.append(f"［＃「{caption}」の図（{image_pages[pg.num]}）入る］")
+            fname = image_pages[pg.num]
+            if fname is not None:
+                caption = "目次" if pg.num in toc_pages else "挿絵"
+                out.append(f"［＃「{caption}」の図（{fname}）入る］")
             prev_line_short = True
             prev_page_short = True   # 画像ページの後は必ず改ページ
             continue
@@ -2615,6 +3333,15 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         if not body_lines:
             for _, t in page_marks:
                 emit_heading(t)
+            for rect, fname, cap in inline_figures.get(pg.num, ()):
+                if (pg.num, fname) in emitted_figs:
+                    continue
+                emitted_figs.add((pg.num, fname))
+                flush()
+                out.extend(pending_figs)
+                pending_figs.clear()
+                out.extend(_figure_tag_lines(fname, cap))
+                prev_line_short = True
             if page_headings or long_items or page_marks:
                 # 章扉など本文のないページ → 次の本文の前で改ページする
                 # （帯分割の非最終帯は同一紙面内なので改ページしない）
@@ -2634,10 +3361,37 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         # ページ先頭にまとめて出すと、ページ途中の列から始まる節
         # （風の万里 p23 の「3」＝ xc 70.5、その右 96 までが前節の末尾）が
         # 前節より前に出て本文の順序が壊れる。同キーではマーカーを先に出す
+        # 部分図は「読み順でその図より後ろに来る最初の列」の直前に出す。
+        # 全幅の上帯ならページの本文の前、上左ブロック（人類 p30 の写真）なら
+        # 図の右の本文の後・下の本文の前、下帯ならページの本文の後になる
+        fig_items = []
+        for rect, fname, cap in inline_figures.get(pg.num, ()):
+            if (pg.num, fname) in emitted_figs:
+                continue
+            emitted_figs.add((pg.num, fname))
+            key = None
+            for v in sorted(body_lines, key=lambda v: -v.xc):
+                if v.xc < rect[2] and v.y0 >= rect[3] - body_size * 0.8:
+                    key = -v.xc
+                    break
+            fig_items.append((key if key is not None else 1e9, 2,
+                              (fname, cap)))
         items = sorted([(-v.xc, 0, v) for v in body_lines] +
-                       [(k, 1, t) for k, t in page_marks],
+                       [(k, 1, t) for k, t in page_marks] + fig_items,
                        key=lambda it: (it[0], -it[1]))
         for _, kind, obj in items:
+            if kind == 2:
+                # **段落の途中では出さない。** 上帯の図はページの本文より前に
+                # 来るが、前ページから続く段落の途中であることが多く、そこで
+                # 割ると文が2段落に切れて字下げが入る（人類 p99 で実測）。
+                # 次の段落の切れ目まで持ち越す
+                tag = _figure_tag_lines(*obj)
+                if prev_line_short:
+                    flush()
+                    out.extend(tag)
+                else:
+                    pending_figs.extend(tag)
+                continue
             if kind:
                 emit_heading(obj)
                 continue
@@ -2649,6 +3403,9 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
 
             if starts_indented or prev_line_short:
                 flush()
+                if pending_figs:
+                    out.extend(pending_figs)
+                    pending_figs.clear()
             cur += render_vline(v, ruby_map)
             prev_line_short = ends_short
         # ページ末尾: 段落継続は次ページに持ち越す。
@@ -2660,6 +3417,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                            >= line_pitch * 2.5)
 
     flush()
+    out.extend(pending_figs)     # 段落待ちのまま本文が終わった図
+    pending_figs.clear()
     _demote_image_only_headings(out)
     if junk_count[0]:
         print(f"挿絵ノイズ除去: {junk_count[0]} 行")
@@ -2671,6 +3430,20 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
 
 
 _MIDASHI_LINE_RE = re.compile(r"^［＃「(.*)」は中見出し(終わり)?］$")
+
+
+def _figure_tag_lines(fname, caption=None):
+    """部分図の図タグ（＋キャプション行）を返す。
+
+    キャプションがあるときは青空文庫の「キャプション付きの図」書式にする。
+    ePub側は `<figure><img><figcaption>` に描画する（_body_lines_to_xhtml）。
+    **画像の中に焼き込まれたキャプションは拡大できない**ので、
+    リフローで読める形を別に出す意味がある。
+    """
+    if not caption:
+        return [f"［＃「図」の図（{fname}）入る］"]
+    return [f"［＃「図」のキャプション付きの図（{fname}）入る］",
+            f"{caption}［＃「{caption}」はキャプション］"]
 
 
 def _demote_image_only_headings(out):
@@ -7092,12 +7865,26 @@ def run_from_text(args, doc, npages):
             if fname in images_data:
                 continue
             path = os.path.join(img_dir, fname)
-            pm = re.fullmatch(r"p(\d+)\.jpe?g", fname, re.IGNORECASE)
+            # 部分図は矩形をファイル名に持っている（figure_filename）ので、
+            # _images/ を失っても PDF から同じ切り抜きを再現できる
+            pm = _FIG_NAME_RE.fullmatch(fname)
+            sm = _SPREAD_NAME_RE.fullmatch(fname)
             if os.path.exists(path):
                 with open(path, "rb") as f:
                     images_data[fname] = f.read()
+            elif sm and all(1 <= int(g) <= npages for g in sm.groups()):
+                images_data[fname] = render_image_spread(
+                    doc, int(sm.group(1)) - 1, int(sm.group(2)) - 1)
+                rerendered += 1
             elif pm and 1 <= int(pm.group(1)) <= npages:
-                images_data[fname] = render_image_page(doc, int(pm.group(1)) - 1)
+                pnum = int(pm.group(1)) - 1
+                if pm.group(2) is not None:
+                    rect = tuple(float(pm.group(i)) for i in (2, 3, 4, 5))
+                    images_data[fname] = render_figure_rect(
+                        doc, pnum, rect, dpi=args.figure_dpi,
+                        horizontal=args.horizontal)
+                else:
+                    images_data[fname] = render_image_page(doc, pnum)
                 rerendered += 1
             else:
                 print(f"警告: 画像が見つかりません: {fname}", file=sys.stderr)
@@ -7186,6 +7973,20 @@ def main():
     ap.add_argument("--toc-front", action="store_true",
                     help="ePubの目次ページを表紙の直後に置く"
                          "（既定は本文の後・奥付の前）")
+    ap.add_argument("--inline-figure", choices=("auto", "strict", "off"),
+                    default="auto",
+                    help="本文と同居する図・写真を切り出して本文の流れに"
+                         "画像として挟む（既定 auto）。strict はしきい値を"
+                         "上げて薄い線画やOCR不能な飾り文字を拾わない")
+    ap.add_argument("--figure-caption", choices=("auto", "off"),
+                    default="auto",
+                    help="図の下のキャプションをテキストとしても拾い、"
+                         "ePubの figcaption に出す（既定 auto・縦書きのみ）")
+    ap.add_argument("--no-spread", action="store_true",
+                    help="2ページにまたがる見開きの図を1枚に連結しない")
+    ap.add_argument("--figure-dpi", type=int, default=FIG_RENDER_DPI,
+                    metavar="N",
+                    help=f"本文中の図のレンダリング解像度（既定 {FIG_RENDER_DPI}）")
     ap.add_argument("--no-front-image", action="store_true",
                     help="巻頭の扉・口絵・目次・地図・献辞をそのままの画像として"
                          "残す処理を行わない（v1.11.0 と同じ扱いになる）")
@@ -7291,6 +8092,9 @@ def main():
     # （DESIGN_v2.0.md §3.2・§3.5）
     image_page_map = {}   # page_num -> ファイル名
     images_data = {}      # ファイル名 -> JPEGバイト列
+    inline_figures = {}      # page_num -> [矩形]（部分図）
+    inline_figure_map = {}   # page_num -> [(矩形, ファイル名)]
+    spread_skip = set()      # 見開きの後半ページ（図タグを出さない）
     toc_page_map = {}     # page_num -> [目次エントリ]
     front_only = set()    # 巻頭の窓で新たに画像化したページ
     if not args.no_images:
@@ -7307,17 +8111,76 @@ def main():
             print("印刷目次ページ: "
                   + "/".join(f"p{p + 1}" for p in sorted(toc_page_map))
                   + f"（章題 {sum(len(v) for v in toc_page_map.values())} 件）")
+        # 本文と同居する部分図（DESIGN_部分図.md）。全面図と判定された
+        # ページは従来どおりページ丸ごとの画像にする（§3.6）
+        if args.inline_figure != "off":
+            gate = (FIG_INK_GATE_STRICT if args.inline_figure == "strict"
+                    else FIG_INK_GATE)
+            inline_figures, fig_fullpage = detect_inline_figures(
+                doc, pages, drop, headings, body_size, body_top, body_bottom,
+                image_pages=img_nums | {args.cover_page - 1},
+                body_end=body_end, ink_gate=gate,
+                horizontal=args.horizontal, verbose=args.verbose)
+            img_nums |= fig_fullpage
+        # 見開き（2ページにまたがる図）は1枚に連結する（§8.3）。
+        # 連結した対は「先のページ」に1枚だけ図タグを出し、後のページは
+        # 画像ページのまま図タグを出さない（spread_skip）
+        spreads = ({} if args.no_spread
+                   else detect_image_spreads(doc, img_nums,
+                                             horizontal=args.horizontal))
+        for first, (left, right) in spreads.items():
+            fname = spread_filename(left, right)
+            images_data[fname] = render_image_spread(doc, left, right)
+            image_page_map[first] = fname
+            spread_skip.add(first + 1)
+        if spreads:
+            print("見開き連結: "
+                  + "/".join(f"p{a + 1}+p{a + 2}" for a in sorted(spreads))
+                  + f"（{len(spreads)} 組）")
         for pnum in sorted(img_nums):
+            if pnum in image_page_map or pnum in spread_skip:
+                continue
             fname = f"p{pnum + 1:04d}.jpg"
             images_data[fname] = render_image_page(doc, pnum)
             image_page_map[pnum] = fname
-        if image_page_map:
+        by_num = {pg.num: pg for pg in pages}
+        n_cap = 0
+        for pnum in sorted(inline_figures):
+            named = []
+            for rect in inline_figures[pnum]:
+                fname = figure_filename(pnum, rect)
+                images_data[fname] = render_figure_rect(
+                    doc, pnum, rect, dpi=args.figure_dpi,
+                    horizontal=args.horizontal)
+                # 横書きモードは転置座標でキャプションが縦行になるので対象外
+                cap = None
+                if args.figure_caption != "off" and not args.horizontal:
+                    cap = _figure_caption(by_num[pnum], rect, body_size)
+                    n_cap += 1 if cap else 0
+                named.append((rect, fname, cap))
+            inline_figure_map[pnum] = named
+        for pnum in sorted(spread_skip):
+            # 見開きの後半ページ。画像ページ扱いのまま図タグだけ出さない
+            image_page_map.setdefault(pnum, None)
+        if image_page_map or inline_figure_map:
             img_dir = os.path.splitext(out_path)[0] + "_images"
             os.makedirs(img_dir, exist_ok=True)
             for fname, data in images_data.items():
                 with open(os.path.join(img_dir, fname), "wb") as f:
                     f.write(data)
-            print(f"画像ページ検出: {len(image_page_map)} 枚 → {img_dir}/")
+            if image_page_map:
+                n_files = sum(1 for v in image_page_map.values() if v)
+                extra = (f"（見開き連結で {len(image_page_map)} ページ → "
+                         f"{n_files} 枚）" if spread_skip else "")
+                print(f"画像ページ検出: {n_files} 枚{extra} → {img_dir}/")
+            if inline_figure_map:
+                n_fig = sum(len(v) for v in inline_figure_map.values())
+                print(f"本文中の図: {n_fig} 枚 / "
+                      f"{len(inline_figure_map)} ページ"
+                      + (f"（キャプション {n_cap} 件）" if n_cap else ""))
+                if n_fig > len(pages):
+                    print("  注意: 図の枚数がページ数を超えています。"
+                          "出力が大きくなる場合は --figure-dpi を下げてください")
 
     # 行が詰まった巻頭の画像ページ（印刷目次・系図・一覧）は章頭にできない
     # ＝ assemble_text がそこで見出しを出さないので、選ぶと章題が消える
@@ -7348,7 +8211,8 @@ def main():
                       horizontal=args.horizontal,
                       chapter_marks=chapter_marks, body_end=body_end,
                       heading_pages_out=probe_pages,
-                      toc_pages=set(toc_page_map), front_pages=front_only)
+                      toc_pages=set(toc_page_map), front_pages=front_only,
+                      inline_figures=inline_figure_map)
     if pillar_runs:
         # **既存の見出しのほうが柱ランより多い本には手を出さない。**
         # 章立てが既にできている本（ほんもの22・グリック50・タイム・リープ47・
@@ -7393,7 +8257,8 @@ def main():
                          horizontal=args.horizontal,
                          chapter_marks=chapter_marks, body_end=body_end,
                          pillar_chapters=pillar_chapters,
-                         toc_pages=set(toc_page_map), front_pages=front_only)
+                         toc_pages=set(toc_page_map), front_pages=front_only,
+                         inline_figures=inline_figure_map)
 
     if not args.no_toc_refine:
         # 目次ページを画像化した本では、章題辞書を本文テキストからでなく
