@@ -45,7 +45,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -2183,6 +2183,31 @@ class _PageInk:
                     gr[gx] += c
         self.grid = g
 
+    def rules(self, min_px, max_thick_px):
+        """細くて長い直線（罫線）を画素座標の (a, c, b, d) で返す。
+
+        文字のグリフは長い連続した暗画素を作らないが、罫線・括弧の縦棒は作る。
+        bytes.translate 済みのバッファに正規表現をかけるので C 速度で走る
+        （288ページの本で約6秒）。
+
+        **横の走査線と縦の走査線は別々にまとめる。** 一緒にすると括弧の角で
+        縦横がつながり、外接矩形が両方向に大きくなって「太い塊」として
+        捨てられてしまう（実測: 蘇我氏の系図で罫線が1本も残らなかった）。
+        """
+        pat = re.compile(b"\x01{%d,}" % int(min_px))
+        w, h, d = self.w, self.h, self.dark
+        hor, ver = [], []
+        for y in range(h):
+            row = d[y * w:(y + 1) * w]
+            for m in pat.finditer(row):
+                hor.append((m.start(), y, m.end(), y + 1))
+        for x in range(w):
+            col = d[x::w]
+            for m in pat.finditer(col):
+                ver.append((x, m.start(), x + 1, m.end()))
+        return (_merge_runs(hor, True, max_thick_px)
+                + _merge_runs(ver, False, max_thick_px))
+
     def cells_on(self, rect, min_frac):
         """矩形（解析座標）内で「絵」とみなせるグリッドセルの集合。"""
         self._build_grid()
@@ -2237,6 +2262,116 @@ def _fig_components(cells, merge_cells):
             if changed:
                 break
     return comps
+
+
+# ── 罫線でできた図（系図・表・年表）の検出 ───────────────────────
+#
+# 設計書 DESIGN_部分図.md §13。名前が縦組みのテキストで並び細い罫線で
+# つながれている図（蘇我氏の「建内宿禰系図」等）は、名前が本文行として
+# 被覆マスクに入るので「テキストの無い矩形」ができず、§3 の経路では
+# 原理的に拾えない。**罫線そのものを見る**のが決め手。
+#
+# 実測（蘇我氏・ページ幅289pt）: 本文ページの罫線は **0本**、系図・表の
+# ページは 6〜39本。小説（ソフロニア嬢417ページ）は「4本以上」を要求すると
+# **0ページ**になる（単発の縦線1〜3本は縦組みのダッシュ・長音の連なり）。
+#
+# **紙面の外周は必ず除く。** スキャンの端に出る黒い帯が罫線に見え、
+# タイム・リープ上では36ページが誤検出になった（除外して5ページ＝奥付周辺のみ）。
+#
+# **この図のテキストは本文から消さない**（設計判断・§13.3）。系図の名前は
+# 現状でも本文に出ており（罫線が `庁`・`１１`・`ｌ` に化けるだけ）、
+# 消すと拡大して読める形が失われる。画像で構造を、テキストで名前を残す。
+RULE_MIN_LEN_CH = 1.6      # 罫線とみなす長さ（本文字数）
+RULE_MAX_THICK = 2.5       # 罫線とみなす太さ(pt)。写真の暗部は厚い塊になる
+RULE_MIN_COUNT = 4         # 1つの図に要求する罫線の本数
+RULE_MERGE_CH = 2.0        # 罫線をまとめて1つの図にする距離（本文字数）
+# 罫線の箱の中の本文行が「その本の普通の本文行と同じ長さ」なら図ではない。
+# 飾り枠で囲まれた本文ページ（ファンタジー事典 p6 の「本書の概要」、
+# ぼくがぼくであること p323 の「角川文庫発刊に際して」）を丸ごと画像に
+# するのを止める。実測の行の長さ比（本文帯比）の中央値:
+#   系図・表（採りたい）  0.06 / 0.08 / 0.36 / 0.50
+#   枠付きの本文（捨てたい） 0.87 / 0.97
+# **基準は本文帯の高さでなく「その本の本文行の長さの中央値」にする。**
+# 横書きの段組では1行が本文帯の半分しかないので、帯を基準にすると
+# 段組ページの本文断片を図として拾う（30秒DS p100 で実測）
+RULE_LINE_LEN_MAX = 0.65
+
+
+def _merge_runs(runs, horizontal, max_thick_px):
+    """同じ向きの走査線を1本の罫線にまとめ、太い塊（写真の暗部）を捨てる。"""
+    out = []
+    key = (lambda r: (r[1], r[0])) if horizontal else (lambda r: (r[0], r[1]))
+    for r in sorted(runs, key=key):
+        hit = None
+        for o in out:
+            if horizontal:
+                near = abs(o[1] - r[1]) <= 3 and r[0] < o[2] + 5 and o[0] < r[2] + 5
+            else:
+                near = abs(o[0] - r[0]) <= 3 and r[1] < o[3] + 5 and o[1] < r[3] + 5
+            if near:
+                hit = o
+                break
+        if hit is None:
+            out.append(list(r))
+        else:
+            hit[0] = min(hit[0], r[0]); hit[1] = min(hit[1], r[1])
+            hit[2] = max(hit[2], r[2]); hit[3] = max(hit[3], r[3])
+    thick = (lambda o: o[3] - o[1]) if horizontal else (lambda o: o[2] - o[0])
+    return [tuple(o) for o in out if thick(o) <= max_thick_px]
+
+
+def _rule_structures(rects, merge, min_count):
+    """近い罫線をまとめて (bbox, 本数) にする。"""
+    groups = []
+    for r in sorted(rects):
+        hit = None
+        for g in groups:
+            if (r[0] - merge < g[2] and g[0] - merge < r[2]
+                    and r[1] - merge < g[3] and g[1] - merge < r[3]):
+                hit = g
+                break
+        if hit is None:
+            groups.append([r[0], r[1], r[2], r[3], 1])
+        else:
+            hit[0] = min(hit[0], r[0]); hit[1] = min(hit[1], r[1])
+            hit[2] = max(hit[2], r[2]); hit[3] = max(hit[3], r[3])
+            hit[4] += 1
+    # 統合で近づいたグループ同士をもう一度たたむ
+    changed = True
+    while changed and len(groups) > 1:
+        changed = False
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                a, b = groups[i], groups[j]
+                if (a[0] - merge < b[2] and b[0] - merge < a[2]
+                        and a[1] - merge < b[3] and b[1] - merge < a[3]):
+                    groups[i] = [min(a[0], b[0]), min(a[1], b[1]),
+                                 max(a[2], b[2]), max(a[3], b[3]), a[4] + b[4]]
+                    groups.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+    return [(tuple(g[:4]), g[4]) for g in groups if g[4] >= min_count]
+
+
+def _ruled_figures(ink, page_rect, body_size):
+    """罫線でできた図の矩形を返す（座標は解析座標＝page_rect と同じ系）。"""
+    min_px = max(4, int(body_size * RULE_MIN_LEN_CH * ink.scale))
+    thick_px = max(2, int(RULE_MAX_THICK * ink.scale))
+    # **紙面の外周は除く**（スキャン端の黒帯が罫線に見える）。転置しても
+    # 端は端なので、解析座標のまま両軸2%で切れば縦書き・横書きに共通で効く
+    mx, my = page_rect.width * 0.02, page_rect.height * 0.02
+    rects = []
+    for a, c, b, d in ink.rules(min_px, thick_px):
+        r = ink.from_px(a, c, b, d)
+        r = (min(r[0], r[2]), min(r[1], r[3]), max(r[0], r[2]), max(r[1], r[3]))
+        if not (mx < r[0] and r[2] < page_rect.width - mx
+                and my < r[1] and r[3] < page_rect.height - my):
+            continue
+        rects.append(r)
+    merge = body_size * RULE_MERGE_CH
+    return [bx for bx, _n in _rule_structures(rects, merge, RULE_MIN_COUNT)]
 
 
 def _fig_coverage(pg, drop, headings, body_size):
@@ -2404,11 +2539,15 @@ def _fig_allowance(rect, cov, marg, page_rect):
 def detect_inline_figures(doc, pages, drop, headings, body_size,
                           body_top, body_bottom, image_pages=None,
                           body_end=None, ink_gate=FIG_INK_GATE,
-                          horizontal=False, verbose=False):
+                          ruled=True, horizontal=False, verbose=False):
     """本文と同居する図・写真の矩形を {page_num: [(x0,y0,x1,y1), ...]} で返す。
 
     矩形は紙面の読み順（縦組みは右→左）に並ぶ。座標は analyze_page と
     同じ座標系（横書きモードでは転置後）で返す。
+
+    ruled=True では、罫線でできた図（系図・表・年表）も候補にする
+    （DESIGN_部分図.md §13）。この型は中身がテキストなので「テキストの
+    無い矩形」としては拾えず、罫線そのものを見るしかない。
     """
     image_pages = set(image_pages or ())
     # **インク計測は別のドキュメントハンドルで行う。** MuPDF はページの
@@ -2437,6 +2576,12 @@ def detect_inline_figures(doc, pages, drop, headings, body_size,
         return {}, {}
     minh = body_size * FIG_MIN_CH
     area_body = (br - bl) * (body_bottom - body_top)
+    # その本の「普通の本文行の長さ」。罫線図の歯止めの基準に使う
+    lens = []
+    for pg in pages:
+        if kept_counts.get(pg.num, 0) >= 8:
+            lens += [v.y1 - v.y0 for v in _kept_lines(pg, drop, headings)]
+    line_len_med = statistics.median(lens) if lens else 0.0
     merge_cells = max(1, int(FIG_MERGE / FIG_GRID))
     result, fullpage = {}, set()
     seen_nums = set()
@@ -2450,8 +2595,6 @@ def detect_inline_figures(doc, pages, drop, headings, body_size,
             continue          # 後付け（巻末広告・奥付）
         cov = _fig_coverage(pg, drop, headings, body_size)
         free = _fig_free_rects(cov, bl, br, body_top, body_bottom, body_size)
-        if not free:
-            continue
         marg = _fig_walls(pg, drop, headings, bl, br,
                           body_top, body_bottom)
         page_rect = doc[pg.num].rect
@@ -2497,6 +2640,25 @@ def detect_inline_figures(doc, pages, drop, headings, body_size,
                               f"（テキスト層に本文らしい行がある）")
                     continue
                 boxes.append(bx)
+        if ruled:
+            # 罫線でできた図（系図・表）。**「テキストの無い矩形」の経路が
+            # 何も見つけなかった場所にだけ足す**＝写真も罫線らしい暗部を
+            # 作るので、重なるときは §3 の切り抜きのほうが正確
+            if ink is None:
+                ink = _PageInk(ink_doc[pg.num], horizontal=horizontal)
+            for bx in _ruled_figures(ink, page_rect, body_size):
+                if (bx[2] - bx[0] < minh or bx[3] - bx[1] < minh
+                        or (bx[2] - bx[0]) * (bx[3] - bx[1])
+                        < area_body * FIG_MIN_AREA):
+                    continue
+                if any(_fig_overlap(bx, o) for o in boxes):
+                    continue
+                if _ruled_is_framed_body(pg, drop, headings, bx,
+                                         line_len_med):
+                    continue
+                # **§5.3(b) の歯止めは掛けない**＝罫線でできた図は中身が
+                # テキストであることが前提で、本文からは消さない（§13.3）
+                boxes.append(bx)
         if not boxes:
             continue
         # 矩形は整数ptに正規化する。**ファイル名に載る値と描画に使う値を
@@ -2528,6 +2690,45 @@ def _fig_textlike_cover(bx, boxes):
         if w > 0 and h > 0:
             cov += w * h
     return cov / area
+
+
+def _kept_lines(pg, drop, headings):
+    """本文として出力される縦行。"""
+    out = []
+    for v in pg.vlines:
+        if not v.text.strip():
+            continue
+        key = (pg.num, id(v))
+        if key in drop and key not in headings:
+            continue
+        if is_junk_line(v.text.strip()):
+            continue
+        out.append(v)
+    return out
+
+
+def _ruled_is_framed_body(pg, drop, headings, bx, line_len_med):
+    """罫線の箱の中身が「飾り枠で囲まれた普通の本文」かどうか。
+
+    系図・表の行は短くて段違いに並ぶが、枠で囲まれただけの本文ページの行は
+    その本の普通の本文行と同じ長さになる。
+    """
+    hs = [v.y1 - v.y0 for v in _kept_lines(pg, drop, headings)
+          if v.x0 >= bx[0] - 3 and v.x1 <= bx[2] + 3
+          and v.y0 >= bx[1] - 3 and v.y1 <= bx[3] + 3]
+    if not hs or not line_len_med:
+        return False
+    return statistics.median(hs) >= line_len_med * RULE_LINE_LEN_MAX
+
+
+def _fig_overlap(a, b):
+    """2つの矩形が実質的に重なるか（小さいほうの面積の30%以上）。"""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return False
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return w * h >= small * 0.30
 
 
 def _fig_dedup(boxes):
@@ -7982,6 +8183,9 @@ def main():
                     default="auto",
                     help="図の下のキャプションをテキストとしても拾い、"
                          "ePubの figcaption に出す（既定 auto・縦書きのみ）")
+    ap.add_argument("--no-ruled-figure", action="store_true",
+                    help="罫線でできた図（系図・表・年表）を画像として残さない。"
+                         "残す場合も本文のテキストは消さない（画像とテキストの両方）")
     ap.add_argument("--no-spread", action="store_true",
                     help="2ページにまたがる見開きの図を1枚に連結しない")
     ap.add_argument("--figure-dpi", type=int, default=FIG_RENDER_DPI,
@@ -8120,6 +8324,7 @@ def main():
                 doc, pages, drop, headings, body_size, body_top, body_bottom,
                 image_pages=img_nums | {args.cover_page - 1},
                 body_end=body_end, ink_gate=gate,
+                ruled=not args.no_ruled_figure,
                 horizontal=args.horizontal, verbose=args.verbose)
             img_nums |= fig_fullpage
         # 見開き（2ページにまたがる図）は1枚に連結する（§8.3）。
