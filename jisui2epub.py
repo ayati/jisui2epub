@@ -45,7 +45,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -1306,6 +1306,102 @@ def _body_end_by_layout(pages, drop, body_size, body_top, lo):
         else:
             run_start, run_len = None, 0
     return None
+
+
+# ── 本文列の欠落検出（スキャナOCRの段落末尾ぬけ）────────────────
+#
+# ScanSnap 等の内蔵OCRは、段落の最後の2〜3字だけが入った短い列を
+# 「隣の列に付いたルビ」と誤認し、ルビ用の小さい認識器で読んで文字化け
+# させることがある。実測（人類の起源 p165）: 印刷は「です。」なのに
+# テキスト層は 6.3pt の '戸」←９０'（本文は 12.6pt）で、本文が
+# 「考えるほうが合理的」で切れる。
+#
+# **テキスト層に正しい字が無いので復元はできない**（同じページを
+# YomiToku で再OCRすると 12.6pt の「で／す／。」が返る）。できるのは
+# 「ここで本文が失われた疑いがある」と気づかせることだけなので、
+# 検出して件数とページを報告し、再OCRを促す。
+#
+# 手がかりは列グリッドの空きスロット: 短い列が丸ごとルビ扱いになると
+# 本文列の間隔が1列ぶん（≈2ピッチ）空き、そのすき間の**天**に
+# ルビ級の断片だけが残る。柱・ノンブルを拾わないよう、
+# classify_marginals（本文領域外のルビを柱候補へ移す）の**後**に呼ぶ。
+#
+# 実測の分離（同じ本のスキャナOCR版と再OCR版）:
+#   赤毛のアン    ScanSnap 14 → NDLOCR 1
+#   ピザンの危機  ScanSnap 26 → NDLOCR 1
+#   どこよりも    ScanSnap  6 → NDLOCR 0
+# 赤毛のアン14件は全件を NDLOCR 版の同じ座標と突き合わせて本物の脱落だと
+# 確認した（「わかったにちがいない。」の「い。」→'いｏ'、「そうでしょう？」の
+# 「う？」→'、っ？．」' 等）。
+#
+# **拾った断片を本文に昇格させてはならない**。10冊125件のうち字面が
+# 本文らしいものは15件しかなく、しかもその中には本物のルビ（タイム・リープの
+# 'めいづら'・'しようか'）が混じる。ほとんどは復元不能な文字化けなので、
+# 昇格させると得るものより壊すもののほうが多い。
+#
+# 横書きモードは転置座標で「列」＝紙面の行になり、段落末尾の行が短いのは
+# 当たり前なので対象外にする。
+LOST_COL_GAP_MIN = 1.55     # 列間隔がこの倍数以上なら1列ぶん空いている
+LOST_COL_GAP_MAX = 2.6
+LOST_COL_MIN_CELLS = 8      # ピッチ推定に使う本文列の最低セル数
+LOST_COL_MAX_LEN = 8        # 断片の長さ（本文サイズ換算）の上限
+LOST_COL_CENTER_TOL = 0.18  # 断片がすき間の中央にあること（すき間比）
+
+
+# ── 底本の空行（アキ）の反映 ──────────────────────────────
+#
+# 縦組みは右→左に列が詰まるので、**段落と段落のあいだに空の列がある**＝
+# 底本の空行になる（グリックの冒険 p264: 「そこに、海が、あったのだ！」の
+# 前後1列ずつが空。公式ePubも同じ位置に `<p>　</p>` を置いている）。
+# 列アキは幾何でしか分からず、テキストからは復元できない。
+#
+# **直前の列が段落の途中で終わっていない（＝下端まで達している）ときは
+# 出さない**。列が丸ごと空くもう一つの原因は「スキャナOCRが段落末尾の
+# 短い列を読み損なった」で（detect_lost_columns 参照）、そちらは段落の
+# 途中なので下端まで届く。この歯止めが無いと人類の起源 p165 のような
+# 脱落箇所に偽のアキが入る。既知の脱落スロットは lost_cols でも除く。
+BLANK_LINE_GAP = 1.6      # 列間隔がこの倍数以上なら間に空の列がある
+BLANK_LINE_MAX = 3        # 一度に出す空行の上限（OCR崩れページの暴走止め）
+
+
+def detect_lost_columns(pages, body_size):
+    """本文列の空きスロットにルビ級の断片だけが座っている箇所を返す。
+
+    戻り値: [(ページ番号（0基点）, スロットのx中心, 断片テキスト), …]
+    """
+    hits = []
+    for pg in pages:
+        cols = [v for v in pg.vlines
+                if len(v.cells) >= LOST_COL_MIN_CELLS
+                and v.size >= body_size * 0.8]
+        if len(cols) < 5:
+            continue
+        cols.sort(key=lambda v: -v.xc)
+        gaps = [a.xc - b.xc for a, b in zip(cols, cols[1:])
+                if a.xc - b.xc < body_size * 2]
+        if len(gaps) < 3:
+            continue
+        pitch = statistics.median(gaps)
+        top = statistics.median(v.y0 for v in cols)
+        for a, b in zip(cols, cols[1:]):
+            gap = a.xc - b.xc
+            if not (pitch * LOST_COL_GAP_MIN < gap < pitch * LOST_COL_GAP_MAX):
+                continue
+            # **すき間の中央**だけを見る。本物のルビは親列に寄り添って
+            # 立つ（実測 0.36〜0.38 / 1.47〜1.49 ピッチ）のに対し、
+            # 消えた列はスロットの中央に来る（0.69〜1.29）ので位置で分かれる
+            lo = b.xc + gap * (0.5 - LOST_COL_CENTER_TOL)
+            hi = b.xc + gap * (0.5 + LOST_COL_CENTER_TOL)
+            frag = [r for r in pg.rubies
+                    if lo <= r.xc <= hi
+                    # 列は必ず本文の天から始まる。天から下がった位置に
+                    # あるルビは本物のルビなので対象外
+                    and top - body_size * 0.3 <= r.y0 <= top + body_size * 0.6
+                    and r.y1 - r.y0 <= body_size * LOST_COL_MAX_LEN]
+            if frag:
+                hits.append((pg.num, (a.xc + b.xc) / 2,
+                             "".join(r.text for r in frag)))
+    return hits
 
 
 def detect_body_end(pages, drop, body_size, body_top, horizontal=False):
@@ -3025,14 +3121,124 @@ def attach_rubies(pg, body_size, verbose=False):
     return result
 
 
-def render_vline(vl, ruby_map):
-    """縦行1本を、ルビを埋め込んだ文字列にする。"""
+# ── 傍点（圏点）─────────────────────────────────────
+#
+# 縦組みの傍点は親文字の**右**に打つ小さな点で、ルビと同じ帯に入る。
+# ScanSnap の内蔵OCRはこれを本文の 0.3 倍級の「、」として拾うので、
+# ルビ帯の中の「点だけの run」を集めれば復元できる。実測（グリックの冒険
+# 367ページ）: 点 468 個／公式ePubの傍点 211 句（484字ぶん）で、
+# 点そのものはほぼ全部テキスト層に入っている。
+#
+# **再OCRすると消える**（実測: ぼんもの ScanSnap 36 点 → Vision 0、
+# グリック 468 点 → NDLOCR 0、どこよりも 9 点 → NDLOCR 0）。
+# したがってこの経路が効くのはスキャナOCRを直接使うときだけ。
+#
+# **2点以上の連なりだけを採る**（`BOUTEN_MIN_RUN`）。孤立した1点は
+# OCRノイズと区別できず、実測でも誤りのほとんどがそれだった
+# （'タ'・'カ'・'ミ'・'ノ'・'し'）。傍点句は公式ePubの実測で
+# 211句中174句が2字・1字は1句だけなので、落とすものは少ない。
+# 位置照合の実測（公式ePubの傍点位置と文字単位で突き合わせ）:
+#
+#   本            発行  完全一致  正しいが短い  一部ずれ  明確な誤り
+#   グリック      169     70.4%       4.7%      11.2%      0.6%
+#   ソフロニア    126     54.0%      20.6%       1.6%      4.0%
+#   百億           25     72.0%      12.0%       4.0%      0.0%
+#   （残りは本文のOCR差でGOAL側に該当箇所が見つからなかったもの）
+#
+# 1点でも採ると発行数は 1.3〜1.7 倍になるが明確な誤りが 5〜16% に増える。
+# 傍点の無い本での誤発行は実測でほぼゼロ（人類の起源0・蘇我氏0・
+# どこよりも0・伯爵夫人1・霧1・タイム・リープ2／300ページ級）。
+BOUTEN_DOT_RE = re.compile(r'^[、。・ヽゝ\'’`,.]+$')
+BOUTEN_MIN_RUN = 2       # 連続する点がこれ未満なら採らない
+BOUTEN_MAX_LEN = 10      # 傍点句の上限（実測の最長は7字）
+_BOUTEN_BAD_RE = re.compile(r'[［＃］《》｜]')
+
+
+def detect_bouten(pg, body_size):
+    """ページ内の傍点を {id(vline): [(開始index, 終了index), …]} で返す。"""
+    per = {}
+    for run in pg.rubies:
+        if not BOUTEN_DOT_RE.match(run.text):
+            continue
+        # 親行はルビと同じ規則（傍点は親文字の右）
+        best = None
+        for vl in pg.vlines:
+            if not vl.cells or vl.xc >= run.xc:
+                continue
+            gap = run.x0 - vl.x1
+            if gap > body_size * 1.2 or gap < -(vl.x1 - vl.x0):
+                continue
+            if run.y1 < vl.y0 - body_size or run.y0 > vl.y1 + body_size:
+                continue
+            if best is None or vl.xc > best.xc:
+                best = vl
+        if best is None:
+            continue
+        centers = [(c[1] + c[2]) / 2 for c in best.cells]
+        h = (run.y1 - run.y0) / len(run.text)
+        for t in range(len(run.text)):
+            yc = run.y0 + h * (t + 0.5)
+            j = min(range(len(centers)), key=lambda m: abs(centers[m] - yc))
+            per.setdefault(id(best), set()).add(j)
+    out = {}
+    for key, idx in per.items():
+        runs = []
+        cur = None
+        for j in sorted(idx):
+            if cur is not None and j == cur[1] + 1:
+                cur = (cur[0], j)
+            else:
+                if cur is not None:
+                    runs.append(cur)
+                cur = (j, j)
+        if cur is not None:
+            runs.append(cur)
+        runs = [r for r in runs
+                if BOUTEN_MIN_RUN <= r[1] - r[0] + 1 <= BOUTEN_MAX_LEN]
+        # 注記は ［＃「本文」に傍点］ と本文を丸ごと繰り返す形なので、
+        # 青空文庫書式の記号を含む範囲は出せない（］が入ると
+        # _AOZORA_ANY_TAG_RE が途中で切れる）
+        vl = next((v for v in pg.vlines if id(v) == key), None)
+        if vl is not None:
+            txt = "".join(c[0] for c in vl.cells)
+            runs = [r for r in runs
+                    if not _BOUTEN_BAD_RE.search(txt[r[0]:r[1] + 1])]
+        if runs:
+            out[key] = runs
+    return out
+
+
+def render_vline(vl, ruby_map, bouten_map=None):
+    """縦行1本を、ルビ（と傍点）を埋め込んだ文字列にする。
+
+    傍点は青空文庫の後置注記 `本文［＃「本文」に傍点］` で出す。
+    ルビと範囲が重なることは実際上ないが、重なった場合はルビを優先する
+    （ルビの《》の中に注記が割り込むと round-trip が壊れるため）。
+    """
     cells = vl.cells
     rubies = sorted(ruby_map.get(id(vl), []))
+    bouten = sorted((bouten_map or {}).get(id(vl), []))
+    ruby_span = set()
+    for i0, i1, _ in rubies:
+        ruby_span.update(range(i0, i1 + 1))
+    bouten = [(a, b) for a, b in bouten
+              if not ruby_span & set(range(a, b + 1))]
+    bi = 0
     out = []
     ri = 0
     i = 0
     while i < len(cells):
+        if bi < len(bouten) and bouten[bi][0] == i:
+            a, b = bouten[bi]
+            base = "".join(c[0] for c in cells[a:b + 1])
+            out.append(base + f"［＃「{base}」に傍点］")
+            i = b + 1
+            bi += 1
+            while ri < len(rubies) and rubies[ri][0] < i:
+                ri += 1
+            continue
+        while bi < len(bouten) and bouten[bi][0] < i:
+            bi += 1
         if ri < len(rubies) and rubies[ri][0] == i:
             i0, i1, rtxt = rubies[ri]
             base = "".join(c[0] for c in cells[i0:i1 + 1])
@@ -3151,7 +3357,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                   image_pages=None, horizontal=False,
                   chapter_marks=None, body_end=None, pillar_chapters=None,
                   heading_pages_out=None, toc_pages=None,
-                  front_pages=None, inline_figures=None):
+                  front_pages=None, inline_figures=None,
+                  lost_cols=None, blank_lines=True, bouten=True):
     """全ページから青空文庫形式の本文を組み立てる。
     image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
     toc_pages: set — 印刷目次のページ（detect_toc_pages）。図タグのキャプションを
@@ -3176,8 +3383,13 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         （detect_inline_figures）。**改ページで挟まずに**本文の読み順の
         途中へ図タグを出す。_split_episode_images はインライン図タグを
         本文に残すので、ePub側は figure 要素として描画される
+    lost_cols: {page_num: [欠落スロットのxc, …]} — detect_lost_columns の結果。
+        そのスロットは「OCRが読み損なった列」なので空行を出さない
+    blank_lines: 底本の空行（列アキ）を反映するか（--no-blank-line で False）
+    bouten: 傍点を ［＃「…」に傍点］ で出すか（--no-bouten で False。縦書きのみ）
     """
     hashira_keys = hashira_keys or {}
+    lost_cols = lost_cols or {}
     image_pages = image_pages or {}
     inline_figures = inline_figures or {}
     chapter_marks = chapter_marks or {}
@@ -3552,6 +3764,10 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
 
         # ルビ対応付け（このページ全体）
         ruby_map = attach_rubies(pg, body_size, verbose=verbose)
+        # 傍点（ルビ帯の中の「点だけの run」）。横書きは転置座標で傍点が
+        # 行の上に来るうえ、実測できる標本が無いので対象外
+        bouten_map = ({} if (horizontal or not bouten)
+                      else detect_bouten(pg, body_size))
 
         page_top = min(v.y0 for v in body_lines)
         # 極端に見出しの下から始まるページは自身のtopを使う
@@ -3566,6 +3782,9 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         # 全幅の上帯ならページの本文の前、上左ブロック（人類 p30 の写真）なら
         # 図の右の本文の後・下の本文の前、下帯ならページの本文の後になる
         fig_items = []
+        prev_v = None        # このページで直前に出した本文列（列アキ検出用）
+        fig_spans = [(r[0], r[2]) for r, _, _ in inline_figures.get(pg.num, ())]
+        page_lost = lost_cols.get(pg.num, ())
         for rect, fname, cap in inline_figures.get(pg.num, ()):
             if (pg.num, fname) in emitted_figs:
                 continue
@@ -3602,13 +3821,45 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
             starts_indented = indent_depth > cell * 0.55
             ends_short = v.y1 < loc_bottom - cell * 1.3
 
+            # 底本の空行（列アキ）。直前の列が段落末尾で終わっている
+            # ときだけ数える（下端まで達していれば段落の途中＝OCRの列脱落）
+            n_blank = 0
+            if (blank_lines and not horizontal and prev_v is not None
+                    and prev_line_short and not pending_figs
+                    and line_pitch > 0
+                    # 巻末広告は書名ブロックと紹介文ブロックを段違いに積む
+                    # 別組みなので、列アキが構造的に多い（グリックで誤検出の
+                    # 半分がここ）。本文終端より後ろでは数えない
+                    and not (body_end is not None and pg.num > body_end)
+                    # 章扉は大きさの違う飾り行を離して並べるので列アキだらけ
+                    # になる（人類の起源 p20 は 16.6/15.7/14.0/11.1pt が
+                    # 1.2〜4.7ピッチ間隔）。両隣とも本文サイズの列に限る
+                    and body_size * 0.85 <= v.size <= body_size * 1.15
+                    and body_size * 0.85 <= prev_v.size <= body_size * 1.15):
+                lo, hi = v.xc, prev_v.xc
+                # 図が挟まっている／OCRの欠落スロットがある間隔は数えない
+                if not any(lo < x < hi for x in page_lost) and \
+                        not any(lo < (a + b) / 2 < hi for a, b in fig_spans):
+                    n_blank = max(0, min(
+                        round((hi - lo) / line_pitch) - 1, BLANK_LINE_MAX))
+
             if starts_indented or prev_line_short:
                 flush()
+                # 章・節の切れ目にはアキを出さない。見出しの前後は紙面でも
+                # 列が空くが、ePub では見出し自身が余白を持つので二重になる
+                # （人類の起源で誤検出の8割が「第一章…」「1 人類の起源を
+                # どう考えるか」等の見出し直後だった）
+                prev_out = next((x for x in reversed(out) if x.strip()), None)
+                if n_blank and prev_out is not None \
+                        and prev_out != "［＃改ページ］" \
+                        and not _MIDASHI_LINE_RE.match(prev_out):
+                    out.extend([""] * n_blank)
                 if pending_figs:
                     out.extend(pending_figs)
                     pending_figs.clear()
-            cur += render_vline(v, ruby_map)
+            cur += render_vline(v, ruby_map, bouten_map)
             prev_line_short = ends_short
+            prev_v = v
         # ページ末尾: 段落継続は次ページに持ち越す。
         # 最左行が本文左端より行送り2.5本分以上手前なら意図的な改ページ。
         # 帯分割の非最終帯（no_break）は判定に参加しない（サイドバー帯は
@@ -5616,6 +5867,13 @@ p.body-blank {{
   height: 1em;
 }}
 
+/* ── 傍点（圏点）。縦組みは親文字の右、横組みは上に出る ── */
+span.bouten {{
+  -webkit-text-emphasis-style: filled sesame;
+  -epub-text-emphasis-style: filled sesame;
+  text-emphasis-style: filled sesame;
+}}
+
 /* ── 章内の意図的な改ページ（底本の改ページを反映） ── */
 div.pagebreak {{
   break-before: page;
@@ -6044,6 +6302,25 @@ def _tcy_wrap(m: "re.Match") -> str:
     return f'<span class="tcy">{s}</span>'
 
 
+# 傍点: `本文［＃「本文」に傍点］` を <span class="bouten"> にする。
+# tcy と同じくセンチネル方式にする（_apply_ruby_auto が本文をエスケープ
+# するので、先に HTML を入れると &lt; に化ける）
+_BOUTEN_RE = re.compile(r"(.{1,20}?)［＃「\1」に傍点］")
+_BOUTEN_SENTINEL_RE = re.compile(r"\x00BTN\x01(.*?)\x00BTNEND\x01", re.S)
+
+
+def _apply_bouten_pre(text: str) -> str:
+    """傍点注記をセンチネルに置換（_apply_ruby_auto 前に適用）。"""
+    return _BOUTEN_RE.sub(
+        lambda m: f"\x00BTN\x01{m.group(1)}\x00BTNEND\x01", text)
+
+
+def _apply_bouten_post(html: str) -> str:
+    """センチネルを <span class="bouten"> に置換（_apply_ruby_auto 後）。"""
+    return _BOUTEN_SENTINEL_RE.sub(
+        lambda m: f'<span class="bouten">{m.group(1)}</span>', html)
+
+
 def _apply_tcy_pre(text: str) -> str:
     """縦中横タグ内容をセンチネルに置換（_apply_ruby_auto 前に適用）。"""
     return _TCY_RE.sub(lambda m: f"\x00TCY\x01{m.group(1)}\x00TCYEND\x01", text)
@@ -6156,7 +6433,7 @@ def _body_lines_to_xhtml(text: str, horizontal: bool = False) -> str:
     caption_block_lines: list = []
 
     for raw in text.split("\n"):
-        line = _apply_tcy_pre(raw.rstrip())
+        line = _apply_bouten_pre(_apply_tcy_pre(raw.rstrip()))
 
         # ── 複数行キャプション収集中 ──
         if in_caption_block:
@@ -6325,8 +6602,10 @@ def _body_lines_to_xhtml(text: str, horizontal: bool = False) -> str:
     # 縦中横センチネル→<span class="tcy"> 変換、および2-3桁数字の自動縦中横
     # 横書きモードでは縦中横は不要なのでスキップ
     if horizontal:
-        return "\n".join(_apply_tcy_post(r) for r in result)
-    return "\n".join(_auto_tcy_xhtml(_apply_tcy_post(r)) for r in result)
+        return "\n".join(_apply_bouten_post(_apply_tcy_post(r))
+                          for r in result)
+    return "\n".join(_auto_tcy_xhtml(_apply_bouten_post(_apply_tcy_post(r)))
+                     for r in result)
 
 
 def _make_cover_xhtml(title: str, author: str, synopsis: str,
@@ -8188,6 +8467,10 @@ def main():
                          "残す場合も本文のテキストは消さない（画像とテキストの両方）")
     ap.add_argument("--no-spread", action="store_true",
                     help="2ページにまたがる見開きの図を1枚に連結しない")
+    ap.add_argument("--no-blank-line", action="store_true",
+                    help="底本の空行（段落のあいだの列アキ）を反映しない")
+    ap.add_argument("--no-bouten", action="store_true",
+                    help="傍点（圏点）を検出しない")
     ap.add_argument("--figure-dpi", type=int, default=FIG_RENDER_DPI,
                     metavar="N",
                     help=f"本文中の図のレンダリング解像度（既定 {FIG_RENDER_DPI}）")
@@ -8267,6 +8550,21 @@ def main():
     print(f"本文領域: y {body_top:.0f}〜{body_bottom:.0f} / "
           f"柱・ノンブル除去 {len(drop)} 行 / 見出し候補 {len(headings)} 個 / "
           f"柱パターン {len(hashira_keys)} 種")
+
+    # スキャナOCRが段落末尾の短い列をルビと誤認して読み崩した疑いの報告。
+    lost_cols = {}
+    # 復元はできないので件数とページだけ出して再OCRを促す（詳細は
+    # detect_lost_columns のコメント）
+    if not args.horizontal:
+        lost = detect_lost_columns(pages, body_size)
+        for n, xc, _ in lost:
+            lost_cols.setdefault(n, []).append(xc)
+        if lost:
+            ps = "/".join(f"p{n + 1}" for n, _, _ in lost[:8])
+            more = " ほか" if len(lost) > 8 else ""
+            print(f"⚠ 本文列の欠落疑い: {len(lost)} 箇所（{ps}{more}）"
+                  f" — スキャナOCRが段落末尾の短い列をルビと誤認しています。"
+                  f"再OCR（vision/docai/yomitoku/ndlocr）を推奨します")
 
     # 章頭マーカー（第N章・節番号）と後付けの境界。どちらも assemble_text に渡す
     toc_pages = {} if args.no_chapter_marks else detect_toc_chapter_pages(
@@ -8463,7 +8761,10 @@ def main():
                          chapter_marks=chapter_marks, body_end=body_end,
                          pillar_chapters=pillar_chapters,
                          toc_pages=set(toc_page_map), front_pages=front_only,
-                         inline_figures=inline_figure_map)
+                         inline_figures=inline_figure_map,
+                         lost_cols=lost_cols,
+                         blank_lines=not args.no_blank_line,
+                         bouten=not args.no_bouten)
 
     if not args.no_toc_refine:
         # 目次ページを画像化した本では、章題辞書を本文テキストからでなく
