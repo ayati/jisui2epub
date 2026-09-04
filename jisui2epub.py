@@ -45,7 +45,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -89,11 +89,22 @@ DIGIT_RE = re.compile(r'[0-9０-９]')
 
 RUBY_SIZE_RATIO = 0.68      # 本文サイズ×この値以下ならルビ
 HEADING_SIZE_RATIO = 1.18   # 本文サイズ×この値以上なら見出し候補
+FIG_RENDER_DPI = 144
+# **横書きの図解書は図が本体**なので既定の解像度を上げる。図の中の文字は
+# 画像に焼き込まれていてリフローで拡大できず、老眼・弱視の読者には
+# 本文と同じ重みの情報になる。実測（図解・気象学入門）: 144dpi=図の幅
+# 中央値 504px・ePub 10.4MB、216dpi=756px・20.2MB、288dpi=1008px・33.2MB。
+# 公式ePubは 1008px・64.7MB なので、216 でも「公式の1.5割減の幅で
+# ファイルは3分の1」に収まる。縦組みの小説は挿絵が主役ではないので据え置く
+FIG_RENDER_DPI_H = 216
 HASHIRA_MIN_FREQ = 3        # 同一テキストがこのページ数以上で柱と判定
 HASHIRA_SHORT_MIN_FREQ = 5  # 2文字の柱を章題辞書に入れる最低ページ数
+HASHIRA_FUZZY_RATIO = 0.75  # 柱のあいまい頻度で同一柱とみなす類似度
+HASHIRA_FUZZY_MIN_LEN = 4   # あいまい頻度の対象にする最短の柱（正規化後）
 # 短い章題（2〜3字）を見出しに昇格させるサイズ比。柱一致が必須なので
 # is_big の 1.18 より強めに取る（飾り文字・図版ノイズを避ける）
 HEADING_SHORT_SIZE_RATIO = 1.25
+HEADING_LEN_MAX_H = 0.9     # 横書きの見出しが版面幅に占めてよい比
 HEADING_MAX_LEN = 30        # 見出しとして扱う最大文字数
 KANA_RE = re.compile(r'[ぁ-ゖァ-ヺー]')
 
@@ -111,6 +122,17 @@ FRONT_FILL_KANA_MAX = 0.20  # 穴埋め（前後が画像のページ）のか�
 _FRONT_PUNCT_RE = re.compile(r'[。、．，]')
 _FRONT_KANA_RE = re.compile(r'[ぁ-ゖ]')
 TOC_PAGE_MIN_ENTRIES = 3    # 印刷目次ページと認めるエントリ数の下限
+# 横書きの印刷目次は「項目 → ページ数」が行単位で読める（縦組みは縦中横の
+# 章番号が1列に連結され、ページ数も漢数字ジャンクになるので使えなかった）。
+# 行末の算用数字が**行をまたいで単調増加する**ことを目次の署名にする。
+# 実測（`scratchpad/probe_tocpair.py`）: 図解・気象学入門は322ページ中
+# p8/p9/p10 の3ページだけが該当（＝目次そのもの・誤検出0）、
+# 30秒DS は171ページ中 p12/p13 の2ページだけ（同）、
+# 現代暗号入門・ファンタジー事典は0ページ。索引の数字列は1行の中では
+# 増えるが行をまたぐと戻るので落ちる
+TOC_PAIR_MIN_LINES = 5      # 行末が数字の行の下限
+TOC_PAIR_INC_RATIO = 0.8    # そのうち単調増加している割合の下限
+_TOC_TAIL_NUM_RE = re.compile(r'(?:^|[^0-9])([0-9]{1,3})[\s　]*$')
 TOC_PAGE_KANA_MAX = 0.46    # 目次ページのかな率の上限（本文ページを弾く）
 IMG_HEADING_MAX_LINES = 2   # 巻頭の画像ページで見出しを出してよい本文行数
 
@@ -460,6 +482,140 @@ def count_orientation_chars(doc, page_range):
 # 0.9〜3.7% と2桁違う。間は大きく空いているので 0.2 で十分に安全。
 ORIENT_VOTE_MIN_RATIO = 0.2
 
+# ── 書字方向の自動判別（DESIGN_書字方向の自動判別.md）──────────────
+#
+# **誤りの重さが非対称**なので「迷ったら縦書き」に倒す。縦組みの本を
+# 横書きと誤認すると転置座標で本文・章立て・図が全損するが、横書きの本を
+# 縦書きのままにしても従来どおり（利用者が --horizontal を付ければ直る）。
+#
+# **【新発見】票が立たないのは縦組みの本だけ。** PyMuPDF は
+# `get_text("dict")` で「同じ行に連続して並ぶ文字」を1スパンにまとめて返す。
+# 再OCR経路は insert_text を文字ごとに呼ぶが、横組みなら同じ y に並ぶので
+# まとまり、縦組みは y がずれるのでまとまらない。つまり**票率の低さ自体が
+# 縦書きの証拠**になる（実測: 横書きのNDLOCR再OCR版でも票率 0.993）。
+ORIENT_HORIZONTAL_MIN = 0.85  # 横票率がこれ以上なら横書きの候補
+# 横票率がこれ以下なら縦書きと断定する。実測（20冊・p10〜p39）の横票率は
+# **縦書き 0.00〜0.15 対 横書き 0.93〜1.00** で、あいだが 0.78 も空いている。
+# 縦書き側の最大は星空をつくる機械（0.15）＝図版の横組みラベルが多い本で、
+# ここを 0.15 のままにすると**縦書きの本に判定不能の警告が出る**。
+# 0.30 まで上げても横書き側とは3倍の余裕がある
+ORIENT_VERTICAL_MAX = 0.30
+ORIENT_LINE_MIN = 18.0        # 横向きに数えた1行の文字数（中央値）の下限
+ORIENT_LINE_RATIO = 0.80      # 横向きの行長 / 縦向きの行長 の下限
+ORIENT_SAMPLE_SKIP = 10       # 前付けを避けて飛ばすページ数
+ORIENT_SAMPLE_PAGES = 30      # 判定に使うページ数
+
+
+def _orient_line_len(doc, pages, body_size):
+    """両向きにクラスタリングしたときの「1行あたりの文字数」の中央値。
+
+    戻り値は {True: 縦向き, False: 横向き}。スパンを文字単位に展開してから
+    数えるので、**1行1スパンでも1文字1スパンでも同じ土俵**に乗る。
+    正しい向きなら1行20〜40字、誤った向きなら1〜3字の破片になる。
+
+    **単独では使えない**（DESIGN §2）。30秒でわかる！DS は2〜3段組なので
+    横向きの行が短く、縦23 対 横20 と逆転する。票の裏取り専用。
+    """
+    out = {}
+    for vertical in (True, False):
+        counts = []
+        for i in pages:
+            chars = []
+            for sp in collect_spans(doc[i]):
+                t = sp["text"]
+                n = len(t)
+                if n == 0:
+                    continue
+                x0, y0, x1, y1 = sp["bbox"]
+                vert = (y1 - y0) > (x1 - x0) * 1.2
+                for k, ch in enumerate(t):
+                    if ch.isspace():
+                        continue
+                    if vert:
+                        c = y0 + (y1 - y0) * (k + 0.5) / n
+                        chars.append(((x0 + x1) / 2, c))
+                    else:
+                        c = x0 + (x1 - x0) * (k + 0.5) / n
+                        chars.append((c, (y0 + y1) / 2))
+            if len(chars) < 40:
+                continue
+            key = (lambda c: c[0]) if vertical else (lambda c: c[1])
+            main = (lambda c: c[1]) if vertical else (lambda c: c[0])
+            tol = body_size * 0.6
+            chars.sort(key=lambda c: (round(key(c) / tol), main(c)))
+            groups, cur, ref = [], [], None
+            for c in chars:
+                k = key(c)
+                if ref is not None and abs(k - ref) <= tol:
+                    cur.append(c)
+                else:
+                    if cur:
+                        groups.append(cur)
+                    cur, ref = [c], k
+            if cur:
+                groups.append(cur)
+            counts += [len(g) for g in groups if len(g) >= 2]
+        out[vertical] = statistics.median(counts) if counts else 0.0
+    return out
+
+
+def detect_orientation(doc, page_nums, body_size):
+    """書字方向を自動判別する。戻り値 (縦書きか, 説明文, 確定したか)。
+
+    判定できないときは (True, 説明, False) を返す＝**縦書きのまま進める**。
+    """
+    start = min(ORIENT_SAMPLE_SKIP, max(0, len(page_nums) - 1))
+    sample = page_nums[start:start + ORIENT_SAMPLE_PAGES] or page_nums
+    v, h, total = count_orientation_chars(doc, sample)
+    votes = v + h
+    if total and votes < total * ORIENT_VOTE_MIN_RATIO:
+        # 票が立たない＝1文字1スパン＝縦組み（§1.1 の非対称性）
+        return True, f"票率 {votes / total:.2f}（1文字1スパンのPDF）", True
+    if votes == 0:
+        return True, "向き票なし", False
+    hr = h / votes
+    if hr <= ORIENT_VERTICAL_MAX:
+        return True, f"横票率 {hr:.2f}", True
+    if hr < ORIENT_HORIZONTAL_MIN:
+        return True, f"横票率 {hr:.2f}", False
+    ll = _orient_line_len(doc, sample, body_size)
+    note = f"横票率 {hr:.2f} / 行長 縦{ll[True]:.0f}・横{ll[False]:.0f}"
+    if (ll[False] >= ORIENT_LINE_MIN
+            and ll[False] >= ll[True] * ORIENT_LINE_RATIO):
+        return False, note, True
+    return True, note, False
+
+
+def _resolve_orientation(args, doc, page_nums):
+    """`args.horizontal` を確定させる（DESIGN_書字方向の自動判別.md §3）。
+
+    **明示指定が最優先**で、auto のときだけ判定する。判定できなければ
+    縦書きのまま進める＝縦組みの本を横書きと誤認すると転置座標で全損するが、
+    逆は従来どおりで済む（利用者が --horizontal を付ければ直る）。
+    """
+    if args.horizontal and getattr(args, "vertical", False):
+        print("エラー: --horizontal と --vertical は同時に指定できません",
+              file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "orientation", "auto") == "horizontal" or args.horizontal:
+        args.horizontal = True
+        return
+    if getattr(args, "orientation", "auto") == "vertical" \
+            or getattr(args, "vertical", False):
+        args.horizontal = False
+        return
+    body_size = detect_body_size(doc, page_nums[:80]) or 12.0
+    vertical, note, sure = detect_orientation(doc, page_nums, body_size)
+    args.horizontal = not vertical
+    if not vertical:
+        print(f"書字方向: 横書きと判定（{note}） — --vertical で無効化できます")
+    elif sure:
+        print(f"書字方向: 縦書き（{note}）")
+    else:
+        print(f"警告: 書字方向を判定できませんでした（{note}）。縦書きとして"
+              f"処理します。横書きの本なら --horizontal を指定してください",
+              file=sys.stderr)
+
 
 def analyze_page(fpage, num, body_size, horizontal=False):
     """1ページを解析して Page オブジェクトを返す。
@@ -665,6 +821,59 @@ def _strip_heading_ornaments(text):
     return t.strip("　 ")
 
 
+# 見出しの先頭に付くアイコン由来の1字ノイズ。図解・気象学入門の小見出しは
+# 🔍 のアイコンが付いていて、ScanSnap OCR が毎回違う1字を返す
+# （実測: ぺ ﾍ へ 気 く < ､ R 煮 葱 式 ' ‘ 』 血 必 … K ヘ v し ひ）。
+#
+# **落とすのは記号だけにする。** かな・漢字1字を「直後がかなで始まるなら
+# 語頭になりえない」という理由で落とす案は試して撤回した＝漢字＋送り仮名は
+# 日本語で最も普通の形で、`湿った空気は重くない` が `った空気は重くない` に
+# 壊れる。かな・漢字に化けたアイコンは**印刷目次の辞書**（
+# refine_headings_with_toc・difflib 0.75）が直す担当にする
+# ＝1字余分でも比 0.93 なので当たる（DESIGN_横書き章立て.md §5
+# 「位置は本文側、表記は目次側」）。
+_HIRAGANA_RE = re.compile(r'[ぁ-ゖ]')
+_HEAD_WORD_RE = re.compile(r'[ぁ-ゖァ-ヺー㐀-鿿々0-9０-９A-Za-zＡ-Ｚａ-ｚ]')
+
+
+def _line_text_size(v):
+    """行の「地の活字サイズ」。構成スパンを推定文字数で重み付けした中央値。
+
+    `VLine.size` は構成スパンの **max** なので、見出しの飾りタイル
+    （図解・気象学入門の `1-1` や `図1-9` の黒タイル）が同じ行に入ると
+    行全体が大活字に見える。実測（本文 12.31pt）:
+
+    | 行 | 構成スパン | max | 文字数重み中央値 |
+    |---|---|---|---|
+    | 節見出し `1-1 雲が空に浮かんでいられるわけ` | 35.4pt(1字)＋15.0pt(14字) | 35.4 | **15.0**（1.22倍） |
+    | 小見出し `雲はなぜ地上に落ちてこないのか？` | 17.8pt(15字) | 17.8 | **17.8**（1.45倍） |
+    | 図キャプション `図1-9 水滴の半径と落下速度` | 26.3pt(1字)＋11.9pt(16字) | 26.3 | **11.9**（0.97倍） |
+
+    max を使うと**図のキャプションが 2.14 倍の見出しに化ける**。
+    地の活字で見れば見出しは 1.19〜1.45 倍、キャプションは 0.97〜0.99 倍で
+    きれいに分かれる。横書きの見出し判定専用（縦書き経路には影響しない）。
+    """
+    if not v.spans:
+        return v.size
+    weighted = []
+    for x0, y0, x1, y1, size in v.spans:
+        if size <= 0:
+            continue
+        n = max(1, int(round((y1 - y0) / size)))
+        weighted += [size] * n
+    return statistics.median(weighted) if weighted else v.size
+
+
+def _strip_leading_noise(text):
+    """見出しの先頭1字だけの飾りノイズ（記号）を落とす（横書き専用）。"""
+    t = text.strip("　 ")
+    if len(t) < 4:
+        return t
+    if not _HEAD_WORD_RE.match(t[0]):
+        return t[1:].strip("　 ")
+    return t
+
+
 def dedup_norm_heading(text):
     """見出し重複判定用の正規化（全半角統一・空白記号除去、数字は残す）。"""
     t = unicodedata.normalize("NFKC", text)
@@ -779,26 +988,11 @@ def classify_marginals(pages, body_size, horizontal=False):
                 kept.append(vl)
         pg.vlines = kept
 
-    # 柱・ノンブルはフォントが小さく「ルビ」に誤分類されていることがある。
-    # 本文領域の外にあるルビはマージン行（柱・ノンブル候補）に移す。
-    for pg in pages:
-        keep, migrate = [], []
-        for run in pg.rubies:
-            ryc = (run.y0 + run.y1) / 2
-            if ryc < body_top - cell * 0.7 or ryc > body_bottom + cell * 0.7:
-                migrate.append(run)
-            else:
-                keep.append(run)
-        pg.rubies = keep
-        for run in migrate:
-            hl = HLine()
-            hl.add_span({"text": run.text, "size": body_size * 0.5,
-                         "bbox": (run.x0, run.y0, run.x1, run.y1)})
-            pg.hlines.append(hl)
-
     # 横書きモード: x′方向（転置後x＝紙面の上下方向）の本文バンドを推定。
     # 柱・ノンブルは本文よりフォントが小さい（柱9pt/本文12pt級）ため、
-    # サイズ・セル数フィルタで推定から外れ、中央値汚染を防ぐ
+    # サイズ・セル数フィルタで推定から外れ、中央値汚染を防ぐ。
+    # **ルビの移送より先に求める**＝横書きのノンブルは y 方向には本文帯の
+    # 中にあり（転置後 y′ は紙面の左右方向）、x′ バンドでしか外に出ない
     band_l = band_r = None
     if horizontal:
         lefts, rights = [], []
@@ -816,6 +1010,29 @@ def classify_marginals(pages, body_size, horizontal=False):
         return (band_l is not None and
                 (xc < band_l - tol or xc > band_r + tol))
 
+    # 柱・ノンブルはフォントが小さく「ルビ」に誤分類されていることがある。
+    # 本文領域の外にあるルビはマージン行（柱・ノンブル候補）に移す。
+    # **横書きでは x′バンドの外も見る。** 図解・気象学入門のノンブルは
+    # 転置後 y′ が本文帯の中に入るので y だけでは外に出ず、739個の
+    # ノンブルが全部ルビのまま残っていた（`estimate_nombre_offset` が
+    # 数字行を7個しか見つけられず None を返し、印刷目次からの章位置が
+    # 使えなかった）
+    for pg in pages:
+        keep, migrate = [], []
+        for run in pg.rubies:
+            ryc = (run.y0 + run.y1) / 2
+            if (ryc < body_top - cell * 0.7 or ryc > body_bottom + cell * 0.7
+                    or out_of_band((run.x0 + run.x1) / 2, cell * 0.7)):
+                migrate.append(run)
+            else:
+                keep.append(run)
+        pg.rubies = keep
+        for run in migrate:
+            hl = HLine()
+            hl.add_span({"text": run.text, "size": body_size * 0.5,
+                         "bbox": (run.x0, run.y0, run.x1, run.y1)})
+            pg.hlines.append(hl)
+
     # 柱候補の頻度: 横書き行 + 本文領域外の縦行
     freq = Counter()
     candidates = []  # (pg, line, is_vline)
@@ -829,6 +1046,30 @@ def classify_marginals(pages, body_size, horizontal=False):
                     out_of_band(vl.xc, cell * 0.5):
                 candidates.append((pg, vl, True))
                 freq[norm_hashira(vl.text)] += 1
+
+    # 柱の**あいまい頻度**。柱の章番号が丸数字の本（図解・気象学入門の
+    # 「第①章 雲のしくみ」）はスキャナOCRが丸数字を毎ページ違う字に化けさせる
+    # （譲・診・繕・鐡・⑲・⑪…）ので、norm_hashira の完全一致では頻度が
+    # 1 に割れる。この本の柱は本文より大きい活字（13.7pt 対 12.3pt）なので
+    # 「マージン内の小さい文字 → 柱」にも当たらず、**柱がそのまま中見出しに
+    # 昇格して nav を埋め尽くす**（194 個中 60 個以上）。
+    # 対策は「同じマージン位置に似た文字列が何ページ出るか」を数えること。
+    # 判定を使うのは in_margin の候補だけなので、本文中の見出しには影響しない。
+    # **縦書きには掛けない。** 柱が章題そのものの本（黒牢城）では、あいまい
+    # 頻度が章題の表記ゆれをまたいで効き、章扉の見出しが `33第一章雪夜灯籠`・
+    # `117　夜籠` のような柱＋ノンブルの断片に置き換わる（実測 見出し 59→62、
+    # うち6件が改悪）。実証できているのは横書きの丸数字柱だけなので、
+    # そこに限る（縦書き16冊は定義上バイト一致）。
+    fuzzy = {}
+    keys = ([k for k in freq if len(k) >= HASHIRA_FUZZY_MIN_LEN]
+            if horizontal else [])
+    for k in keys:
+        n = 0
+        for k2 in keys:
+            if k2 == k or difflib.SequenceMatcher(None, k, k2).ratio() \
+                    >= HASHIRA_FUZZY_RATIO:
+                n += freq[k2]
+        fuzzy[k] = n
 
     drop = set()
     headings = {}  # (page_num, id) -> text
@@ -855,6 +1096,8 @@ def classify_marginals(pages, body_size, horizontal=False):
             headings[(pg.num, id(ln))] = text
         elif freq[key] >= HASHIRA_MIN_FREQ:
             drop.add((pg.num, id(ln)))           # 柱（頻出）
+        elif in_margin and fuzzy.get(key, 0) >= HASHIRA_MIN_FREQ:
+            drop.add((pg.num, id(ln)))           # 柱（OCRが揺れる章番号つき）
         elif in_margin and freq[key] >= 2:
             drop.add((pg.num, id(ln)))           # マージン内で複数回 → 柱
         elif in_margin and ln.size < body_size * 0.95:
@@ -1137,6 +1380,86 @@ def _toc_entries_and_numbers(pg):
 _TOC_MULTI_ITEM_RE = re.compile(r'[／/].*[／/]')
 
 
+def _toc_tail_numbers(pg, drop):
+    """ページの本文行のうち「行末が1〜3桁の算用数字」の値を読み順で返す。"""
+    vals = []
+    for ln in list(pg.vlines) + list(pg.hlines):
+        if (pg.num, id(ln)) in drop:
+            continue
+        t = ln.text.strip()
+        if not t or is_junk_line(t):
+            continue
+        m = _TOC_TAIL_NUM_RE.search(t)
+        if m:
+            vals.append(int(m.group(1)))
+    return vals
+
+
+# 巻末索引の署名。**目次と同じ「行末の数字」を見るが、単調増加しない**のが
+# 索引の特徴（索引は五十音順で、ページ数は行ごとに戻る）。本の末尾にある
+# ことも要求する。これを使うのは**図の検出を止める**ためだけで、本文には
+# 触らない（30秒DS p164-166 の索引が 3.10M pt² の画像2枚になっていた）。
+# 実測: 30秒DS の索引 p164/165/166 は位置 0.96〜0.97・増加率 0.49〜0.58、
+# 印刷目次 p12 は位置 0.07・増加率 0.91 と離れている
+INDEX_TAIL_MIN = 8          # 行末が数字の行の下限
+INDEX_INC_MAX = 0.70        # 単調増加率の上限（これ未満なら索引）
+INDEX_TAIL_POS = 0.85       # 本のこの位置より後ろ
+
+
+# 横書きの本文終端。**最後に「本文の段落らしいページ」が現れる位置**で切る。
+# 索引・参考文献・執筆者紹介は行が短く、版面いっぱいまで達する行を持たない。
+# 実測（行長／版面幅の最大値）: 本文ページ 0.89〜1.01 に対し
+# 図解・気象学入門の索引 p311-316 は 0.32〜0.46、
+# 30秒DS の索引 p164-166 は 0.46〜0.48、ファンタジー事典の索引 0.26〜0.31。
+# **図が主役のページも行は短い**（気象学 p293 は最大比 0.46）ので、
+# 行長だけでは索引と分けられない。だから「最後に本文が来た位置」で切る
+BODY_END_LONG = 0.85        # 本文行とみなす行長／版面幅
+BODY_END_MIN_LINES = 5      # 本文ページとみなす本文行の本数
+
+
+def detect_body_end_h(pages, drop, body_top, body_bottom):
+    """横書きの本文終端ページ（0基点）。見つからなければ None。"""
+    w = (body_bottom - body_top) * BODY_END_LONG
+    last = None
+    for pg in pages:
+        n = sum(1 for ln in pg.vlines
+                if (pg.num, id(ln)) not in drop and ln.text.strip()
+                and not is_junk_line(ln.text.strip())
+                and ln.y1 - ln.y0 >= w)
+        if n >= BODY_END_MIN_LINES:
+            last = pg.num
+    if last is None or last >= len(pages) - 2:
+        return None            # 巻末まで本文＝切るものが無い
+    return last
+
+
+def detect_index_pages(pages, drop):
+    """巻末索引のページ番号（0基点）の集合。図の検出から外すために使う。"""
+    out = set()
+    n = len(pages)
+    if n < 20:
+        return out
+    for pg in pages:
+        if (pg.num + 1) / n < INDEX_TAIL_POS:
+            continue
+        vals = _toc_tail_numbers(pg, drop)
+        if len(vals) < INDEX_TAIL_MIN:
+            continue
+        inc = sum(1 for a, b in zip(vals, vals[1:]) if b > a)
+        if inc / max(1, len(vals) - 1) < INDEX_INC_MAX:
+            out.add(pg.num)
+    return out
+
+
+def _toc_pair_signal(pg, drop):
+    """横書きの印刷目次の署名（行末のページ数が単調増加する）。"""
+    vals = _toc_tail_numbers(pg, drop)
+    if len(vals) < TOC_PAIR_MIN_LINES:
+        return False
+    inc = sum(1 for a, b in zip(vals, vals[1:]) if b > a)
+    return inc / max(1, len(vals) - 1) >= TOC_PAIR_INC_RATIO
+
+
 def _toc_page_entries(pg, drop):
     """ページの本文行から目次エントリ候補を読み順で取り出す。
 
@@ -1159,7 +1482,7 @@ def _toc_page_entries(pg, drop):
     return entries, label, kana
 
 
-def detect_toc_pages(pages, drop):
+def detect_toc_pages(pages, drop, horizontal=False):
     """印刷目次のページを {page_num: [エントリ, …]} で返す（DESIGN_v2.0.md §3.5）。
 
     画像として残すページを決めるのと、章題辞書を
@@ -1179,11 +1502,20 @@ def detect_toc_pages(pages, drop):
     """
     limit = len(pages) * TOC_SCAN_HEAD
     cand = {}
+    by_num = {pg.num: pg for pg in pages}
     for pg in pages:
         if pg.num > limit:
             break
         entries, label, kana = _toc_page_entries(pg, drop)
         if len(entries) < TOC_PAGE_MIN_ENTRIES:
+            continue
+        # 横書きのページ数ペア署名。**かな率の門より先に見る**＝
+        # 図解・気象学入門の目次は項目名が口語的でかな率 0.476 と
+        # 本文並みになり、門（0.46）で落ちる。ペア署名は322ページ中
+        # 目次3ページだけに当たるので、これで門を越えてよい
+        pair = _toc_pair_signal(pg, drop) if horizontal else False
+        if pair:
+            cand[pg.num] = (entries, True)
             continue
         # **かな率で本文ページを弾く。** 目次の直後は本文の1ページ目なので、
         # 隣接規則をそのまま当てると本文が画像になって消える（黒牢城 p5 で
@@ -1199,9 +1531,152 @@ def detect_toc_pages(pages, drop):
     prim = {p for p, (_e, pri) in cand.items() if pri}
     out = {p: cand[p][0] for p in prim}
     for p, (entries, pri) in cand.items():
-        if not pri and (p - 1 in prim or p + 1 in prim):
-            out[p] = entries
+        if pri or not (p - 1 in prim or p + 1 in prim):
+            continue
+        # **横書きは「行末の数字が1つも無いページ」を目次の続きにしない。**
+        # 章扉（図解・気象学入門 p11 の `第1章 雲のしくみ` の全面写真）は
+        # OCRジャンクでエントリ数だけ満たしてしまい、目次として扱うと
+        # 章題辞書が汚れ、章頭の位置も奪われる
+        if horizontal and not _toc_tail_numbers(by_num[p], drop):
+            continue
+        out[p] = entries
     return dict(sorted(out.items()))
+
+
+# 印刷目次の章題とみなす本文比（横書き）。実測（図解・気象学入門 p8-p10・
+# 本文 12.31pt）: 章題 18.7〜31.1pt（1.52〜2.53倍）／節題 11.2〜12.3pt
+# （0.91〜1.00倍）。**1.8 では第7章（18.7pt＝1.52倍）が落ちる**ので 1.4。
+# 下げたぶんは `valid_heading_item` で締める＝飾りタイルのOCR
+# （認蕊隷溌・鳶灘識蕊・蕊ゞ蕊蕊蕊）はかなを含まないので全部落ち、
+# 本物の章題7本は全部通る
+TOC_CHAPTER_SIZE = 1.4
+TOC_CHAPTER_SNAP = 2        # 章頭を画像ページに寄せる許容ページ数
+_TOC_CHAPTER_NUM_RE = re.compile(r'第(.{1,2}?)章')
+
+
+def detect_toc_chapters_h(pages, drop, body_size, toc_pages, image_pages):
+    """横書きの印刷目次から {章頭ページ(0基点): 章題} を得る（DESIGN_横書き章立て.md §2.4）。
+
+    **横書きの目次は「項目 → ページ数」が行単位で読める。** 縦組みでは
+    縦中横の章番号が1列に連結され、ページ数も漢数字ジャンクになるので
+    x 位置で対応を取るしかなかった（detect_toc_chapter_pages）が、
+    横書きでは行がそのまま対になっている。
+
+    章題と節題は**地の活字サイズ**で分かれる（`_line_text_size`）。
+    実測（図解・気象学入門 p9、本文 12.31pt）: 章題 24.6〜31.1pt（2.0〜2.5倍）／
+    節題 11.7〜12.2pt（0.95〜0.99倍）。
+
+    章題の行にはページ数が付かない（`爵4房風のしくみ` の `143` は別行になり
+    ノンブルとして drop される）ので、**drop された数字だけの行も見る**。
+
+    章題そのものはOCRが飾りタイルを巻きこんで崩れる（`爵4房風のしくみ`・
+    `曹息喜廃聯気圧と前線`）ので、**表記は柱から取る**（`第③章雲のしくみ`＝
+    丸数字だけが壊れている）。順序はランの並びで確定するので `第N章` に直す。
+    """
+    if not toc_pages:
+        return {}
+    offset = estimate_nombre_offset(pages, drop)
+    if offset is None:
+        return {}
+    by_num = {pg.num: pg for pg in pages}
+    hi = body_size * TOC_CHAPTER_SIZE
+    items = []          # (章題, 印刷ページ or None)
+    for num in sorted(toc_pages):
+        pg = by_num.get(num)
+        if pg is None:
+            continue
+        seq = []        # 読み順の (種別, テキスト, 数値)
+        for ln in sorted(list(pg.vlines) + list(pg.hlines),
+                         key=lambda l: -(l.x0 + l.x1) / 2):
+            t = re.sub(r'[\s　]+', "", ln.text.strip())
+            if not t:
+                continue
+            if re.fullmatch(r'[0-9０-９]{1,4}', t):
+                seq.append(("num", t,
+                            int(unicodedata.normalize("NFKC", t))))
+                continue
+            if (pg.num, id(ln)) in drop or is_junk_line(t):
+                continue
+            m = _TOC_TAIL_NUM_RE.search(t)
+            size = _line_text_size(ln) if getattr(ln, "spans", None) \
+                else getattr(ln, "size", 0.0)
+            kind = "chap" if size >= hi else "sect"
+            seq.append((kind, t, int(m.group(1)) if m else None))
+        for i, (kind, t, val) in enumerate(seq):
+            if kind != "chap":
+                continue
+            if not valid_heading_item(t):
+                continue        # 飾りタイルのOCR（認蕊隷溌・蕊ゞ蕊蕊蕊）
+            page = val
+            if page is None:
+                # 直後の数字だけの行、無ければ**直後の節**のページ数 − 1。
+                # **飛ばして遠くの節を使ってはならない**＝節の間隔は
+                # 6〜9ページあるので、3つ先の節から引くと章頭を十数ページ
+                # 後ろに置く（第1章が p24 になるのを実測）
+                for k2, _t2, v2 in seq[i + 1:i + 3]:
+                    if k2 == "num" and v2 is not None:
+                        page = v2
+                        break
+                    if k2 == "sect":
+                        page = v2 - 1 if v2 is not None else None
+                        break
+            items.append((t, page))
+    # ページ数が単調増加する章だけを採る（目次の飾り・柱の混入を落とす）。
+    # ページ数の取れなかった章（`第1章 雲のしくみ` は目次でも数字が別要素で
+    # ノンブル扱いになる）は None のまま残し、あとで画像ページに寄せる
+    kept, last = [], None
+    for t, page in items:
+        if page is not None:
+            if last is not None and page <= last:
+                continue
+            last = page
+        kept.append((t, page))
+    while kept and kept[-1][1] is None:
+        kept.pop()          # 末尾の未確定は置きようがない
+    if sum(1 for _t, p in kept if p is not None) < 3:
+        return {}
+    # 柱から章題を復元する
+    per_page = _pillar_margin_texts(pages, drop)
+    out = {}
+    last_toc = max(toc_pages)
+    for i, (t, page) in enumerate(kept):
+        nxt = next((p for _t, p in kept[i + 1:] if p is not None), None)
+        if page is None:
+            # ページ数の取れなかった章は「前の章頭より後・次の章より前」の
+            # 最初の画像ページ（＝章扉）に置く。図解・気象学入門の第1章は
+            # 目次に数字が無く、章扉 p11 がこれで当たる
+            lo = (max(out) + 1) if out else last_toc + 1
+            hi_p = (nxt + offset) if nxt is not None else len(pages)
+            cand = [p for p in sorted(image_pages) if lo <= p < hi_p]
+            if not cand:
+                continue
+            head = cand[0]
+        else:
+            phys = page + offset
+            if not 0 <= phys < len(pages):
+                continue
+            cand = [p for p in range(phys - TOC_CHAPTER_SNAP,
+                                     phys + TOC_CHAPTER_SNAP + 1)
+                    if p in image_pages]
+            head = min(cand, key=lambda p: abs(p - phys)) if cand else phys
+        while head in out:
+            head += 1
+        end = (nxt + offset) if nxt is not None else len(pages)
+        freq = Counter()
+        for p in range(head, min(end, len(pages))):
+            for key, raw in per_page.get(p, ()):
+                if len(key) >= 4:
+                    freq[raw.strip()] += 1
+        title = t
+        if freq:
+            best = freq.most_common(1)[0][0]
+            if _TOC_CHAPTER_NUM_RE.search(best):
+                title = _TOC_CHAPTER_NUM_RE.sub(
+                    lambda _m: f"第{i + 1}章", best, count=1)
+            elif len(best) >= len(t):
+                title = best
+        out[head] = title
+    return out
 
 
 def detect_toc_chapter_pages(pages, drop, body_size, horizontal=False):
@@ -2035,10 +2510,13 @@ def _page_ink_small_bbox(doc_page, scale=0.3):
     return min(xs), min(ys), max(xs), max(ys), w, h
 
 
-def render_image_page(doc, page_num):
+def render_image_page(doc, page_num, dpi=FIG_RENDER_DPI):
     """
     PDFページを画像ページ用JPEGにレンダリングして bytes を返す。
     外周の白余白はインクのバウンディングボックスで自動トリミングする。
+
+    dpi は部分図（render_figure_rect）と揃える。既定の 144 は
+    従来の `Matrix(2, 2)` と同値なので、縦組みの出力は変わらない。
     """
     page = doc[page_num]
     bb = _page_ink_small_bbox(page)
@@ -2051,7 +2529,8 @@ def render_image_page(doc, page_num):
                          min(h, y1 + pad) / 0.3)
     else:
         clip = page.rect
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+    z = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(z, z), clip=clip)
     return pix.tobytes("jpeg", jpg_quality=85)
 
 
@@ -2136,19 +2615,20 @@ def spread_filename(left_num, right_num):
 _SPREAD_NAME_RE = re.compile(r"s(\d+)-(\d+)\.jpe?g", re.IGNORECASE)
 
 
-def render_image_spread(doc, left_num, right_num):
+def render_image_spread(doc, left_num, right_num, dpi=FIG_RENDER_DPI):
     """見開きの2ページを1枚のJPEGに連結する（左ページ・右ページの順）。"""
     lp, rp = doc[left_num], doc[right_num]
     lm, rm = _spread_ink_margins(lp), _spread_ink_margins(rp)
     if lm is None or rm is None:
-        return render_image_page(doc, left_num)
+        return render_image_page(doc, left_num, dpi=dpi)
     pad = max(2.0, min(lp.rect.width, lp.rect.height) * 0.02)
     y0 = max(0.0, min(lm[2], rm[2]) - pad)
     y1 = min(lp.rect.height, max(lm[3], rm[3]) + pad)
     # 綴じ側（左ページの右端・右ページの左端）は切らずに突き合わせる
     lclip = fitz.Rect(max(0.0, lm[0] - pad), y0, lp.rect.width, y1)
     rclip = fitz.Rect(0.0, y0, min(rp.rect.width, rp.rect.width - rm[1] + pad), y1)
-    m = fitz.Matrix(2, 2)
+    z = dpi / 72.0
+    m = fitz.Matrix(z, z)
     p1 = lp.get_pixmap(matrix=m, clip=lclip)
     p2 = rp.get_pixmap(matrix=m, clip=rclip)
     w, h = p1.width + p2.width, max(p1.height, p2.height)
@@ -2196,7 +2676,6 @@ FIG_MERGE = 25.0          # 連結成分を1つの図にまとめる距離(pt)�
                           # ファンタジー事典 p107 の盾3個（間隔40pt＋罫線）は
                           # 別々にしたい（DESIGN_部分図.md §8.4）
 FIG_FULLPAGE_RATIO = 0.70  # 本文帯のこの割合を覆ったら「全面図」扱い
-FIG_RENDER_DPI = 144
 # 「テキスト層に本文らしい行がある」判定（DESIGN_部分図.md §5.3(b)）。
 # is_junk_line がかな無しの本文列を挿絵ノイズと誤判定して落とすことがあり
 # （蘇我氏 p215 の官人の官歴の列挙）、そのままだと本文4列が画像になる
@@ -2470,8 +2949,170 @@ def _ruled_figures(ink, page_rect, body_size):
     return [bx for bx, _n in _rule_structures(rects, merge, RULE_MIN_COUNT)]
 
 
-def _fig_coverage(pg, drop, headings, body_size):
+FIG_LADDER_LO, FIG_LADDER_HI = 0.75, 1.40   # 行送りとみなす間隔の比
+FIG_LADDER_MIN = 3        # 梯子とみなす連続行数
+FIG_FREE_LEVELS = 6       # 自由域の段差をいくつまで試すか
+# 「梯子から外れても被覆に入れる見出し」とみなす本文比。**見出し判定の
+# 1.18 より高く取る**＝図に添えた説明文は本文より大きい活字で組まれる
+# ことがあり（図解・気象学入門 p70 の `びこむ〇の数が等しいときに…` は
+# 15.2pt＝1.24倍）、1.18 で拾うと**図が説明文で分断される**。
+# 小見出し（17.5〜17.9pt＝1.42〜1.45倍）だけを確実に拾う値にする
+FIG_HEAD_COVER_RATIO = 1.35
+FIG_TEXT_DENSE = 0.17     # 行の面積が本文帯のこの割合を超えたら「文字のページ」
+FIG_LADDER_HEAD = 3.0     # 本文行が版面の行頭から下がってよい字数
+FIG_LADDER_LONG = 0.5     # 「長い行」とみなす版面幅の比
+FIG_BAND_REPEAT = 2       # 段組とみなすのに必要な同型ページ数
+FIG_BAND_TOL = 12.0       # 同型とみなす帯端のずれ(pt)
+# 帯検出ページで梯子を使ってよい「梯子に残る行の割合」。実測（帯が1ページ
+# しか現れないページ）: 図が主役のページ 0.20〜0.30（図解・気象学入門
+# p78/p85/p185/p219/p234/p293）に対し、段組の検出漏れ（巻末索引・用語集）は
+# 0.37〜1.00（30秒DS p164 の索引が 0.37 で最小）。**外す側に倒して 0.32**
+# ＝高すぎると索引の本文が画像になり、低すぎても図が刻まれたまま残るだけ
+FIG_BAND_LADDER_MAX = 0.32
+
+
+def _fig_real_bands(pages):
+    """本当に段組みされているページ番号の集合。
+
+    `_detect_span_bands` は**図の中のラベル群を段組と誤検出する**
+    （図解・気象学入門 p78 は本文4行＋図1枚のページなのに3段と判定される）。
+    誤検出のページで図の梯子（`_fig_ladder_lines`）を止めると、図が
+    ラベルのすき間で刻まれたままになる。
+    **段組は本の組版であってページの偶然ではない**ので、同じ帯の並びが
+    本の中で繰り返されるかどうかで見分ける。実測（図解・気象学入門）:
+    誤検出11ページはすべて同型ページ数1、巻末索引の3段は2〜4。
+    30秒DS の本物の段組は 5〜50。
+    """
+    bands = {pg.num: pg.bands for pg in pages if len(pg.bands) > 1}
+    real = set()
+    for n, b in bands.items():
+        cnt = 0
+        for m, c in bands.items():
+            if len(b) == len(c) and all(
+                    abs(x[0] - y[0]) <= FIG_BAND_TOL
+                    and abs(x[1] - y[1]) <= FIG_BAND_TOL
+                    for x, y in zip(b, c)):
+                cnt += 1
+        if cnt >= FIG_BAND_REPEAT:
+            real.add(n)
+    return real
+
+
+def _fig_line_pitch(pages, drop, body_size):
+    """書籍レベルの行送り（assemble_text の line_pitch と同じ推定）。"""
+    gaps = []
+    for pg in pages:
+        xs = sorted((v.xc for v in pg.vlines
+                     if (pg.num, id(v)) not in drop and v.text.strip()
+                     and not is_junk_line(v.text.strip())), reverse=True)
+        gaps.extend(a - b for a, b in zip(xs, xs[1:])
+                    if 0 < a - b < body_size * 4)
+    return statistics.median(gaps) if gaps else body_size * 1.75
+
+
+def _fig_ladder_fallback(ordered, long_min, dense=False):
+    """梯子が立たないページの被覆。
+
+    **「全部を本文とみなす」のは誤り。** 図が主役のページ
+    （図解・気象学入門 p53 の層状雲一覧は説明の小箱が格子に並び、
+    p204 の図5-12 は4段の模式図にラベルが散る）は、どの行も梯子に
+    乗らないので、全部を被覆にすると**図が小箱やラベルのすき間に
+    刻まれる**（p53 は2枚・p204 は3枚に割れていた）。
+
+    残すのは「行頭から始まる長い行」＝本文の段落らしい行だけで、
+    それが**2本以上あるとき**に限る。1本だけの長い行は本文の段落では
+    なく**図のキャプション**である公算が高い（`図5-12 温度移流による
+    気圧の谷の深まり` は版面の65%の長さで行頭から始まる）。
+    """
+    keep = [v for v in ordered
+            if long_min is None or v.y1 - v.y0 >= long_min]
+    if len(keep) >= 2:
+        return keep
+    # **文字で埋まったページでは従来どおり全部を被覆にする。**
+    # 段組の本文ページ（30秒DS の執筆者紹介 p161・用語集 p36/p130）は
+    # 段の幅しかないので「長い行」を持たず、被覆を空にすると
+    # **本文が丸ごと画像になる**。行の占める面積で分ける。実測:
+    # 守るべき本文ページ 0.196〜0.391（DS p161/p164/p36/p130/p56）に対し、
+    # 図が主役のページ 0.041〜0.159（気象学 p204/p284/p293/p53）。
+    # **境目は狭いので外す側に倒す**＝高すぎると本文が画像になり、
+    # 低すぎても図が刻まれたまま残るだけで済む
+    return list(ordered) if dense else []
+
+
+def _fig_ladder_lines(lines, pitch, head=None, long_min=None,
+                      dense=False):
+    """読み順に等間隔で連なる行（＝本文の行送りの梯子）だけを返す。
+
+    **横書きモード専用の歯止め。** 縦組みでは図中のラベル・キャプションは
+    横組みなので `_fig_coverage` が hlines を無視するだけで分離できるが、
+    横書きの本では図中ラベルも本文と同じ向きなので、転置後は両方 vline に
+    なって区別が付かない。被覆に入れるとラベルとラベルのすき間しか
+    「テキストの無い矩形」に残らず、**図の見出し帯・凡例・キャプションが
+    切り落とされる**（図解・気象学入門 p23 の図1-9 は帯 x′44〜160 のうち
+    69〜147 しか切り出されなかった）。
+
+    本文の行は必ず等間隔の梯子に乗る（同じ行送りで積まれる）が、図中の
+    ラベルは任意の位置に散る。連続 FIG_LADDER_MIN 行以上の梯子に乗る行
+    だけを本文とみなす。梯子が作れないページ（本文の少ないページ）は
+    判断材料が無いので従来どおり全部を本文として扱う。
+    """
+    if len(lines) < FIG_LADDER_MIN or not pitch:
+        return list(lines)
+    if head is not None:
+        # **行頭から始まらない行は梯子に載せない。** 図に添えられた文字は
+        # 本文と同じ行送りで組まれていることがあり（吹き出しの中・凡例の
+        # 箱の中）、間隔だけでは本文と分けられない。図解・気象学入門の
+        # 実測: p60 の吹き出し（行頭から 151pt）と p159 の凡例
+        # （166pt）は、どちらも本文と同じ 14.8pt 間隔で3行並ぶので梯子に
+        # 乗ってしまい、**吹き出しと凡例が切り落とされていた**。
+        # 本文の行は必ず版面の行頭から始まる（段落頭の1字下げを含めても
+        # FIG_LADDER_HEAD 字以内）。段組ページには掛けない（副段の行頭は
+        # 版面の行頭ではない）ので、呼び出し側が head=None にする。
+        ordered = [v for v in lines if v.y0 <= head]
+        if len(ordered) < FIG_LADDER_MIN:
+            return _fig_ladder_fallback(ordered, long_min, dense)
+        lines = ordered
+    ordered = sorted(lines, key=lambda v: -v.xc)
+    lo, hi = pitch * FIG_LADDER_LO, pitch * FIG_LADDER_HI
+
+    def take(run):
+        # **等間隔なだけの短い行の並びは本文ではない。** 図の中の小さな
+        # ラベルは版面の行頭から始まり本文と同じ間隔で並ぶことがある
+        # （図解・気象学入門 p46 の `仮想大気／の温度／20℃／20℃`）。
+        # 本文の段落は必ず版面の幅いっぱいまで達する行を含むので、
+        # 「長い行を1本も含まない梯子」は捨てる（段落末尾の短い行は
+        # 長い行と同じ梯子に乗るので守られる）。
+        if len(run) < FIG_LADDER_MIN:
+            return False
+        if long_min is None:
+            return True
+        # **長い行が2本以上要る。** 1本でよいとすると、図のキャプション
+        # （`図4-22 2つのジェット気流…` は版面いっぱいの長さで行頭から
+        # 始まり、活字も本文と同じ）が1本で梯子を成立させ、図中のラベル
+        # 2本を道連れに被覆へ引き入れる（図解・気象学入門 p176 で
+        # 図の左半分とキャプションが切り落とされた）。本文の段落は
+        # 3行あれば長い行が2本以上ある
+        return sum(1 for v in run if v.y1 - v.y0 >= long_min) >= 2
+
+    keep, run = [], [ordered[0]]
+    for i in range(1, len(ordered)):
+        if lo <= ordered[i - 1].xc - ordered[i].xc <= hi:
+            run.append(ordered[i])
+        else:
+            if take(run):
+                keep += run
+            run = [ordered[i]]
+    if take(run):
+        keep += run
+    return keep or _fig_ladder_fallback(ordered, long_min, dense)
+
+
+def _fig_coverage(pg, drop, headings, body_size, pitch=None,
+                  head=None, long_min=None, dense=False):
     """本文として出力される行の構成スパンの bbox を返す（被覆マスクの材料）。
+
+    pitch（行送り）を渡すと `_fig_ladder_lines` で梯子に乗る行だけに絞る。
+    横書きモード専用の歯止めで、縦書きでは None を渡して従来どおりにする。
 
     **行の bbox でなくスパンの bbox を使う**（DESIGN_部分図.md §3.1）。
     巨大スパン（図版OCRノイズ）と極小スパン（図版内の微細ノイズ）は外す。
@@ -2481,6 +3122,7 @@ def _fig_coverage(pg, drop, headings, body_size):
     """
     hi, lo = body_size * FIG_BIG_SPAN_RATIO, body_size * FIG_MIN_SPAN_RATIO
     out = []
+    cand = []
     for v in pg.vlines:
         if not v.text.strip():
             continue
@@ -2489,6 +3131,41 @@ def _fig_coverage(pg, drop, headings, body_size):
             continue
         if is_junk_line(v.text.strip()):
             continue
+        cand.append(v)
+    if pitch:
+        # **見出しの行は梯子から外れても必ず被覆に入れる。**
+        # 横書きの小見出しは 🔍 のアイコンや飾り罫を持つので、行送りが
+        # 本文とずれて梯子から落ち、**見出しの帯そのものが図として
+        # 切り出される**（図解・気象学入門で13件。しかも図中ラベルと同じ
+        # 扱いなので左端が欠け、`ぺ温度によって空気の湿る限度は変わる` が
+        # `よって空気の湿る限度は変わる` の画像になる）。見出しは
+        # テキストとして出るので画像にする意味がない。
+        # **図のキャプションと混同しない**のがここの肝で、
+        # `_line_text_size`（地の活字）で見れば見出し 1.19〜1.45倍 /
+        # キャプション 0.97〜0.99倍 と分かれる（VLine.size の max では
+        # キャプションが 2.14 倍に化けて図が分断される）
+        keep = _fig_ladder_lines(cand, pitch, head=head, long_min=long_min,
+                                 dense=dense)
+        kept_ids = {id(v) for v in keep}
+        for v in cand:
+            if id(v) in kept_ids:
+                continue
+            t = _strip_heading_ornaments(v.text.strip())
+            # **ひらがなを要求する**のがここの歯止め。図版のOCRジャンクは
+            # 珍しい漢字の羅列で `valid_heading_item` を通ってしまい
+            # （`一判議議蕊溌靭ノア`・`荊鍛錨雛＆`・`4灘蕊蕊灘`）、
+            # これを被覆に入れると**図が分断される**（p160 の図4-11 が
+            # 面積 92,526 → 38,802 に）。本物の小見出しは口語的な文なので
+            # ひらがなが3字以上・2割以上ある。純漢字の見出し（標本抽出・
+            # 平均回帰）は落ちるが、落ちても従来どおりの挙動に戻るだけ
+            kana = len(_HIRAGANA_RE.findall(t))
+            if (_line_text_size(v) >= body_size * FIG_HEAD_COVER_RATIO
+                    and len(v.cells) >= 4
+                    and kana >= 3 and kana >= len(t) * 0.2
+                    and valid_heading_item(t)):
+                keep.append(v)
+        cand = keep
+    for v in cand:
         for x0, y0, x1, y1, size in (v.spans or
                                      [(v.x0, v.y0, v.x1, v.y1, v.size)]):
             if lo <= size <= hi:
@@ -2566,8 +3243,18 @@ def _fig_body_box(pages, drop, headings, kept_counts):
     return statistics.median(lefts), statistics.median(rights)
 
 
-def _fig_free_rects(cov, bl, br, bt, bb, body_size):
-    """本文テキストに覆われていない矩形（＝図の許容範囲）を返す。"""
+def _fig_free_rects(cov, bl, br, bt, bb, body_size, multi_level=False):
+    """本文テキストに覆われていない矩形（＝図の許容範囲）を返す。
+
+    multi_level=True では、**自由域の段差ごとに部分矩形も出す**。
+    本文が図に回りこむページ（横書きの図解書では普通）の自由域はL字になり、
+    走査範囲まるごと1つの矩形にすると**いちばん狭い段に合わせて潰れる**。
+    図解・気象学入門 p25 の実測: 本文が x′45〜160 で y′147.8 まで、
+    x′160〜177 で y′214 までしか来ていないのに、矩形は y′214 から始まる
+    ものが1つだけ出て、キャラクターの吹き出しが切り落とされていた。
+    段差ごとに「その段以上の高さがある区間」の矩形も出せば、
+    広いほうの矩形が候補に入る（重なりは `_fig_dedup` が畳む）。
+    """
     step = 1.0
     w = int((br - bl) / step) + 1
     top = [bb] * w
@@ -2603,6 +3290,18 @@ def _fig_free_rects(cov, bl, br, bt, bb, body_size):
         out.append((bl + a * step, bt, bl + (b + 1) * step, min(top[a:b + 1])))
     for a, b in runs(lambda i: bb - bot[i] >= minh):
         out.append((bl + a * step, max(bot[a:b + 1]), bl + (b + 1) * step, bb))
+    if multi_level:
+        q = max(body_size, 1.0)
+        for h, mk in ((lambda i: top[i] - bt,
+                       lambda c, d: (bl + c * step, bt,
+                                     bl + (d + 1) * step, min(top[c:d + 1]))),
+                      (lambda i: bb - bot[i],
+                       lambda c, d: (bl + c * step, max(bot[c:d + 1]),
+                                     bl + (d + 1) * step, bb))):
+            lv = sorted({int(h(i) / q) for i in range(w) if h(i) >= minh})
+            for L in lv[:FIG_FREE_LEVELS]:
+                for c, d in runs(lambda i: h(i) >= max(minh, L * q)):
+                    out.append(mk(c, d))
     return [r for r in out
             if r[2] - r[0] >= minh and r[3] - r[1] >= minh]
 
@@ -2679,6 +3378,21 @@ def detect_inline_figures(doc, pages, drop, headings, body_size,
             lens += [v.y1 - v.y0 for v in _kept_lines(pg, drop, headings)]
     line_len_med = statistics.median(lens) if lens else 0.0
     merge_cells = max(1, int(FIG_MERGE / FIG_GRID))
+    # 梯子の基準になる行送り。**書籍レベルで測る**＝ページ内の中央値だと、
+    # 行の多い表（図解・気象学入門 p82 の表2-1 は44行中28行が表のセル）で
+    # 表の行間が「本文の行送り」になり、本文行のほうが梯子から外れて
+    # **本文が画像になる**
+    ladder_pitch = (_fig_line_pitch(pages, drop, body_size)
+                    if horizontal else None)
+    real_bands = _fig_real_bands(pages) if horizontal else set()
+    index_pages = detect_index_pages(pages, drop) if horizontal else set()
+    if horizontal:
+        # 巻末（索引・参考文献）では図を切り出さない。**本文は残す**ので
+        # 情報は失われず、無意味な画像だけが減る（図解・気象学入門の
+        # 巻末ノイズ 25枚 0.68M pt²・30秒DS の索引 3.10M pt²）
+        end_h = detect_body_end_h(pages, drop, body_top, body_bottom)
+        if end_h is not None:
+            index_pages |= {pg.num for pg in pages if pg.num > end_h}
     result, fullpage = {}, set()
     seen_nums = set()
     for pg in pages:
@@ -2689,8 +3403,49 @@ def detect_inline_figures(doc, pages, drop, headings, body_size,
             continue          # 既に全面画像ページ
         if body_end is not None and pg.num > body_end:
             continue          # 後付け（巻末広告・奥付）
-        cov = _fig_coverage(pg, drop, headings, body_size)
-        free = _fig_free_rects(cov, bl, br, body_top, body_bottom, body_size)
+        if pg.num in index_pages:
+            continue          # 巻末索引（本文は残す。画像にしないだけ）
+        # 横書きの本では図の見出し帯・凡例・キャプションが本文と同じ向きに
+        # 組まれるので、被覆に入れると図が「ラベルとラベルのすき間」に
+        # 切り詰められる（図解・気象学入門 p23 の図1-9 は帯 x′44〜160 の
+        # うち 69〜147 しか残らなかった）→ 本文の行送りの梯子に乗る行だけを
+        # 被覆にする。**段組のページは対象外**＝副段は本段と行送りが違うので
+        # 梯子から外れ、本文がまるごと図になる（30秒DS p56 は本文3段の
+        # ページなのに図5枚。書籍全体で 45枚 → 158枚）。
+        # 段組の判定は `_fig_real_bands`（同型ページ数）で行う＝
+        # `_detect_span_bands` の誤検出をそのまま信じると、図のラベル群を
+        # 段組と見て梯子を止めてしまう
+        use_ladder = ladder_pitch and pg.num not in real_bands
+        if use_ladder and len(pg.bands) > 1:
+            # 同型ページの無い帯検出は図のラベル群の誤検出のことが多いが、
+            # **段組の検出漏れ**（巻末索引の3段が2段に見える等）もある。
+            # 前者は「ページのほとんどが図」＝梯子に残る行がわずかなので、
+            # 残る割合で分ける。索引のページは行がほぼ全部梯子に乗るため
+            # 従来どおり梯子を止め、本文が画像になるのを防ぐ
+            cand = [v for v in pg.vlines if v.text.strip()
+                    and ((pg.num, id(v)) not in drop
+                         or (pg.num, id(v)) in headings)
+                    and not is_junk_line(v.text.strip())]
+            if cand:
+                lad = _fig_ladder_lines(
+                    cand, ladder_pitch,
+                    head=body_top + body_size * FIG_LADDER_HEAD,
+                    long_min=(body_bottom - body_top) * FIG_LADDER_LONG)
+                if len(lad) > len(cand) * FIG_BAND_LADDER_MAX:
+                    use_ladder = False
+        area_txt = sum((v.x1 - v.x0) * (v.y1 - v.y0) for v in pg.vlines
+                       if v.text.strip()
+                       and ((pg.num, id(v)) not in drop
+                            or (pg.num, id(v)) in headings)
+                       and not is_junk_line(v.text.strip()))
+        cov = _fig_coverage(pg, drop, headings, body_size,
+                            pitch=(ladder_pitch if use_ladder else None),
+                            head=body_top + body_size * FIG_LADDER_HEAD,
+                            long_min=((body_bottom - body_top)
+                                      * FIG_LADDER_LONG),
+                            dense=area_txt >= area_body * FIG_TEXT_DENSE)
+        free = _fig_free_rects(cov, bl, br, body_top, body_bottom, body_size,
+                               multi_level=bool(horizontal))
         marg = _fig_walls(pg, drop, headings, bl, br,
                           body_top, body_bottom)
         page_rect = doc[pg.num].rect
@@ -3357,7 +4112,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                   image_pages=None, horizontal=False,
                   chapter_marks=None, body_end=None, pillar_chapters=None,
                   heading_pages_out=None, toc_pages=None,
-                  front_pages=None, inline_figures=None,
+                  front_pages=None, inline_figures=None, chapters_win=False,
                   lost_cols=None, blank_lines=True, bouten=True):
     """全ページから青空文庫形式の本文を組み立てる。
     image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
@@ -3394,6 +4149,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
     inline_figures = inline_figures or {}
     chapter_marks = chapter_marks or {}
     pillar_chapters = pillar_chapters or {}
+    # 印刷目次から決めた章は**確定情報**なので、そのページに既存経路の
+    # 見出しがあっても優先する（柱ランは「補完」なので従来どおり譲る）
     toc_pages = set(toc_pages or ())
     front_pages = set(front_pages or ())
     emitted_images = set()   # 図タグを出したページ（横書きの帯分割対策）
@@ -3575,13 +4332,28 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                             v.size >= body_size * HEADING_SHORT_SIZE_RATIO and
                             2 <= len(v.cells) <= 3 and
                             matches_hashira(text, exact=True))
-            is_big = (v.size >= body_size * HEADING_SIZE_RATIO and
+            # **横書きの見出しは縦組みの慣行を3つとも満たさない**
+            # （DESIGN_横書き章立て.md §3）。図解・気象学入門 p12 の
+            # 節見出し `雲が空に浮かんでいられるわけ`(35.4pt・本文の2.9倍) は
+            # (1)左揃えなので字下げが無く (2)版面の82%まで達し、
+            # 小見出し `雲はなぜ地上に落ちてこないのか？`(17.8pt) は
+            # (3)末尾が `？` で、3条件すべてに引っかかって本文に落ちていた。
+            # 縦組みの根拠（字下げ＝章見出しの組版、行長・末尾約物＝段落末尾の
+            # 断片除け）は横書きには当てはまらないので、横書きだけ緩める。
+            # 実測の見出し候補数: 気象学 46→204、ファンタジー事典 277→360、
+            # 30秒DS 62→78、現代暗号入門 46→60
+            len_max = HEADING_LEN_MAX_H if horizontal else 0.7
+            tail_bad = "。」！、）』…" if horizontal else "。」！？、）』…"
+            # **横書きは行の max サイズで見てはならない**（_line_text_size）。
+            # 飾りタイルが混ざると図のキャプションが見出しに化ける
+            h_size = _line_text_size(v) if horizontal else v.size
+            is_big = (h_size >= body_size * HEADING_SIZE_RATIO and
                       len(v.cells) <= HEADING_MAX_LEN and
-                      (v.y1 - v.y0) < loc_height * 0.7 and
-                      indented and
+                      (v.y1 - v.y0) < loc_height * len_max and
+                      (indented or horizontal) and
                       (len(v.cells) >= 4 or short_titled or
                        (not horizontal and n_textlines <= 3)) and
-                      text[-1] not in "。」！？、）』…")
+                      text[-1] not in tail_bad)
             # 章見出しは通常の段落字下げ（1字）より深く下がっている
             deep_indented = v.y0 > loc_top + body_size * 1.5
             # ページ右端の行のみ。判定には章頭マーカーを含む列の並び
@@ -3592,7 +4364,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                                deep_indented and
                                v is kept_v[0])
             if is_big or is_hashira_head:
-                heading_lines.append((-v.xc, v.text))
+                heading_lines.append((-v.xc, v.text, v))
             else:
                 body_lines.append(v)
 
@@ -3607,23 +4379,44 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                 if txt:
                     h_headings.append((h.yc, txt))
 
+        heading_lines.sort(key=lambda it: it[0])
         page_headings = ([t for _, t in sorted(h_headings)] +
-                         [t for _, t in sorted(heading_lines)])
+                         [t for _, t, _v in heading_lines])
         if horizontal:
-            # 飾り囲み（口標本抽出□）を剥がしてから有効性判定する。
-            # 剥がさないと漢字のみの章題が「かな無し＋記号あり」でジャンク
-            # 扱いされ、囲み付き見出しが丸ごと落ちる
-            page_headings = [_strip_heading_ornaments(t) for t in page_headings]
-            # 図版OCRノイズの署名を持つ見出しを拒否
-            page_headings = [t for t in page_headings
-                             if not _H_NOISE_RE.search(t)]
-            # 純漢字の見出し（標本抽出・相関・平均回帰）は実用書で頻出する
-            # ため、かな必須の縦書きルールを緩めて2〜8字の漢字列を許可
-            # （1字は図版の飾り文字ノイズが多いため除外）
-            page_headings = [t for t in page_headings
-                             if valid_heading_item(t) or
-                             (2 <= len(t) <= 8 and
-                              re.fullmatch(r'[㐀-鿿々]+', t))]
+            # **横書きは見出しをページ先頭にまとめて出してはならない。**
+            # 縦組みで `　` 連結しているのは、章題が2行に割れる組版のため。
+            # 横書きの本は1ページに節見出し（h3）と小見出し（h4）が別々の
+            # 位置で立つので、まとめると本文の順序が壊れ、階層も潰れる
+            # （図解・気象学入門 p12 が「趾雲が空に浮かんでいられるわけ　
+            # ぺ雲はなぜ地上に落ちてこないのか？」という1個の見出しになる）。
+            # 章頭マーカー（page_marks）と同じ読み順の発行に載せる
+            # **図の矩形に含まれる行を落としてはならない**（試して撤回）。
+            # 節見出しは飾りタイル（`1-1` の黒タイル）と罫線を持つので
+            # 見出しの帯そのものが「図」として検出される（図解・気象学入門
+            # p12 の r364-30-442-278 は中身が見出し2本だけ）。落とすと
+            # **本物の節見出しが nav からも本文からも消える**。
+            # 図のキャプションは `_line_text_size` が地の活字で見るので
+            # ここで落とさなくても見出しにならない
+            items = []
+            for key, t, v in heading_lines:
+                # 飾り囲み（口標本抽出□）を剥がしてから有効性判定する。
+                # 剥がさないと漢字のみの章題が「かな無し＋記号あり」で
+                # ジャンク扱いされ、囲み付き見出しが丸ごと落ちる
+                t = _strip_heading_ornaments(t)
+                t = _strip_leading_noise(t)
+                # 図版OCRノイズの署名を持つ見出しを拒否
+                if _H_NOISE_RE.search(t):
+                    continue
+                # 純漢字の見出し（標本抽出・相関・平均回帰）は実用書で
+                # 頻出するため、かな必須の縦書きルールを緩めて2〜8字の
+                # 漢字列を許可（1字は図版の飾り文字ノイズが多いので除外）
+                if not (valid_heading_item(t) or
+                        (2 <= len(t) <= 8 and re.fullmatch(r'[㐀-鿿々]+', t))):
+                    continue
+                items.append((key, t))
+            page_headings = []
+            page_marks.extend(items)
+            page_marks.sort(key=lambda it: it[0])
         else:
             # **柱と同文なら純漢字でも見出しとして認める**（三国志（五）の
             # 荊州往来・文武競春・一掴三城・酔計二花・南風北春。かな必須の
@@ -3672,10 +4465,10 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         # 柱ランが章頭と決めたページに既存経路の見出しが無ければ補う。
         # 既存の見出しがあるページでは何もしない＝二重発行しない
         # （推理カルテのエピローグは is_hashira_head が拾うのでここは不発火）
-        if (pg.num in pillar_chapters and not page_headings
-                and not page_marks
+        if (pg.num in pillar_chapters
+                and (chapters_win or (not page_headings and not page_marks))
                 and not (body_end is not None and pg.num > body_end)):
-            page_headings = [pillar_chapters[pg.num]]
+            page_headings = [pillar_chapters[pg.num]] + page_headings
 
         # ── 画像ページ（挿絵・口絵・章頭）: 図タグを改ページに挟んで挿入 ──
         # 章頭ページの見出しテキストは目次のため先に発行する
@@ -3715,7 +4508,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                         break
             # 中扉のOCRが純ジャンクな本（推理カルテ）はページ内に手掛かりが
             # 無い。柱ランが決めた章題をここで補う（DESIGN_柱ラン章立て.md §2.9）
-            if not kept and not dense and pg.num in pillar_chapters:
+            if pg.num in pillar_chapters and (chapters_win or not kept) \
+                    and not dense:
                 kept = [pillar_chapters[pg.num]]
             if kept:
                 emit_heading("　".join(kept))
@@ -4126,7 +4920,8 @@ def _toc_entry_of_line(line):
 
 def refine_headings_with_toc(body, book_title, hashira_keys=None,
                              author=None, verbose=False,
-                             toc_entries=None, toc_page_count=0):
+                             toc_entries=None, toc_page_count=0,
+                             renumber=True):
     """紙の目次ページと本文見出しを突き合わせて見出しを精錬した本文と
     処理統計を返す。目次ページが見つからない本でも章番号の内挿だけは行う。
 
@@ -4178,7 +4973,7 @@ def refine_headings_with_toc(body, book_title, hashira_keys=None,
         toc_spans, toc_entries = _find_toc_spans(out, heads, head_set,
                                                  titles_norm)
         if not toc_spans:
-            n = _renumber_headings(out, heads, {})
+            n = _renumber_headings(out, heads, {}) if renumber else 0
             if n:
                 stats["章番号再構成"] = n
             return "\n".join(out), stats
@@ -4187,7 +4982,7 @@ def refine_headings_with_toc(body, book_title, hashira_keys=None,
     # ── 2. 見出し⇔エントリの対応付け（スコア降順の貪欲マッチ）──
     return _refine_with_entries(out, heads, head_set, head_title, stats,
                                 toc_spans, toc_entries, hashira_keys,
-                                book_title, author)
+                                book_title, author, renumber=renumber)
 
 
 def _find_toc_spans(out, heads, head_set, titles_norm):
@@ -4245,7 +5040,7 @@ def _find_toc_spans(out, heads, head_set, titles_norm):
 
 def _refine_with_entries(out, heads, head_set, head_title, stats,
                          toc_spans, toc_entries, hashira_keys,
-                         book_title, author):
+                         book_title, author, renumber=True):
     """目次エントリを辞書に見出しを精錬する（refine_headings_with_toc の後半）。"""
     # ── 2. 見出し⇔エントリの対応付け（スコア降順の貪欲マッチ）──
     cands = []
@@ -4542,10 +5337,11 @@ def _refine_with_entries(out, heads, head_set, head_title, stats,
     # ── 4. 章番号の再構成＋修復章題の反映 ──
     keep_heads = [i for i in heads
                   if i not in demote and i not in collapse_idx and i not in rep_fix]
-    n_renum = _renumber_headings(out, keep_heads, info,
-                                 breaks=[j for j, _, _ in recovered])
+    n_renum = _renumber_headings(
+        out, keep_heads, info,
+        breaks=[j for j, _, _ in recovered], numbers=renumber)
     if n_renum:
-        stats["章番号再構成"] = n_renum
+        stats["章番号再構成" if renumber else "章題反映"] = n_renum
 
     for idx in collapse_idx:
         _collapse_heading_block(out, idx)
@@ -4588,7 +5384,7 @@ def _refine_with_entries(out, heads, head_set, head_title, stats,
     return "\n".join(cleaned), stats
 
 
-def _renumber_headings(out, head_idx, info, breaks=()):
+def _renumber_headings(out, head_idx, info, breaks=(), numbers=True):
     """見出しの章番号を連番で再構成し、修復済み章題も反映する
     （outをインプレースで書き換え、変更した見出し数を返す）。
     info が空の場合（目次なし）は見出し行から番号だけ解析して内挿する。
@@ -4624,6 +5420,25 @@ def _renumber_headings(out, head_idx, info, breaks=()):
                       or _CHAPTER_HEAD_RE.match(rest)
                       or (num is not None and not rest))
         chapters.append([i, rest, num, fmt, evidence, toc_ok, no_num, virtual])
+
+    if not numbers:
+        # **題の修復だけを行うモード。** 印刷目次から章を立てた本では
+        # 章番号は目次側で確定しているので、通し番号の内挿（章が数百ある
+        # 横書きの図解書では当てどころが無い）は行わず、目次辞書で直った
+        # 章題だけを反映する
+        n_changed = 0
+        for i, rest, num0, fmt, evidence, toc_ok, no_num, virtual in chapters:
+            if virtual or not toc_ok or not rest:
+                continue
+            m = _MIDASHI_LINE_RE.match(out[i])
+            if not m:
+                continue
+            mnum = _LEADNUM_RE.match(m.group(1))
+            new_title = ((mnum.group(0) + rest).strip("　 ")
+                         if mnum else rest.strip("　 "))
+            if _replace_heading(out, i, new_title):
+                n_changed += 1
+        return n_changed
 
     anchors = []    # (chapters内位置, 番号)
     for pos, c in enumerate(chapters):
@@ -8129,6 +8944,22 @@ def _group_section_episodes(episodes: list) -> None:
     is_num = [bool(_SECTION_NUM_RE.fullmatch(_norm_t(ep["title"])))
               for ep in episodes]
     if not any(is_num):
+        # **章題が `第N章 …` の形で並ぶ本**（横書きの図解書。印刷目次から
+        # 章を立てた場合）は、節も小見出しも題を持つので上の「裸の番号」判定に
+        # 掛からない。章が3つ以上あり、その下に題つきの節が並ぶなら、
+        # 節を章にぶら下げる（図解・気象学入門は nav 141 項目がフラットに
+        # 並んでいた。公式 nav は章7つだけ）
+        chaps = [i for i, ep in enumerate(episodes)
+                 if _CHAPTER_TITLE_RE.match(_norm_t(ep["title"]))]
+        if len(chaps) < 3 or len(episodes) - len(chaps) < len(chaps):
+            return
+        chapter = None
+        for i, ep in enumerate(episodes):
+            if i in set(chaps):
+                chapter = ep
+                ep["group"] = ep["title"]
+            elif chapter is not None:
+                ep["group"] = chapter["title"]
         return
     chapter = None
     for ep, num in zip(episodes, is_num):
@@ -8144,6 +8975,8 @@ def _group_section_episodes(episodes: list) -> None:
 
 # 自動採番のエピソード名（本文側に見出しが無いときの仮題）
 _AUTO_EP_TITLE_RE = re.compile(r'第\d+話')
+# 章題の形（`第1章 雲のしくみ`）。nav の2階層化の親を決めるのに使う
+_CHAPTER_TITLE_RE = re.compile(r'第[0-9０-９一二三四五六七八九十]{1,3}章')
 
 
 def _frontmatter_title(body: str) -> str:
@@ -8354,7 +9187,8 @@ def run_from_text(args, doc, npages):
                     images_data[fname] = f.read()
             elif sm and all(1 <= int(g) <= npages for g in sm.groups()):
                 images_data[fname] = render_image_spread(
-                    doc, int(sm.group(1)) - 1, int(sm.group(2)) - 1)
+                    doc, int(sm.group(1)) - 1, int(sm.group(2)) - 1,
+                    dpi=args.figure_dpi)
                 rerendered += 1
             elif pm and 1 <= int(pm.group(1)) <= npages:
                 pnum = int(pm.group(1)) - 1
@@ -8364,7 +9198,8 @@ def run_from_text(args, doc, npages):
                         doc, pnum, rect, dpi=args.figure_dpi,
                         horizontal=args.horizontal)
                 else:
-                    images_data[fname] = render_image_page(doc, pnum)
+                    images_data[fname] = render_image_page(
+                        doc, pnum, dpi=args.figure_dpi)
                 rerendered += 1
             else:
                 print(f"警告: 画像が見つかりません: {fname}", file=sys.stderr)
@@ -8442,9 +9277,16 @@ def main():
                          "見出し化を抑止する処理を行わない")
     ap.add_argument("--no-images", action="store_true",
                     help="挿絵・口絵・章頭ページの画像ページ化を行わない")
+    ap.add_argument("--orientation", choices=("auto", "vertical", "horizontal"),
+                    default="auto",
+                    help="書字方向（既定 auto＝自動判別。"
+                         "確証があるときだけ横書きを適用し、迷えば縦書き）")
     ap.add_argument("--horizontal", action="store_true",
                     help="横書きの本として解析し、ePubも横書きで生成する"
-                         "（既定は縦書き。段組は左揃え2〜4段まで自動分割）")
+                         "（--orientation horizontal と同じ。"
+                         "段組は左揃え2〜4段まで自動分割）")
+    ap.add_argument("--vertical", action="store_true",
+                    help="縦書きの本として解析する（自動判別を切る）")
     ap.add_argument("--no-epub", action="store_true",
                     help="ePubを生成せず青空文庫形式テキストだけを出力する")
     # v1.11.0 まで「ePubも生成する」フラグだった。v2.0.0 で既定になったが、
@@ -8471,9 +9313,11 @@ def main():
                     help="底本の空行（段落のあいだの列アキ）を反映しない")
     ap.add_argument("--no-bouten", action="store_true",
                     help="傍点（圏点）を検出しない")
-    ap.add_argument("--figure-dpi", type=int, default=FIG_RENDER_DPI,
+    ap.add_argument("--figure-dpi", type=int, default=None,
                     metavar="N",
-                    help=f"本文中の図のレンダリング解像度（既定 {FIG_RENDER_DPI}）")
+                    help=f"本文中の図・画像ページのレンダリング解像度"
+                         f"（既定 {FIG_RENDER_DPI}、--horizontal では"
+                         f" {FIG_RENDER_DPI_H}）")
     ap.add_argument("--no-front-image", action="store_true",
                     help="巻頭の扉・口絵・目次・地図・献辞をそのままの画像として"
                          "残す処理を行わない（v1.11.0 と同じ扱いになる）")
@@ -8491,6 +9335,17 @@ def main():
 
     doc = fitz.open(args.pdf)
     npages = len(doc)
+
+    # **書字方向は --from-text と --figure-dpi の既定より前に決める。**
+    # 後ろに置くと (1) 校正済みテキストからの再生成が縦書きに落ちる
+    # (2) 横書きの図の解像度が既定の 144dpi のままになる
+    page_nums = parse_pages_arg(args.pages, npages)
+    if args.cover_page > 0:
+        page_nums = [i for i in page_nums if i != args.cover_page - 1]
+    _resolve_orientation(args, doc, page_nums)
+    if args.figure_dpi is None:
+        args.figure_dpi = (FIG_RENDER_DPI_H if args.horizontal
+                           else FIG_RENDER_DPI)
 
     if args.from_text:
         run_from_text(args, doc, npages)
@@ -8511,25 +9366,6 @@ def main():
         sys.exit(1)
     print(f"本文フォントサイズ: {body_size:.1f}pt  対象 {len(page_nums)}/{npages} ページ")
 
-    # 書字方向の自動判別ヒント（複数文字スパンの縦横アスペクト票）。
-    # 1文字1スパンの旧OCRでは票が集まらず判定不能のため警告のみで、
-    # 自動切替はしない（誤判定は全損につながる）。
-    # **票が本文を代表していなければ黙る**: 1文字1スパンのPDFでは縦書きの
-    # 票が0になり、柱・ノンブルの横書きスパンだけが票を持つので、
-    # 縦書きの本に「横書きの可能性があります」と出てしまう
-    # （再OCR済みPDF3冊・黒牢城vision・グリック2013で実測）。
-    # --horizontal を付けると全損なので、誤警告は実害がある
-    v_ch, h_ch, n_ch = count_orientation_chars(doc, sample[:40])
-    if v_ch + h_ch < n_ch * ORIENT_VOTE_MIN_RATIO:
-        pass                     # 判定不能（1文字1スパン）→ 警告しない
-    elif not args.horizontal and h_ch > v_ch * 2 and h_ch >= 200:
-        print(f"警告: 横書きの本の可能性があります（向き票: 横 {h_ch} / "
-              f"縦 {v_ch} 文字）。--horizontal の指定を検討してください",
-              file=sys.stderr)
-    elif args.horizontal and v_ch > h_ch * 2 and v_ch >= 200:
-        print(f"警告: 縦書きの本の可能性があります（向き票: 縦 {v_ch} / "
-              f"横 {h_ch} 文字）。--horizontal なしの実行を検討してください",
-              file=sys.stderr)
 
     if args.inspect:
         for s in args.inspect.split(","):
@@ -8601,7 +9437,8 @@ def main():
     front_only = set()    # 巻頭の窓で新たに画像化したページ
     if not args.no_images:
         if not args.no_front_image:
-            toc_page_map = detect_toc_pages(pages, drop)
+            toc_page_map = detect_toc_pages(pages, drop,
+                                            horizontal=args.horizontal)
         img_nums = classify_image_pages(
             doc, pages, drop, front_image=not args.no_front_image,
             front_out=front_only)
@@ -8633,7 +9470,8 @@ def main():
                                              horizontal=args.horizontal))
         for first, (left, right) in spreads.items():
             fname = spread_filename(left, right)
-            images_data[fname] = render_image_spread(doc, left, right)
+            images_data[fname] = render_image_spread(doc, left, right,
+                                                     dpi=args.figure_dpi)
             image_page_map[first] = fname
             spread_skip.add(first + 1)
         if spreads:
@@ -8644,7 +9482,8 @@ def main():
             if pnum in image_page_map or pnum in spread_skip:
                 continue
             fname = f"p{pnum + 1:04d}.jpg"
-            images_data[fname] = render_image_page(doc, pnum)
+            images_data[fname] = render_image_page(doc, pnum,
+                                                  dpi=args.figure_dpi)
             image_page_map[pnum] = fname
         by_num = {pg.num: pg for pg in pages}
         n_cap = 0
@@ -8692,17 +9531,30 @@ def main():
 
     # 柱ランによる章境界（DESIGN_柱ラン章立て.md）。章頭ページの算出に
     # 画像ページ（中扉）を使うので、画像ページ検出の後に行う
-    pillar_runs = {} if args.no_chapter_marks else detect_pillar_runs(
-        pages, drop, body_size, image_pages=set(image_page_map),
-        title=title, author=author, body_end=body_end,
-        horizontal=args.horizontal,
-        no_head_pages=front_dense | set(toc_page_map))
+    # 横書きの印刷目次から章の位置と題を決める（DESIGN_横書き章立て.md §2.4）。
+    # **目次が使えた本では柱ランを発火させない**（§5）＝どちらも章の位置を
+    # 決めるので、1ページずれると章が二重になる
+    toc_chapters = {}
+    if args.horizontal and not args.no_chapter_marks and toc_page_map:
+        toc_chapters = detect_toc_chapters_h(
+            pages, drop, body_size, set(toc_page_map), set(image_page_map))
+        if toc_chapters:
+            print(f"印刷目次から章境界: {len(toc_chapters)} 件 "
+                  + "/".join(f"p{p + 1} {t}"
+                             for p, t in sorted(toc_chapters.items()))[:120])
+    pillar_runs = {} if (args.no_chapter_marks or toc_chapters) \
+        else detect_pillar_runs(
+            pages, drop, body_size, image_pages=set(image_page_map),
+            title=title, author=author, body_end=body_end,
+            horizontal=args.horizontal,
+            no_head_pages=front_dense | set(toc_page_map))
     # 章頭が全面挿絵で柱が書名の本（ぼくがぼくであること）は柱ランが
     # 不発火する。画像ページの等間隔性で拾う（DESIGN_柱ラン章立て.md §4）
-    image_chapters = {} if (args.no_chapter_marks or pillar_runs) else \
+    image_chapters = {} if (args.no_chapter_marks or pillar_runs
+                            or toc_chapters) else \
         detect_image_chapters(pages, drop, set(image_page_map), body_end)
 
-    pillar_chapters = {}
+    pillar_chapters = dict(toc_chapters)
     if pillar_runs or image_chapters:
         # 1パス目は柱ラン無しで組み、既存経路が見出しを出したページを集める。
         # 同じ章境界を既に拾っている本（ほんもの・グリック）で二重にしない
@@ -8760,6 +9612,7 @@ def main():
                          horizontal=args.horizontal,
                          chapter_marks=chapter_marks, body_end=body_end,
                          pillar_chapters=pillar_chapters,
+                         chapters_win=bool(toc_chapters),
                          toc_pages=set(toc_page_map), front_pages=front_only,
                          inline_figures=inline_figure_map,
                          lost_cols=lost_cols,
@@ -8771,9 +9624,16 @@ def main():
         # detect_toc_pages の結果から渡す（DESIGN_v2.0.md §3.8）
         toc_entries = [e for p in sorted(toc_page_map)
                        for e in toc_page_map[p]]
+        # **印刷目次から章を立てた本では章番号を再構成しない。**
+        # `_renumber_headings` は「見出し＝章」で通し番号を内挿する仕組みで、
+        # 節・小見出しが数百並ぶ横書きの図解書では番号の当てどころが無く、
+        # 節見出しに勝手な番号を付ける（`４ 気圧の差は何によってできるか`・
+        # `５ ～00h`）うえ、正しく付いていた `第5章` を押しのける。
+        # 章番号は目次側で確定しているので触らせない
         body, toc_stats = refine_headings_with_toc(
             body, title, hashira_keys, author=author, verbose=args.verbose,
-            toc_entries=toc_entries, toc_page_count=len(toc_page_map))
+            toc_entries=toc_entries, toc_page_count=len(toc_page_map),
+            renumber=not toc_chapters)
         if toc_stats:
             detail = " / ".join(f"{k} {v}" for k, v in toc_stats.items())
             print(f"目次照合: {detail}")

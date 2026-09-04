@@ -145,10 +145,65 @@ _NEVER_RUBY = set("、。，．・：；！？「」『』（）〔〕｛｝〈�
                   "…‥―—‐“”‘’〝〟゛゜´｀¨〜～※＊■□●○◎▲△▼▽")
 
 
-def _is_ruby_symbol(text, rect, ruby_threshold):
-    """このシンボルをルビとして書き戻すか（幅判定＋約物・半角英数の除外）"""
+# ── 書字方向の抽象化（DESIGN_NDLOCR横書き.md §2.1）──────────────
+#
+# 書き戻し系は4エンジン（vision / docai / yomitoku / ndlocr）で共有して
+# いるので、軸に依存する量は**ここ1か所**で抽象化する。
+# `vertical=True` を既定にしてあるので、**縦組みの出力は定義上バイト一致**
+# になる（これが受け入れ基準1を満たす唯一の作り方）。
+#
+#   main  : 行が伸びる方向（縦組み=y、横組み=x）
+#   cross : 行が積まれる方向（縦組み=x、横組み=y）
+#
+# 文字サイズの基準になるのは **cross 方向の長さ**（縦組みの列幅＝横組みの
+# 行高）で、ルビ判定・書き戻しサイズ・キャリブレーションが全部これを見る。
+
+
+class Axis:
+    """書字方向。vertical=True なら縦組み（従来）。"""
+
+    __slots__ = ("vertical",)
+
+    def __init__(self, vertical=True):
+        self.vertical = vertical
+
+    def size(self, rect):
+        """文字サイズの基準になる長さ（縦組み=列幅、横組み=行高）。"""
+        return rect.width if self.vertical else rect.height
+
+    def extent(self, rect):
+        """行方向の長さ（縦組み=高さ、横組み=幅）。"""
+        return rect.height if self.vertical else rect.width
+
+    def cross(self, rect):
+        """cross 方向の中心。同じ列／行かの判定に使う。"""
+        return ((rect.x0 + rect.x1) / 2 if self.vertical
+                else (rect.y0 + rect.y1) / 2)
+
+    def cross_lo(self, rect):
+        return rect.x0 if self.vertical else rect.y0
+
+    def cross_hi(self, rect):
+        return rect.x1 if self.vertical else rect.y1
+
+    def main_lo(self, rect):
+        """行方向の開始位置（縦組み=y0、横組み=x0）。"""
+        return rect.y0 if self.vertical else rect.x0
+
+    def set_cross(self, rect, lo, hi):
+        """cross 方向の範囲だけ差し替えた Rect。"""
+        return (fitz.Rect(lo, rect.y0, hi, rect.y1) if self.vertical
+                else fitz.Rect(rect.x0, lo, rect.x1, hi))
+
+
+VERTICAL = Axis(True)
+HORIZONTAL = Axis(False)
+
+
+def _is_ruby_symbol(text, rect, ruby_threshold, axis=VERTICAL):
+    """このシンボルをルビとして書き戻すか（太さ判定＋約物・半角英数の除外）"""
     return (not text.isascii() and text not in _NEVER_RUBY
-            and rect.width < ruby_threshold)
+            and axis.size(rect) < ruby_threshold)
 
 # 一時的なAPIエラーのリトライ回数・待機秒（指数バックオフ）
 MAX_RETRIES = 4
@@ -540,6 +595,7 @@ def collect_page_symbols(annotation, page, img_size):
 # 乗るジッター（実測0.1〜0.5pt程度）を「同一列」とみなして無視する許容量。
 # 本文の列間隔（実測8〜14pt程度）よりは十分小さく、観測されたジッターよりは
 # 十分大きい値
+
 COLUMN_SNAP_TOLERANCE = 3.0
 
 # 二重検出とみなす座標差（pt）。DocAIで常用していたが、Visionも装飾的な
@@ -568,7 +624,7 @@ def _dedup_symbols(symbols):
     return kept
 
 
-def _snap_column_x(symbols):
+def _snap_column_x(symbols, axis=VERTICAL):
     """同一列が複数ブロックに分かれることで生じるX座標のジッターを、直前の
     列と同じ値に丸めて消す。
 
@@ -596,16 +652,17 @@ def _snap_column_x(symbols):
     含めず通常どおりスナップに参加させる（除外すると単独の孤立した記号として
     列からはみ出してしまう）"""
     result = []
-    col_x0 = col_x1 = None
+    col_lo = col_hi = None
     for text, rect in symbols:
         if text.isascii() and text not in _FULLWIDTH_PUNCT:
             result.append((text, rect))
             continue
-        xc = (rect.x0 + rect.x1) / 2
-        if col_x0 is not None and abs(xc - (col_x0 + col_x1) / 2) < COLUMN_SNAP_TOLERANCE:
-            rect = fitz.Rect(col_x0, rect.y0, col_x1, rect.y1)
+        c = axis.cross(rect)
+        if col_lo is not None and abs(c - (col_lo + col_hi) / 2) \
+                < COLUMN_SNAP_TOLERANCE:
+            rect = axis.set_cross(rect, col_lo, col_hi)
         else:
-            col_x0, col_x1 = rect.x0, rect.x1
+            col_lo, col_hi = axis.cross_lo(rect), axis.cross_hi(rect)
         result.append((text, rect))
     return result
 
@@ -697,14 +754,14 @@ def _collect_gap_groups(symbols, old_rubies, ruby_threshold, target_ruby_fontsiz
     return groups
 
 
-def _ruby_params(symbols, target_ruby_fontsize):
+def _ruby_params(symbols, target_ruby_fontsize, axis=VERTICAL):
     """ページのルビ判定しきい値と書き戻しルビフォントサイズを求める
     （insert_invisible_text と二段OCRのグループ収集が同条件を共有する）"""
-    local_body_width = statistics.median(rect.width for _, rect in symbols)
+    local_body_width = statistics.median(axis.size(rect) for _, rect in symbols)
     ruby_threshold = local_body_width * RUBY_WIDTH_RATIO
     ruby_widths = [
-        rect.width for text, rect in symbols
-        if _is_ruby_symbol(text, rect, ruby_threshold)
+        axis.size(rect) for text, rect in symbols
+        if _is_ruby_symbol(text, rect, ruby_threshold, axis)
     ]
     if ruby_widths:
         ruby_fontsize = min(statistics.median(ruby_widths), target_ruby_fontsize)
@@ -714,7 +771,8 @@ def _ruby_params(symbols, target_ruby_fontsize):
 
 
 def insert_invisible_text(
-    page, symbols, target_body_fontsize, target_ruby_fontsize, old_rubies=()
+    page, symbols, target_body_fontsize, target_ruby_fontsize, old_rubies=(),
+    axis=VERTICAL
 ):
     """文字（シンボル）単位で不可視テキストを挿入。縦書きは1文字ずつboxが
     積まれているため、word単位で横書き前提のinsert_textboxを使うと文字が
@@ -759,7 +817,8 @@ def insert_invisible_text(
     if not symbols:
         return 0, 0
 
-    ruby_threshold, ruby_fontsize = _ruby_params(symbols, target_ruby_fontsize)
+    ruby_threshold, ruby_fontsize = _ruby_params(symbols, target_ruby_fontsize,
+                                                 axis)
 
     gapfilled = (
         _gapfill_missing_rubies(symbols, old_rubies, ruby_threshold, ruby_fontsize)
@@ -777,16 +836,16 @@ def insert_invisible_text(
     cols = {}
     for text, rect in symbols:
         if not text.isascii():
-            cols.setdefault(rect.x0, []).append(rect)
+            cols.setdefault(axis.cross_lo(rect), []).append(rect)
     body_pitches = []
     for x0, rects in cols.items():
         if len(rects) < BIG_SIZE_MIN_CHARS:
             continue
-        ys = sorted(r.y0 for r in rects)
+        ys = sorted(axis.main_lo(r) for r in rects)
         diffs = [b - a for a, b in zip(ys, ys[1:]) if b - a > 0.5]
         if not diffs:
             continue
-        wmed = statistics.median(r.width for r in rects)
+        wmed = statistics.median(axis.size(r) for r in rects)
         if wmed < ruby_threshold:
             continue  # ルビ列はピッチ基準にも拡大対象にもしない
         pitch = statistics.median(diffs)
@@ -799,11 +858,11 @@ def insert_invisible_text(
                 big_scale_by_x[x0] = min(pitch / page_pitch, BIG_SIZE_MAX_SCALE)
 
     for text, rect in symbols:
-        is_ruby = _is_ruby_symbol(text, rect, ruby_threshold)
+        is_ruby = _is_ruby_symbol(text, rect, ruby_threshold, axis)
         text = _FULLWIDTH_PUNCT.get(text, text)
         fontsize = ruby_fontsize if is_ruby else target_body_fontsize
-        if not is_ruby and rect.x0 in big_scale_by_x:
-            fontsize = target_body_fontsize * big_scale_by_x[rect.x0]
+        if not is_ruby and axis.cross_lo(rect) in big_scale_by_x:
+            fontsize = target_body_fontsize * big_scale_by_x[axis.cross_lo(rect)]
         # 挿入基準はベースライン指定だが、描画bboxの「上端」がVision実測の
         # 字面上端(rect.y0)に一致するようベースラインを置く
         # （baseline = y0 + ascender×fontsize。fontname="japan"のascenderは

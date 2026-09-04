@@ -166,10 +166,20 @@ def load_got(path):
     return _split_ruby(s)
 
 
+# ルビの読みの長さの上限。**上限を付けないと本文が丸ごと消える**:
+# OCRノイズが作った迷子の `《` と、はるか先にある別の `》` が対応してしまい、
+# あいだの数万字が「ルビ」として削られる。実測（図解・気象学入門の出力は
+# `《`14個・`》`12個）: 141,597字 → 93,096字 に削られ、
+# **本文再現率が 63.63%（正しくは 97.68%）**と出た。図版・罫線の多い本ほど
+# 強く出る（`《` は罫線・記号の化けの定番）。ルビの読みが30字を超えることは
+# 実際の本では無い（最長の実測は12字）。
+RUBY_READING_MAX = 30
+
+
 def _split_ruby(s):
     pairs = [(norm(a), norm(b)) for a, b in RUBY_PAIR.findall(s)]
     s = RUBY_PAIR.sub(lambda m: m.group(1), s)
-    s = re.sub(r"《[^《》]*》|[｜|]", "", s)
+    s = re.sub(r"《[^《》]{0,%d}》|[｜|]" % RUBY_READING_MAX, "", s)
     return norm(s), pairs
 
 

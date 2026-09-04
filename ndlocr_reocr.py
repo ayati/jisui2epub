@@ -39,6 +39,8 @@ import fitz  # PyMuPDF
 from jisui2epub import detect_body_size
 from vision_reocr import (
     CHECKPOINT_EVERY,
+    HORIZONTAL,
+    VERTICAL,
     _FULLWIDTH_PUNCT,
     _atomic_save,
     _dedup_symbols,
@@ -236,11 +238,55 @@ INK_WIDTH_RATIO = 1.0
 # 重複検出で横に伸びた箱のセル幅が上限に張り付いて 0.95 の判定境界まで
 # 0.4pt しか残らない（百億 p27 で実測）。原本の柱は 9.5/12.5＝0.76 なので
 # この帯にそのまま収まる。
+# **見出し（line_title）は本文より大きいサイズで書き戻す。**
+# NDLOCR は見出しを `line_title` として分類して返してくるので、柱・ノンブルを
+# 小さく書き戻す `insert_margin_text` と対称に、原本の「見出しは大きい活字」
+# という情報を復元する。**これが無いと jisui2epub の `is_big`（本文比1.18）が
+# 発火せず、章立てが丸ごと消える**（図解・気象学入門で中見出し 140→52、
+# GOAL の見出し照合 73.1%→15.2%）。
+#
+# **検出箱の高さをそのまま使ってはならない。** この本の小見出しは太字だが
+# 字の大きさは本文とほぼ同じで、箱の高さは 39px 対 本文 36px＝1.08倍しかない
+# （ScanSnap の 17.8pt 申告のほうが誇張だった）。印刷に忠実な NDLOCR の箱では
+# **サイズ比で見出しを分けられない**ので、クラスを信じて一律で持ち上げる
+TITLE_FONT_RATIO = 1.25
+TITLE_CLASSES = ("line_title",)
 MARGIN_FONT_MIN_RATIO = 0.75
 MARGIN_FONT_MAX_RATIO = 0.85
 
 CALIBRATION_MAX_PAGES = 15
 CALIBRATION_TARGET_CHARS = 800
+
+# 書字方向（DESIGN_NDLOCR横書き.md §3）。"auto" はページごとに行の縦横比の
+# 多数決で決める。**ドキュメント単位で決め打ちしてはならない**＝横書きの本にも
+# 縦組みのページ（章扉の飾り・図版の中の縦書きラベル）が混じる
+AXIS_MODE = "auto"   # auto / vertical / horizontal
+
+
+def _page_vertical(lines):
+    """このページを縦組みとして扱うか（行の縦横比の多数決）。"""
+    if AXIS_MODE == "vertical":
+        return True
+    if AXIS_MODE == "horizontal":
+        return False
+    if not lines:
+        return True
+    n = sum(1 for ln in lines
+            if (ln["box"][3] - ln["box"][1]) >= (ln["box"][2] - ln["box"][0]))
+    return n >= len(lines) / 2
+
+
+def _main_rows(crop, vertical=True):
+    """行方向が「行（row）」になる向きに切片を置き直す。
+
+    インクの走査（`_count_ink_runs`・`_split_ruby_runs`）は縦組みを前提に
+    **y方向へ走る**ように書いてある。横組みは転置するだけで同じ論理が
+    そのまま使える（cross 方向＝転置後の列数も自動的に入れ替わる）。
+    """
+    if vertical:
+        return crop
+    return crop.transpose(1, 0, 2) if crop.ndim == 3 else crop.T
+
 
 _MODELS = {}   # 遅延ロードしたモデルを保持
 TRIM_STATS = [0]   # _trim_overlong_lines が切り詰めた行数（完了時に報告）
@@ -377,13 +423,14 @@ def _dedup_boxes(boxes):
     return kept
 
 
-def _count_ink_runs(crop):
+def _count_ink_runs(crop, vertical=True):
     """縦行のインク塊（＝実際に並んでいる字の数の下限）を数える。
 
     TRIM_INK_GAP 以上の連続空白で区切る。字の内部の切れ目で数え過ぎる
     ぶんには安全側（切り詰めない側）に倒れる。
     """
     cv2, np = _import_cv2()
+    crop = _main_rows(crop, vertical)
     g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
     ink_min = max(1, int(crop.shape[1] * RUBY_INK_MIN_FRAC))
     on = (g < RUBY_INK_LEVEL).sum(axis=1) >= ink_min
@@ -461,7 +508,7 @@ def _pick_single_char(crop, fallback):
     return fallback[0]
 
 
-def _trim_overlong_lines(lines, img):
+def _trim_overlong_lines(lines, img, vertical=True):
     """1文字の箱を2〜3文字と読んだ縦行を1文字に戻す（TRIM_PITCH_RATIO 参照）。
 
     「1文字ピッチが本文ピッチに対して小さすぎる」＋「行方向のインク塊が
@@ -471,14 +518,16 @@ def _trim_overlong_lines(lines, img):
     verts, pitches = [], []
     for ln in lines:
         x0, y0, x1, y1 = ln["box"]
-        if (y1 - y0) < (x1 - x0):
+        # **本文と直交する向きの行は対象外**（縦組みなら横行、横組みなら
+        # 縦行）。柱・ノンブルは半角数字が並ぶので本文ピッチと比較できない
+        if ((y1 - y0) < (x1 - x0)) == bool(vertical):
             continue
         chars = [c for c in ln["text"] if not c.isspace()]
         if not chars:
             continue
-        verts.append((ln, chars, y1 - y0))
+        verts.append((ln, chars, (y1 - y0) if vertical else (x1 - x0)))
         if len(chars) >= TRIM_BODY_MIN_CHARS:
-            pitches.append((y1 - y0) / len(chars))
+            pitches.append(verts[-1][2] / len(chars))
     if len(pitches) < TRIM_MIN_SAMPLES:
         return 0
     body = statistics.median(pitches)
@@ -497,7 +546,7 @@ def _trim_overlong_lines(lines, img):
         # 塊の数え落としで削ると仮名が消える（黒牢城のルビ `うかが` は
         # 塊2・3文字で、塊の数まで削ると `うか` になった）。直したいのは
         # 「1文字の箱を2文字と読んだ」場合だけなので、これで過不足ない
-        if _count_ink_runs(crop) != 1:
+        if _count_ink_runs(crop, vertical) != 1:
             continue
         ln["text"] = _pick_single_char(crop, "".join(chars))
         trimmed += 1
@@ -536,7 +585,7 @@ def _dash_run_length(gray, x0, x1, yc, pitch):
     return b - a + 1
 
 
-def _expand_dash_runs(lines, img):
+def _expand_dash_runs(lines, img, vertical=True):
     """1文字の「-」と読まれた2セル以上のダッシュを実測セル数に伸ばす。
 
     ページ本文ピッチは _trim_overlong_lines と同じ「箱の高さ÷字数」だが、
@@ -549,12 +598,12 @@ def _expand_dash_runs(lines, img):
         if ln["cls"] not in BODY_CLASSES:
             continue
         x0, y0, x1, y1 = ln["box"]
-        if (y1 - y0) < (x1 - x0):          # 横行は本文ピッチで測れない
-            continue
+        if ((y1 - y0) < (x1 - x0)) == bool(vertical):
+            continue                        # 本文と直交する行は尺が違う
         chars = [c for c in ln["text"] if not c.isspace()]
         if not chars:
             continue
-        pitch = (y1 - y0) / len(chars)
+        pitch = ((y1 - y0) if vertical else (x1 - x0)) / len(chars)
         if len(chars) >= TRIM_BODY_MIN_CHARS:
             pitches.extend([pitch] * (len(chars) - 1))
             samples += 1
@@ -564,10 +613,16 @@ def _expand_dash_runs(lines, img):
         return 0
     body = statistics.median(pitches)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    if not vertical:
+        # 横組みのダッシュは横棒。ページ全体を転置すれば
+        # `_dash_run_length` の「列の帯をy方向に走る」論理がそのまま効く
+        gray = gray.T
 
     fixed = 0
     for ln, chars, pitch in targets:
         x0, y0, x1, y1 = [int(v) for v in ln["box"]]
+        if not vertical:
+            x0, y0, x1, y1 = y0, x0, y1, x1
         out, i = [], 0
         while i < len(chars):
             if chars[i] != "-":
@@ -591,7 +646,7 @@ def _expand_dash_runs(lines, img):
     return fixed
 
 
-def _split_ruby_runs(crop):
+def _split_ruby_runs(crop, vertical=True):
     """縦書きルビ列を、行方向（Y）のインクの切れ目で語に分割する。
 
     ルビは「親語ごとのまとまり」で振られるので、箱をそのまま1語として
@@ -601,6 +656,7 @@ def _split_ruby_runs(crop):
     語間の余白に散るスキャンノイズで空白が分断され、語が結合する。
     """
     cv2, np = _import_cv2()
+    crop = _main_rows(crop, vertical)
     g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
     w = crop.shape[1]
     ink_min = max(1, int(w * RUBY_INK_MIN_FRAC))
@@ -688,13 +744,18 @@ def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
             continue
         lines.append({"cls": cls, "box": (x0, y0, x1, y1), "text": text})
 
+    # ページの書字方向は**本文の行だけ**で決める（ルビを足す前）。
+    # 柱・ノンブルは短くて向きの申告が当てにならない
+    vertical = _page_vertical([ln for ln in lines
+                               if ln["cls"] in BODY_CLASSES] or lines)
+
     # 1文字の箱を2文字と読む PARSEQ の癖を幾何で弾く（TRIM_PITCH_RATIO）。
     # ルビを足す前に済ませる（ルビ行はピッチの尺が違う）
-    TRIM_STATS[0] += _trim_overlong_lines(lines, img)
+    TRIM_STATS[0] += _trim_overlong_lines(lines, img, vertical)
 
     # 2セル以上のダッシュを実測して伸ばす（DASH_INK_MIN_PX の説明を参照）。
     # 切り詰めのあと・ルビを足す前に行う（ルビ行はピッチの尺が違う）
-    DASH_STATS[0] += _expand_dash_runs(lines, img)
+    DASH_STATS[0] += _expand_dash_runs(lines, img, vertical)
 
     # ルビは重複を潰してから語に切る（_dedup_boxes の説明を参照）。
     # 語ごとに切って読み、切片ごとに1行として積む。位置は実測なので
@@ -703,21 +764,35 @@ def ocr_page_with_ndlocr(doc, page_index, with_ruby=True):
         crop = img[y0:y1, x0:x1]
         if crop.size == 0:
             continue
-        # 幅は実インク相当に縮める（中心は保つ）。RUBY_INK_RATIO 参照
-        rxc = (x0 + x1) / 2
-        rhalf = (x1 - x0) * RUBY_INK_RATIO / 2
-        for a, b in _split_ruby_runs(crop):
-            txt = _read_ruby(crop[a:b + 1])
-            if txt:
-                lines.append({"cls": RUBY_CLASS, "text": txt,
-                              "box": (rxc - rhalf, y0 + a,
-                                      rxc + rhalf, y0 + b + 1)})
+        # cross 方向は実インク相当に縮める（中心は保つ）。RUBY_INK_RATIO 参照。
+        # 横組みのルビは親文字の**上**に付くが、jisui2epub の --horizontal は
+        # 座標を転置するので転置後は「親列の右」＝縦組みと同じ幾何に写る
+        # （DESIGN_NDLOCR横書き.md §2.3）。バックエンドは横組みのまま
+        # 小さい文字高さで書き戻すだけでよい
+        if vertical:
+            rxc = (x0 + x1) / 2
+            rhalf = (x1 - x0) * RUBY_INK_RATIO / 2
+            for a, b in _split_ruby_runs(crop, True):
+                txt = _read_ruby(crop[a:b + 1])
+                if txt:
+                    lines.append({"cls": RUBY_CLASS, "text": txt,
+                                  "box": (rxc - rhalf, y0 + a,
+                                          rxc + rhalf, y0 + b + 1)})
+        else:
+            ryc = (y0 + y1) / 2
+            rhalf = (y1 - y0) * RUBY_INK_RATIO / 2
+            for a, b in _split_ruby_runs(crop, False):
+                txt = _read_ruby(crop[:, a:b + 1])
+                if txt:
+                    lines.append({"cls": RUBY_CLASS, "text": txt,
+                                  "box": (x0 + a, ryc - rhalf,
+                                          x0 + b + 1, ryc + rhalf)})
     return lines, (w, h)
 
 
 # ── 行 → 文字セル ────────────────────────────────────────
 
-def expand_line_to_cells(text, box, sx, sy):
+def expand_line_to_cells(text, box, sx, sy, vertical=True):
     """行ボックスと行テキストを文字セル (text, Rect) に等分割で展開する。
 
     NDLOCR は Vision/DocAI と違い文字単位の座標を返さない（行単位の
@@ -738,12 +813,16 @@ def expand_line_to_cells(text, box, sx, sy):
     y0, y1 = y0 * sy, y1 * sy
 
     def cell(cx0, cy0, cx1, cy1):
-        """幅だけを実インク相当に縮めたセル。中心を保つので列X中心は不変"""
+        """cross 方向だけを実インク相当に縮めたセル。中心は保つ。"""
         if INK_WIDTH_RATIO >= 1.0:
             return fitz.Rect(cx0, cy0, cx1, cy1)
-        xc = (cx0 + cx1) / 2
-        half = (cx1 - cx0) * INK_WIDTH_RATIO / 2
-        return fitz.Rect(xc - half, cy0, xc + half, cy1)
+        if vertical:
+            xc = (cx0 + cx1) / 2
+            half = (cx1 - cx0) * INK_WIDTH_RATIO / 2
+            return fitz.Rect(xc - half, cy0, xc + half, cy1)
+        yc = (cy0 + cy1) / 2
+        half = (cy1 - cy0) * INK_WIDTH_RATIO / 2
+        return fitz.Rect(cx0, yc - half, cx1, yc + half)
 
     n = len(chars)
     if n == 1:
@@ -757,7 +836,8 @@ def expand_line_to_cells(text, box, sx, sy):
             for i, c in enumerate(chars)]
 
 
-def collect_page_symbols_ndlocr(lines, page, img_size, split_margin=False):
+def collect_page_symbols_ndlocr(lines, page, img_size, split_margin=False,
+                                vertical=None):
     """行リストを読み順（縦書きは右の列から）に並べて文字セル列にする。
 
     split_margin=True なら (本文セル, 柱・ノンブルのセル) に分けて返す。
@@ -773,45 +853,84 @@ def collect_page_symbols_ndlocr(lines, page, img_size, split_margin=False):
     """
     if not lines:
         return ([], []) if split_margin else []
+    if vertical is None:
+        vertical = _page_vertical(lines)
+    axis = VERTICAL if vertical else HORIZONTAL
     img_w, img_h = img_size
     sx = page.rect.width / img_w
     sy = page.rect.height / img_h
 
-    def is_vertical(ln):
+    def _thick(ln):
+        """行の太さ（cross 方向）。縦組み=幅、横組み=高さ。"""
         x0, y0, x1, y1 = ln["box"]
-        return (y1 - y0) >= (x1 - x0)
+        return (x1 - x0) if vertical else (y1 - y0)
 
     margin_lines = []
     if split_margin:
-        margin_lines = [ln for ln in lines if ln["cls"] in MARGIN_CLASSES]
-        lines = [ln for ln in lines if ln["cls"] not in MARGIN_CLASSES]
+        # **本文より太い箱は柱ではない。** 柱は本文より小さい活字で組まれる
+        # （原本で 9.5pt 対 12.5pt）ので検出箱も細い。DEIM は章の節見出しを
+        # `block_pillar` と誤分類することがあり（図解・気象学入門 p12 の
+        # `雲が空に浮かんでいられるわけ` は箱の太さ 43px 対 本文 36px）、
+        # そのまま 0.75〜0.85 倍で書き戻すと**見出しが本文より小さくなる**
+        # **縦組みには掛けない。** 実証できているのは横組みの本だけで、
+        # 縦組みの出力はバイト一致を保つ（受け入れ基準1）
+        body_th = ([_thick(ln) for ln in lines if ln["cls"] in BODY_CLASSES]
+                   if not vertical else [])
+        th_max = (statistics.median(body_th) * 1.05) if body_th else None
+        margin_lines = [ln for ln in lines if ln["cls"] in MARGIN_CLASSES
+                        and (th_max is None or _thick(ln) <= th_max)]
+        mid = {id(ln) for ln in margin_lines}
+        lines = [ln for ln in lines if id(ln) not in mid]
         if not lines:
-            return [], _cells_of(margin_lines, sx, sy)
+            return [], _cells_of(margin_lines, sx, sy, vertical), []
 
-    vertical = sum(1 for ln in lines if is_vertical(ln)) >= len(lines) / 2
     if vertical:
         lines = sorted(lines, key=lambda ln: -(ln["box"][0] + ln["box"][2]) / 2)
     else:
         lines = sorted(lines, key=lambda ln: (ln["box"][1] + ln["box"][3]) / 2)
 
+    # 見出しを大きく書き戻すのも**横組み限定**（同上）
+    title_lines = ([ln for ln in lines if ln["cls"] in TITLE_CLASSES]
+                   if split_margin and not vertical else [])
+    if title_lines:
+        tid = {id(ln) for ln in title_lines}
+        lines = [ln for ln in lines if id(ln) not in tid]
     symbols = []
     for ln in lines:
-        symbols.extend(expand_line_to_cells(ln["text"], ln["box"], sx, sy))
-    symbols = _dedup_symbols(_snap_column_x(symbols))
+        symbols.extend(expand_line_to_cells(ln["text"], ln["box"], sx, sy,
+                                            vertical))
+    symbols = _dedup_symbols(_snap_column_x(symbols, axis))
     if split_margin:
-        return symbols, _cells_of(margin_lines, sx, sy)
+        return (symbols, _cells_of(margin_lines, sx, sy, vertical),
+                _cells_of(title_lines, sx, sy, vertical))
     return symbols
 
 
-def _cells_of(lines, sx, sy):
+def _cells_of(lines, sx, sy, vertical=True):
     """柱・ノンブル行をセルにする（列スナップは掛けない）。"""
     cells = []
     for ln in lines:
-        cells.extend(expand_line_to_cells(ln["text"], ln["box"], sx, sy))
+        cells.extend(expand_line_to_cells(ln["text"], ln["box"], sx, sy,
+                                          vertical))
     return _dedup_symbols(cells)
 
 
-def insert_margin_text(page, symbols, body_fontsize):
+def insert_title_text(page, symbols, body_fontsize):
+    """見出し（line_title）を本文より大きいサイズで書き戻す。
+
+    `insert_margin_text` の対称形。原点は同じ「bbox上端合わせ」。
+    """
+    fontsize = body_fontsize * TITLE_FONT_RATIO
+    n = 0
+    for text, rect in symbols:
+        text = _FULLWIDTH_PUNCT.get(text, text)
+        page.insert_text(fitz.Point(rect.x0, rect.y0 + fontsize), text,
+                         fontsize=fontsize, fontname="japan", render_mode=3)
+        n += 1
+    return n
+
+
+def insert_margin_text(page, symbols, body_fontsize, axis=VERTICAL):
     """柱・ノンブルを本文より小さいサイズで書き戻す。
 
     NDLOCR は柱・ノンブルを block_pillar / block_folio として分類して
@@ -823,7 +942,7 @@ def insert_margin_text(page, symbols, body_fontsize):
     n = 0
     for text, rect in symbols:
         text = _FULLWIDTH_PUNCT.get(text, text)
-        fontsize = min(max(rect.width, lo), hi)
+        fontsize = min(max(axis.size(rect), lo), hi)
         page.insert_text(fitz.Point(rect.x0, rect.y0 + fontsize), text,
                          fontsize=fontsize, fontname="japan", render_mode=3)
         n += 1
@@ -860,8 +979,11 @@ def _calibrate_body_fontsize(doc, start_page, end_page, cache):
                 if ln["cls"] != RUBY_CLASS and ln["cls"] not in MARGIN_CLASSES]
         if not body:
             continue
-        for _, rect in collect_page_symbols_ndlocr(body, doc[idx], img_size):
-            widths.append(rect.width)
+        vertical = _page_vertical(lines)
+        axis = VERTICAL if vertical else HORIZONTAL
+        for _, rect in collect_page_symbols_ndlocr(body, doc[idx], img_size,
+                                                   vertical=vertical):
+            widths.append(axis.size(rect))
     return statistics.median(widths) if widths else None
 
 
@@ -905,15 +1027,19 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
                 print(f"ページ{p1}: 埋め込み画像なし／認識なし、スキップ")
                 continue
 
-            symbols, margins = collect_page_symbols_ndlocr(
-                lines, page, img_size, split_margin=True)
+            vertical = _page_vertical([ln for ln in lines
+                                       if ln["cls"] in BODY_CLASSES] or lines)
+            axis = VERTICAL if vertical else HORIZONTAL
+            symbols, margins, titles = collect_page_symbols_ndlocr(
+                lines, page, img_size, split_margin=True, vertical=vertical)
             # 柱・ノンブルしか無いページ（挿絵ページ）は、基準サイズが
             # まだ決まっていないと書き戻せないので従来どおり素通しにする
-            if not symbols and (not margins or target_body_fontsize is None):
+            if not symbols and (not (margins or titles)
+                                or target_body_fontsize is None):
                 continue
             if target_body_fontsize is None and symbols:
                 target_body_fontsize = statistics.median(
-                    r.width for _, r in symbols)
+                    axis.size(r) for _, r in symbols)
                 print(f"本文フォントサイズ基準値: {target_body_fontsize:.2f}pt")
 
             # 旧テキスト層を除去してから書き戻す（画像・線画は保護される）
@@ -922,9 +1048,12 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
 
             nchar, nruby = insert_invisible_text(
                 page, symbols, target_body_fontsize,
-                target_body_fontsize * 0.5)
+                target_body_fontsize * 0.5, axis=axis)
             # 柱・ノンブルは本文より小さく書き戻す（MARGIN_FONT_MIN_RATIO）
-            nchar += insert_margin_text(page, margins, target_body_fontsize)
+            nchar += insert_margin_text(page, margins, target_body_fontsize,
+                                        axis)
+            # 見出しは本文より大きく書き戻す（TITLE_FONT_RATIO）
+            nchar += insert_title_text(page, titles, target_body_fontsize)
             total_chars += nchar
             total_ruby += nruby
             processed += 1
@@ -951,7 +1080,7 @@ def reocr_pdf(input_path, output_path, start_page, end_page):
 
 
 def main():
-    global INK_WIDTH_RATIO, WITH_RUBY, RUBY_INK_RATIO
+    global INK_WIDTH_RATIO, WITH_RUBY, RUBY_INK_RATIO, AXIS_MODE
     ap = argparse.ArgumentParser(
         description="NDLOCR-Lite で自炊PDFを再OCRし透明テキスト層を書き戻す"
                     "（本文＋ルビ。--no-ruby で本文のみ）")
@@ -969,6 +1098,10 @@ def main():
     ap.add_argument("--ruby-ink-ratio", type=float, default=RUBY_INK_RATIO,
                     help=f"ルビ箱を実インク幅に縮める比"
                          f"（既定 {RUBY_INK_RATIO}。過大だと隣語のルビが結合する）")
+    ap.add_argument("--horizontal", action="store_true",
+                    help="横組みの本として扱う（既定はページごとに自動判定）")
+    ap.add_argument("--vertical", action="store_true",
+                    help="縦組みの本として扱う（既定はページごとに自動判定）")
     ap.add_argument("--no-ruby", action="store_true",
                     help="ルビ後段を止めて本文だけ書き戻す")
     ap.add_argument("--preprocess", choices=("auto", "on", "off"),
@@ -979,6 +1112,10 @@ def main():
         sys.exit("エラー: --ndlocr-dir で NDLOCR-Lite の clone 先を指定してください\n"
                  "  git clone https://github.com/ndl-lab/ndlocr-lite")
 
+    if args.horizontal and args.vertical:
+        sys.exit("エラー: --horizontal と --vertical は同時に指定できません")
+    AXIS_MODE = ("horizontal" if args.horizontal
+                 else "vertical" if args.vertical else "auto")
     INK_WIDTH_RATIO = args.ink_ratio
     WITH_RUBY = not args.no_ruby
     RUBY_INK_RATIO = args.ruby_ink_ratio
