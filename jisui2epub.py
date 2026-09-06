@@ -45,7 +45,7 @@ except ImportError:
     print("エラー: PyMuPDF が必要です。 pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 # WindowsでGUI・リダイレクト等のパイプ経由で起動されると、stdoutが
 # コンソールコードページ（cp932）でエンコードされ、✅等の絵文字で
@@ -801,6 +801,18 @@ def valid_heading_item(text):
 # ルビ記号、℃等の単位記号、長音で始まる語（日本語として不成立）
 _H_NOISE_RE = re.compile(r'一一|[《》〈〉℃]|^ー')
 
+# 図・表のキャプション（`図1-2ネットワークプレーヤーの例LUMIND3`・
+# `◆図9-10「RoonARC」の設定画面`）。横書きの図解書はキャプションを
+# 本文より大きい活字で組むので `_line_text_size` の門を通り、そのまま
+# 中見出しに昇格する（ネットオーディオで14本＝nav の1割強）。GOAL は
+# これを画像の中にしか持たない。
+# **番号が「N-N」の形のものだけを落とす。** `図解` のように数字を伴わない
+# 語や、`1-1 楽器を分類する科学` のような本物の節見出し（図・表で
+# 始まらない）は対象外なので、章立てには一切触れない
+_FIG_CAPTION_RE = re.compile(
+    r'^[◆●■□◇▲△▼▽※・\s]*(?:図|表|写真|グラフ|Fig\.?)\s*'
+    r'[0-9０-９]{1,2}\s*[-‐‑–—―ー－.．]\s*[0-9０-９]{1,2}')
+
 
 def _strip_heading_ornaments(text):
     """横書き実用書の見出し飾り囲みを剥がす（口データ収集□ → データ収集）。
@@ -1451,6 +1463,62 @@ def detect_index_pages(pages, drop):
     return out
 
 
+BACKMATTER_H_TAIL = 0.85    # 後付けの開始を認める位置（本の先頭からの割合）
+BACKMATTER_BODY_RATIO = 0.5  # 本文ページとみなす長行数／その本の中央値
+
+
+def _long_line_counts(pages, drop, body_top, body_bottom):
+    """ページごとの「版面いっぱいの行」の本数（横書き）。"""
+    w = (body_bottom - body_top) * BODY_END_LONG
+    return [(pg.num, sum(1 for ln in pg.vlines
+                         if (pg.num, id(ln)) not in drop and ln.text.strip()
+                         and not is_junk_line(ln.text.strip())
+                         and ln.y1 - ln.y0 >= w))
+            for pg in pages]
+
+
+def detect_backmatter_h(pages, drop, body_top, body_bottom):
+    """横書きの後付け（巻末索引・奥付・巻末広告）の先頭ページ（0基点）。
+
+    縦組みの `detect_body_end`（列の天揃い）は横書きでは意味を持たないので
+    `horizontal=True` では None を返す。こちらは
+    **「最後に本文らしいページが出た次のページ」**で切る。索引・奥付・
+    既刊広告は行が短く、版面いっぱいまで達する行を持たない。
+
+    **「索引の先頭で切る」ではいけない。** シナリオのためのファンタジー事典は
+    p294-297 に索引があり、そのあと p299-345 に本文が47ページ続く
+    （中世ヨーロッパの居酒屋・ギルド・商人・職人・医療・旅）。索引の位置で
+    切ると**その47ページが丸ごと消える**（実測で見出し17本・本文1194行）。
+    索引が巻末にあるとは限らない。
+
+    しきい値は書籍ごとに決める（`BACKMATTER_BODY_RATIO`）。実測の
+    「版面いっぱいの行」の本数は、本文ページが 11〜23 に対し
+    後付けは 0〜6（ネットオーディオの奥付5・裏表紙6、楽器の科学の奥付5）で、
+    固定値では分けられない。中央値の半分に取ると
+    ファンタジー事典 thr=7（後付けの最大5）・楽器の科学 thr=9（同5）と
+    どちらも通る。
+
+    歯止めは**本の末尾15%**（`BACKMATTER_H_TAIL`）。図版だけのページが
+    続く章末で早まって切らないための保険で、これに掛かれば何もしない。
+    """
+    n = len(pages)
+    if n < 20:
+        return None
+    counts = _long_line_counts(pages, drop, body_top, body_bottom)
+    dense = [c for _, c in counts if c >= BODY_END_MIN_LINES]
+    if not dense:
+        return None
+    thr = max(BODY_END_MIN_LINES,
+              int(statistics.median(dense) * BACKMATTER_BODY_RATIO))
+    last = max((p for p, c in counts if c >= thr), default=None)
+    if last is None:
+        return None
+    start = last + 1
+    if start >= n or start / n < BACKMATTER_H_TAIL:
+        return None
+    return start
+
+
 def _toc_pair_signal(pg, drop):
     """横書きの印刷目次の署名（行末のページ数が単調増加する）。"""
     vals = _toc_tail_numbers(pg, drop)
@@ -1480,6 +1548,11 @@ def _toc_page_entries(pg, drop):
     kana = (len(_FRONT_KANA_RE.findall(joined)) / len(joined)
             if joined else 0.0)
     return entries, label, kana
+
+
+# 隣接規則で「目次の続き」とみなすのに要る、行末のページ数の本数（横書き）。
+# 実測: 真の目次ページは 5〜11 本、誤検出だった楽器の科学 p15（本文）は 1 本
+TOC_ADJ_TAIL_MIN = 3
 
 
 def detect_toc_pages(pages, drop, horizontal=False):
@@ -1533,11 +1606,18 @@ def detect_toc_pages(pages, drop, horizontal=False):
     for p, (entries, pri) in cand.items():
         if pri or not (p - 1 in prim or p + 1 in prim):
             continue
-        # **横書きは「行末の数字が1つも無いページ」を目次の続きにしない。**
-        # 章扉（図解・気象学入門 p11 の `第1章 雲のしくみ` の全面写真）は
-        # OCRジャンクでエントリ数だけ満たしてしまい、目次として扱うと
-        # 章題辞書が汚れ、章頭の位置も奪われる
-        if horizontal and not _toc_tail_numbers(by_num[p], drop):
+        # **横書きは行末のページ数が TOC_ADJ_TAIL_MIN 本に満たないページを
+        # 目次の続きにしない。** 章扉（図解・気象学入門 p11 の
+        # `第1章 雲のしくみ` の全面写真）はOCRジャンクでエントリ数だけ
+        # 満たしてしまい、目次として扱うと章題辞書が汚れ、章頭の位置も奪う。
+        # **「1本でもあれば通す」では甘い**＝楽器の科学 p15 は
+        # プレリュード章の冒頭（本文）なのに誤読の `0` が1本あるだけで
+        # 目次の続きとして画像化され、**本文580字と章題2本が消えた**
+        # （かな率 0.378 も門の 0.40 を辛くも通っていた。飾り帯のOCR
+        #  `thethethe…` がかな率を押し下げるため）。実測の真の目次ページは
+        # 行末のページ数が 5〜11 本、p15 は 1 本と離れている
+        if horizontal and len(_toc_tail_numbers(by_num[p], drop)) \
+                < TOC_ADJ_TAIL_MIN:
             continue
         out[p] = entries
     return dict(sorted(out.items()))
@@ -3963,8 +4043,11 @@ def detect_bouten(pg, body_size):
     return out
 
 
-def render_vline(vl, ruby_map, bouten_map=None):
+def render_vline(vl, ruby_map, bouten_map=None, ruby_pairs_out=None):
     """縦行1本を、ルビ（と傍点）を埋め込んだ文字列にする。
+
+    ruby_pairs_out: set — 書いた (親文字, 読み) を溜める（省略可）。
+        底本の引用符 `《》` と区別するために `drop_bogus_rubies` が使う。
 
     傍点は青空文庫の後置注記 `本文［＃「本文」に傍点］` で出す。
     ルビと範囲が重なることは実際上ないが、重なった場合はルビを優先する
@@ -3999,6 +4082,8 @@ def render_vline(vl, ruby_map, bouten_map=None):
             base = "".join(c[0] for c in cells[i0:i1 + 1])
             # 直前が漢字なら｜で親文字の始まりを明示
             need_bar = (i0 > 0 and RUBYABLE_RE.match(cells[i0 - 1][0]))
+            if ruby_pairs_out is not None:
+                ruby_pairs_out.add((base, rtxt))
             out.append(("｜" if need_bar else "") + base + "《" + rtxt + "》")
             i = i1 + 1
             ri += 1
@@ -4113,7 +4198,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                   chapter_marks=None, body_end=None, pillar_chapters=None,
                   heading_pages_out=None, toc_pages=None,
                   front_pages=None, inline_figures=None, chapters_win=False,
-                  lost_cols=None, blank_lines=True, bouten=True):
+                  lost_cols=None, blank_lines=True, bouten=True,
+                  backmatter_pages=None, ruby_pairs_out=None):
     """全ページから青空文庫形式の本文を組み立てる。
     image_pages: {page_num: 画像ファイル名} — 図タグとして挿入するページ
     toc_pages: set — 印刷目次のページ（detect_toc_pages）。図タグのキャプションを
@@ -4142,6 +4228,12 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         そのスロットは「OCRが読み損なった列」なので空行を出さない
     blank_lines: 底本の空行（列アキ）を反映するか（--no-blank-line で False）
     bouten: 傍点を ［＃「…」に傍点］ で出すか（--no-bouten で False。縦書きのみ）
+    ruby_pairs_out: set — 実際にルビとして書いた (親, 読み) を書き出す（省略可）。
+        底本の引用符 `《》` と区別するために drop_bogus_rubies が使う
+    backmatter_pages: set — 後付け（巻末索引・奥付・巻末広告）のページ。
+        **見出しだけでなく本文行も出さない**（detect_backmatter_h。横書き
+        限定。縦組みは従来どおり body_end で見出しだけを止める）。
+        全面画像ページだけは図タグとして残す（発刊のことば・裏表紙）
     """
     hashira_keys = hashira_keys or {}
     lost_cols = lost_cols or {}
@@ -4153,6 +4245,7 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
     # 見出しがあっても優先する（柱ランは「補完」なので従来どおり譲る）
     toc_pages = set(toc_pages or ())
     front_pages = set(front_pages or ())
+    backmatter_pages = set(backmatter_pages or ())
     emitted_images = set()   # 図タグを出したページ（横書きの帯分割対策）
     emitted_figs = set()     # 発行済みの部分図（同上）
     pending_figs = []        # 段落の切れ目待ちの部分図タグ
@@ -4241,9 +4334,28 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
 
     n_marks = [0]
     n_backdrop = [0]
+    n_backcut = set()      # 帯分割の仮想ページを重複して数えない
 
     for pg in pages:
         cur_page[0] = pg.num
+        # 後付け（巻末索引・奥付・巻末広告）は本文行ごと出さない。
+        # 全面画像ページだけは残す＝「発刊のことば」「裏表紙」は絵として
+        # 意味があり、テキストではないのでジャンクにならない
+        if pg.num in backmatter_pages:
+            n_backcut.add(pg.num)
+            if pending_figs:      # 直前の本文ページから持ち越した図
+                flush()
+                out.extend(pending_figs)
+                pending_figs.clear()
+            if pg.num in image_pages and pg.num not in emitted_images:
+                emitted_images.add(pg.num)
+                emit_pagebreak()
+                fname = image_pages[pg.num]
+                if fname is not None:
+                    out.append(f"［＃「挿絵」の図（{fname}）入る］")
+                prev_line_short = True
+                prev_page_short = True
+            continue
         # 章頭マーカーは drop より優先して抜き出す（ノンブル・短い断片として
         # 落とされているのが常態）。発行位置に使うソートキーは本文行と同じ
         # 「紙面の右→左」＝ -xc
@@ -4406,6 +4518,9 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                 t = _strip_leading_noise(t)
                 # 図版OCRノイズの署名を持つ見出しを拒否
                 if _H_NOISE_RE.search(t):
+                    continue
+                # 図・表のキャプションは見出しにしない（画像の中にある）
+                if _FIG_CAPTION_RE.match(t):
                     continue
                 # 純漢字の見出し（標本抽出・相関・平均回帰）は実用書で
                 # 頻出するため、かな必須の縦書きルールを緩めて2〜8字の
@@ -4651,7 +4766,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
                 if pending_figs:
                     out.extend(pending_figs)
                     pending_figs.clear()
-            cur += render_vline(v, ruby_map, bouten_map)
+            cur += render_vline(v, ruby_map, bouten_map,
+                                ruby_pairs_out)
             prev_line_short = ends_short
             prev_v = v
         # ページ末尾: 段落継続は次ページに持ち越す。
@@ -4672,6 +4788,8 @@ def assemble_text(pages, drop, headings, body_size, body_top, body_bottom,
         print(f"章頭マーカー: {n_marks[0]} 個")
     if n_backdrop[0]:
         print(f"後付け見出し抑止: {n_backdrop[0]} 個")
+    if n_backcut:
+        print(f"後付けページ除外: {len(n_backcut)} ページ")
     return "\n".join(out)
 
 
@@ -5943,6 +6061,70 @@ def fix_ruby_variants(text):
 
 _PARENT_EXT_KANJI_RE = re.compile(r"[一-鿿々〆〇ヶ]")
 _PARENT_EXT_ALLKANJI_RE = re.compile(r"[一-鿿々〆〇ヶ]+")
+
+
+# **ルビの読みに漢字が2字以上あればルビではない。** 図中・画面写真の
+# 小活字がルビ幅に入って親文字にぶら下がる（ネットオーディオの
+# `設《タスクが一時停止されます》`・`図《コンサート映像》`）ほか、縦組みでも
+# 柱・巻末広告の紹介文が同じ形で付く（赤毛のアンの
+# `持《クルウプ順々に喉頭炎にかかったんですもの》`、ほんものの
+# `子《法外屋フスメール》`、ぼくがぼくであることの
+# `娘《が綴った、現場からの生の声。》`）。
+#
+# **字数の上限は置けない。** temp_sample の GOAL ePub 41冊・ルビ 101,996 組を
+# 実測すると、読みが10字を超える正当なルビが 32 組ある
+# （`國鉄特別強襲班《こくてつとくべつきょうしゅうはん》`16字・
+#  `図書特殊部隊《ライブラリー・タスクフオース》`14字・
+#  `釣浮草《レデイーズ・イア・ドロツプス》`14字）。読み／親字数の比も
+# `び《プッシュジャンパー》` の 9.0 まで正当な例がある。比の上限も置けない＝
+# OCRがルビを2語つないでしまった形（蘇我氏の
+# `元明《やまとねこあまつみしろとよくになりひめげんめい》` 比12）は
+# **読みとしては正しい情報**なので落としたくない。
+# 漢字2字以上だけが 101,996 組中 **0 組**で、唯一安全に切れる署名だった
+# （漢字1字は 11 組あるがいずれもGOAL側の変換残骸）。
+#
+# 掛ける場所には2つの制約があり、**両方を満たす必要がある**:
+#   * `fix_ruby_kanji` より**後**。`render_vline` で捨てると、あちらが本内
+#     多数決で直せるはずの漢字混入ルビ（霧の `魔術師《坐壬じゆつし》` →
+#     `魔術師《まじゅつし》`）を先に消す。実測で31冊 254組が失われ、うち
+#     `台所《だいどころ》`・`隙間《すきま》`・`医師《メディクス》` 等の
+#     正当なルビが多数だった
+#   * **本文中の literal な `《》` に触らない。** 底本が引用符として
+#     `《》` を使うことがあり（人類の起源の
+#     `ゴーギャン作《我々はどこから来たのか、我々は何者か、我々はどこへ
+#     行くのか》`）、テキストだけを見ると誤付着ルビと**区別できない**。
+#     分かるのは幾何だけなので、`render_vline` が実際にルビとして書いた
+#     組（`ruby_pairs`）に限って落とす
+_RUBY_KANJI_RE = re.compile(r'[一-鿿々]')
+# 読みは改行をまたがず長さにも上限を置く。`[^《》]+` のままだと、OCRノイズの
+# 迷子の `《` とはるか先の `》` が対応して**本文を丸ごと巻き込む**
+# （人類の起源 p180 で本文20行が消えるのを実測）
+_RUBY_DROP_RE = re.compile(
+    r"(?:｜([^｜《》\n]+)|([一-鿿々〆〇ヶ]+))《([^《》\n]{1,40})》")
+
+
+def ruby_pair_ok(base, reading):
+    """親文字と読みの組がルビとして成立するか（図中ラベルの誤検出を弾く）。"""
+    return len(_RUBY_KANJI_RE.findall(reading)) < 2
+
+
+def drop_bogus_rubies(text, ruby_pairs):
+    """ルビとして成立しない組を外す（親文字は本文に残す）。
+
+    ruby_pairs: `render_vline` が実際にルビとして書いた (親, 読み) の集合。
+        ここに無い `《》` は底本の引用符なので触らない。
+    戻り値: (テキスト, 外した件数)
+    """
+    n = [0]
+
+    def rep(m):
+        base = m.group(1) or m.group(2)
+        pair = (base, m.group(3))
+        if pair not in ruby_pairs or ruby_pair_ok(base, m.group(3)):
+            return m.group(0)
+        n[0] += 1
+        return base
+    return _RUBY_DROP_RE.sub(rep, text), n[0]
 
 
 def fix_ruby_parent_extend(text):
@@ -9415,7 +9597,22 @@ def main():
     if body_end is None and not args.no_backmatter_cut and not args.horizontal:
         # 列の天揃いでは見えない巻末広告を柱から拾う（推理カルテ）
         body_end = detect_backmatter_by_pillar(pages, drop)
-    if body_end is not None:
+    # 横書きの後付けは**本文ごと落とす**（縦組みは従来どおりテキストを残す）。
+    # 実用書の巻末は索引・奥付・既刊広告で、リフローのePubでは索引の
+    # ページ数が意味を失ううえ、段組広告のOCRは丸ごとジャンクになる
+    # （ネットオーディオは出力2430行のうち594行＝24%がこれで、
+    #  nav の後半20項目がジャンク見出しだった）。実測の挿入率は
+    # ネットオーディオ 18.7%→10.7%・楽器の科学 8.1%→3.1%、
+    # 本文再現率の低下はどちらも 0.1pt 未満
+    backmatter_pages = set()
+    if args.horizontal and not args.no_backmatter_cut:
+        back_start = detect_backmatter_h(pages, drop, body_top, body_bottom)
+        if back_start is not None:
+            body_end = back_start - 1
+            backmatter_pages = {pg.num for pg in pages if pg.num >= back_start}
+            print(f"後付け（索引・奥付・巻末広告）: p{back_start + 1} 以降"
+                  f" {len(backmatter_pages)} ページを本文から除外")
+    if body_end is not None and not backmatter_pages:
         print(f"本文終端: p{body_end + 1}（以降は後付けとして見出し化しない）")
 
     fn_title, fn_author = parse_meta_from_filename(args.pdf)
@@ -9567,7 +9764,8 @@ def main():
                       chapter_marks=chapter_marks, body_end=body_end,
                       heading_pages_out=probe_pages,
                       toc_pages=set(toc_page_map), front_pages=front_only,
-                      inline_figures=inline_figure_map)
+                      inline_figures=inline_figure_map,
+                      backmatter_pages=backmatter_pages)
     if pillar_runs:
         # **既存の見出しのほうが柱ランより多い本には手を出さない。**
         # 章立てが既にできている本（ほんもの22・グリック50・タイム・リープ47・
@@ -9605,6 +9803,7 @@ def main():
         if n_split:
             print(f"段組分割: {n_split} ページを帯に分割")
 
+    ruby_pairs = set()      # 幾何としてルビだった組（底本の《》引用符と区別する）
     body = assemble_text(pages, drop, headings, body_size,
                          body_top, body_bottom, hashira_keys,
                          indent=not args.no_indent, verbose=args.verbose,
@@ -9617,7 +9816,9 @@ def main():
                          inline_figures=inline_figure_map,
                          lost_cols=lost_cols,
                          blank_lines=not args.no_blank_line,
-                         bouten=not args.no_bouten)
+                         bouten=not args.no_bouten,
+                         backmatter_pages=backmatter_pages,
+                         ruby_pairs_out=ruby_pairs)
 
     if not args.no_toc_refine:
         # 目次ページを画像化した本では、章題辞書を本文テキストからでなく
@@ -9653,6 +9854,12 @@ def main():
             body, extend_fixed = fix_ruby_parent_extend(body)
             if extend_fixed:
                 print(f"ルビ親範囲の自動拡張: {extend_fixed} 箇所")
+    if args.ruby != "drop":
+        # 図中ラベル・柱・広告文の誤付着を外す。**--no-ocr-fix でも掛ける**
+        # ＝OCRの誤りの訂正ではなく「ルビとして成立するか」の判定なので
+        body, bogus = drop_bogus_rubies(body, ruby_pairs)
+        if bogus:
+            print(f"ルビでない組を除去: {bogus} 箇所")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"{title}\n{author}\n\n{body}\n")
     print(f"✅ 青空文庫形式テキスト出力: {out_path}")
